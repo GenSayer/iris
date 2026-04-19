@@ -199,6 +199,18 @@ pub struct Ioc {
 
 impl Ioc {
     pub fn new(guinness: bool) -> Self {
+        Self::new_inner(guinness, false)
+    }
+
+    /// CI-mode constructor: skips TCP serial backend binding on SCC channels
+    /// so multiple instances can run in parallel without port conflicts.
+    /// Caller must install backends via `scc().set_backend_{a,b}` before the
+    /// first `start()`.
+    pub fn new_ci(guinness: bool) -> Self {
+        Self::new_inner(guinness, true)
+    }
+
+    fn new_inner(guinness: bool, ci_mode: bool) -> Self {
         let sys_id = if guinness { 0x26 } else { 0x11 }; // primarily prom looks at bit 1 to detect full house.
         let state = Arc::new(Mutex::new(IocState {
             sys_id,
@@ -241,9 +253,15 @@ impl Ioc {
             source: IocInterrupt::KbMouse,
         });
 
+        let scc = if ci_mode {
+            Z85c30::new_null(Some(serial_irq))
+        } else {
+            Z85c30::new(Some(serial_irq))
+        };
+
         Self {
             state,
-            scc: Z85c30::new(Some(serial_irq)),
+            scc,
             pit: Pit8254::new(1_000_000, Some(timer0_cb), Some(timer1_cb), None),
             ps2: Arc::new(Ps2Controller::new(Some(ps2_cb))),
             guinness,

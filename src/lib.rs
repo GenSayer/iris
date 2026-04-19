@@ -43,6 +43,7 @@ pub mod disp;
 pub mod exp;
 pub mod gdb_stub;
 pub mod snapshot;
+pub mod ci;
 pub mod hptimer;
 pub mod hptimer_tests;
 pub mod vga_font;

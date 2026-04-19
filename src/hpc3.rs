@@ -1067,7 +1067,15 @@ impl Hpc3 {
     }
 
     pub fn add_scsi_device(&self, id: usize, path: &str, is_cdrom: bool, discs: Vec<String>, overlay: bool) -> std::io::Result<()> {
-        self.scsi_dev.add_device(id, path, is_cdrom, discs, overlay)
+        self.scsi_dev.add_device(id, path, is_cdrom, discs, overlay, None)
+    }
+
+    /// Same as `add_scsi_device` but lets the caller specify where the COW
+    /// overlay file lives. Used by `--ci` mode to keep per-process overlays
+    /// in `/tmp` so parallel `--ci` instances (and an interactive session)
+    /// don't race on the same file.
+    pub fn add_scsi_device_with_overlay(&self, id: usize, path: &str, is_cdrom: bool, discs: Vec<String>, overlay: bool, overlay_path: &str) -> std::io::Result<()> {
+        self.scsi_dev.add_device(id, path, is_cdrom, discs, overlay, Some(overlay_path))
     }
 
     pub fn ioc(&self) -> &Ioc {

@@ -115,7 +115,23 @@ pub struct MachineConfig {
     /// If Some(port), start the GDB RSP stub on that TCP port.
     #[serde(default)]
     pub gdb_port: Option<u16>,
+
+    /// CI mode: opens a control socket for automation, applies speed-favoring
+    /// fidelity shortcuts. Implies headless unless ci_display is also set.
+    #[serde(default)]
+    pub ci: bool,
+
+    /// Unix socket path for CI control. Used only when `ci` is true.
+    #[serde(default = "default_ci_socket")]
+    pub ci_socket: String,
+
+    /// With `ci`, keep the Newport window visible (deferred rendering) for
+    /// interactive test development.
+    #[serde(default)]
+    pub ci_display: bool,
 }
+
+fn default_ci_socket() -> String { "/tmp/iris.sock".to_string() }
 
 fn default_prom() -> String {
     "prom.bin".to_string()
@@ -156,6 +172,9 @@ impl Default for MachineConfig {
             headless: false,
             no_audio: false,
             gdb_port: None,
+            ci: false,
+            ci_socket: default_ci_socket(),
+            ci_display: false,
         }
     }
 }
@@ -178,8 +197,8 @@ impl MachineConfig {
 
     /// Validate bank sizes, returns a description of any errors.
     pub fn validate(&self) -> Result<(), String> {
-        if self.scale != 1 && self.scale != 2 {
-            return Err(format!("scale {} is invalid (valid: 1, 2)", self.scale));
+        if self.scale < 1 || self.scale > 4 {
+            return Err(format!("scale {} is invalid (valid: 1, 2, 3, 4)", self.scale));
         }
         for (i, &sz) in self.banks.iter().enumerate() {
             if !VALID_BANK_SIZES.contains(&sz) {
@@ -310,6 +329,20 @@ pub struct Cli {
     /// Connect with: target remote localhost:<port>
     #[arg(long = "gdb-port", value_name = "PORT")]
     pub gdb_port: Option<u16>,
+
+    /// CI mode: enable the control socket and apply speed-favoring fidelity
+    /// shortcuts. Implies --headless unless --ci-display is also set.
+    #[arg(long, default_value_t = false)]
+    pub ci: bool,
+
+    /// Override the default control-socket path (/tmp/iris.sock).
+    #[arg(long = "ci-socket", value_name = "PATH")]
+    pub ci_socket: Option<String>,
+
+    /// With --ci, keep the Newport window visible for interactive test
+    /// development (deferred rendering at 10–15 fps).
+    #[arg(long = "ci-display", default_value_t = false)]
+    pub ci_display: bool,
 }
 
 impl Cli {
@@ -348,6 +381,12 @@ impl Cli {
         if self.scale2x { cfg.scale = 2; }
         if self.headless  { cfg.headless  = true; }
         if self.no_audio  { cfg.no_audio  = true; }
+
+        if self.ci         { cfg.ci         = true; }
+        if let Some(p) = &self.ci_socket { cfg.ci_socket = p.clone(); }
+        if self.ci_display { cfg.ci_display = true; }
+        // NB: --ci does NOT imply --headless. REX3 stays alive so screenshots
+        // work; main.rs simply skips the host window when ci && !ci_display.
 
         // NFS: --nfs-dir enables NFS; other flags refine an existing [nfs] section or the defaults.
         if let Some(dir) = &self.nfs_dir {

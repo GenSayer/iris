@@ -5,6 +5,12 @@ fn main() {
     let (mut cfg, scale) = load_config();
     let headless = cfg.headless;
     let gdb_port = cfg.gdb_port;
+    let ci_enabled = cfg.ci;
+    let ci_display = cfg.ci_display;
+    let ci_socket_path = cfg.ci_socket.clone();
+
+    // CI control socket will be started after Machine::new below (it needs a
+    // pointer into the constructed Machine).
 
     // Start unfsd before the machine so NFS is ready when IRIX boots.
     // If start_unfsd returns None (directory missing/uncreatable, or binary not found),
@@ -23,6 +29,22 @@ fn main() {
         .join()
         .unwrap();
     machine.register_system_controller();
+
+    // CI control socket: started after Machine::new so it can hand out the
+    // machine pointer + CiSerialBackend to command handlers.
+    #[cfg(unix)]
+    let _ci_server = if ci_enabled {
+        let mptr: *mut iris::machine::Machine = &mut *machine;
+        match iris::ci::start_server(mptr, &ci_socket_path) {
+            Ok(s) => Some(s),
+            Err(e) => {
+                eprintln!("iris: failed to start CI server: {}", e);
+                std::process::exit(1);
+            }
+        }
+    } else {
+        None
+    };
 
     // DIAG: optionally enable verbose logging from startup via IRIS_DEBUG_LOG.
     // IRIS_DEBUG_LOG="mc,mips" enables those modules. "all" enables everything.
@@ -57,14 +79,22 @@ fn main() {
     }
 
     machine.start();
-    std::thread::spawn(|| {
-        Machine::run_console_client();
-    });
+    if !ci_enabled {
+        std::thread::spawn(|| {
+            Machine::run_console_client();
+        });
+    }
 
-    if headless {
-        // Headless mode: no window, no graphics, no audio.
-        // Park the main thread and let the machine run until killed.
-        eprintln!("iris: running headless (no window)");
+    let show_window = !headless && !(ci_enabled && !ci_display);
+    if !show_window {
+        if headless {
+            eprintln!("iris: running headless (no REX3, no window)");
+        } else if ci_enabled {
+            eprintln!("iris: --ci mode (REX3 rendering to offscreen buffer, no window)");
+        }
+        // Park the main thread so background threads (CPU, REX3 refresh,
+        // CI socket) keep running. `quit` via the CI socket calls
+        // std::process::exit.
         std::thread::park();
     } else {
         use iris::ui::Ui;

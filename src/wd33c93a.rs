@@ -234,12 +234,27 @@ impl Wd33c93a {
     /// For CD-ROMs, `discs` is the full ordered list of ISO paths; the first
     /// entry is mounted immediately.  For HDDs `discs` is ignored — only
     /// `path` is used.
-    pub fn add_device(&self, id: usize, path: &str, is_cdrom: bool, discs: Vec<String>, overlay: bool) -> std::io::Result<()> {
+    ///
+    /// If `overlay_path_override` is `Some`, it specifies where the COW
+    /// overlay file lives. This lets CI mode isolate its overlay from an
+    /// interactive session sharing the same base image. Ignored when
+    /// `overlay` is false.
+    pub fn add_device(
+        &self,
+        id: usize,
+        path: &str,
+        is_cdrom: bool,
+        discs: Vec<String>,
+        overlay: bool,
+        overlay_path_override: Option<&str>,
+    ) -> std::io::Result<()> {
         use crate::cow_disk::CowDisk;
         use crate::scsi::DiskBackend;
 
         let (backend, size) = if overlay && !is_cdrom {
-            let overlay_path = format!("{}.overlay", path);
+            let overlay_path = overlay_path_override
+                .map(|s| s.to_string())
+                .unwrap_or_else(|| format!("{}.overlay", path));
             let cow = CowDisk::new(path, &overlay_path)?;
             let sz = cow.size();
             (DiskBackend::Cow(cow), sz)
@@ -315,6 +330,59 @@ impl Wd33c93a {
                 Some((id, dev.current_disc().to_string(), dev.disc_list().to_vec(), phys, logical))
             })
             .collect()
+    }
+
+    /// Reset the COW overlay on every attached device that's using COW.
+    /// Direct-mode devices are left alone. Used by `Machine::ci_restore`.
+    pub fn reset_all_overlays(&self) -> Vec<(usize, std::io::Result<()>)> {
+        let mut state = self.state.lock();
+        let mut results = Vec::new();
+        for id in 0..8 {
+            if let Some(dev) = &mut state.devices[id] {
+                if dev.is_cow() {
+                    results.push((id, dev.cow_reset()));
+                }
+            }
+        }
+        results
+    }
+
+    /// Copy every COW overlay into `dir` as `scsi<id>.overlay`. Returns a
+    /// list of `(id, dirty_sector_list)` entries so snapshot save can
+    /// persist the dirty set alongside the raw overlay bytes.
+    pub fn export_overlays(&self, dir: &std::path::Path) -> std::io::Result<Vec<(usize, Vec<u64>)>> {
+        let mut state = self.state.lock();
+        let mut out = Vec::new();
+        for id in 0..8 {
+            if let Some(dev) = &mut state.devices[id] {
+                if dev.is_cow() {
+                    let dest = dir.join(format!("scsi{}.overlay", id));
+                    let dirty = dev.cow_export(&dest)?;
+                    out.push((id, dirty));
+                }
+            }
+        }
+        Ok(out)
+    }
+
+    /// Replace each COW overlay with its saved counterpart in `dir` and
+    /// adopt the matching dirty sector set. Devices with no corresponding
+    /// entry in `dirty_sets` keep their current overlay untouched.
+    pub fn import_overlays(
+        &self,
+        dir: &std::path::Path,
+        dirty_sets: &[(usize, Vec<u64>)],
+    ) -> std::io::Result<()> {
+        let mut state = self.state.lock();
+        for (id, dirty) in dirty_sets {
+            if let Some(dev) = &mut state.devices[*id] {
+                if dev.is_cow() {
+                    let src = dir.join(format!("scsi{}.overlay", id));
+                    dev.cow_import(&src, dirty.clone())?;
+                }
+            }
+        }
+        Ok(())
     }
 
     pub fn read_fifo(&self) -> u8 {

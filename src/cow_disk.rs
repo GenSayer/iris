@@ -7,6 +7,7 @@
 use std::collections::HashSet;
 use std::fs::{File, OpenOptions};
 use std::io::{self, Read, Seek, SeekFrom, Write};
+use std::path::Path;
 
 const SECTOR_SIZE: u64 = 512;
 
@@ -158,5 +159,38 @@ impl CowDisk {
     /// Number of dirty sectors in the overlay.
     pub fn dirty_count(&self) -> usize {
         self.dirty.len()
+    }
+
+    /// Copy the current overlay file to `dest` and return the dirty sector
+    /// list (sorted, ascending). Used by snapshot save so the entire disk
+    /// state — base + overlay — is captured consistently with RAM.
+    pub fn export_overlay(&mut self, dest: &Path) -> io::Result<Vec<u64>> {
+        self.overlay.sync_all()?;
+        std::fs::copy(&self.overlay_path, dest)?;
+        let mut dirty: Vec<u64> = self.dirty.iter().copied().collect();
+        dirty.sort_unstable();
+        Ok(dirty)
+    }
+
+    /// Replace the overlay contents with `source` and adopt `dirty` as the
+    /// dirty sector set. Used by snapshot load. If `source` doesn't exist
+    /// the overlay is truncated instead (matches `reset_overlay` behavior —
+    /// handles old snapshots without overlay data).
+    pub fn import_overlay(&mut self, source: &Path, dirty: Vec<u64>) -> io::Result<()> {
+        if source.exists() {
+            std::fs::copy(source, &self.overlay_path)?;
+        } else {
+            // Clear the overlay: nothing saved for this device.
+            std::fs::File::create(&self.overlay_path)?;
+        }
+        // Reopen the file handle — the previous File object points at the
+        // old inode (which std::fs::copy replaced on some platforms).
+        self.overlay = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .open(&self.overlay_path)?;
+        self.dirty = dirty.into_iter().collect();
+        Ok(())
     }
 }

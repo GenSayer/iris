@@ -167,6 +167,24 @@ impl ScsiDevice {
         }
     }
 
+    /// Copy the COW overlay into `dest` and return its dirty sector set.
+    /// Direct-mode devices return an empty list and create no file.
+    pub fn cow_export(&mut self, dest: &std::path::Path) -> io::Result<Vec<u64>> {
+        match &mut self.backend {
+            DiskBackend::Cow(cow) => cow.export_overlay(dest),
+            DiskBackend::Direct(_) => Ok(Vec::new()),
+        }
+    }
+
+    /// Replace the COW overlay with the contents of `source` and adopt
+    /// `dirty` as the dirty sector set. No-op on direct-mode devices.
+    pub fn cow_import(&mut self, source: &std::path::Path, dirty: Vec<u64>) -> io::Result<()> {
+        match &mut self.backend {
+            DiskBackend::Cow(cow) => cow.import_overlay(source, dirty),
+            DiskBackend::Direct(_) => Ok(()),
+        }
+    }
+
     /// Number of dirty sectors in the COW overlay, or 0 if direct mode.
     pub fn cow_dirty_count(&self) -> usize {
         match &self.backend {

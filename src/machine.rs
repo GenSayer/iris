@@ -69,10 +69,20 @@ pub struct Machine {
     pub event_tx: mpsc::SyncSender<MachineEvent>,
     event_rx: Option<mpsc::Receiver<MachineEvent>>,
     timer_manager: Arc<TimerManager>,
+    /// When `cfg.ci` is set, the channel-A backend is replaced by this
+    /// in-process one so the CI control socket can drive the console.
+    ci_serial: Option<Arc<crate::z85c30::CiSerialBackend>>,
+    /// Most recent snapshot restored via `ci_restore`. `rollback` re-invokes
+    /// `ci_restore` with this name.
+    last_restore: Option<String>,
 }
 
 impl Machine {
     pub fn new(cfg: MachineConfig) -> Self {
+        // Capture config flags that are needed after the local `cfg` binding
+        // is shadowed later in this function.
+        let ci_enabled = cfg.ci;
+
         // 0. Shared EEPROM
         let eeprom = Arc::new(Mutex::new(Eeprom93c56::new()));
 
@@ -102,8 +112,22 @@ impl Machine {
         let l1i_fetch_count      = Arc::new(AtomicU64::new(0)); // L1-I fetch counter
         let uncached_fetch_count = Arc::new(AtomicU64::new(0)); // uncached instruction fetches
 
-        // HPC3 (512KB at 0x1FB80000)
-        let ioc = Ioc::new(true);
+        // HPC3 (512KB at 0x1FB80000). CI mode skips the SCC TCP backend
+        // bindings so multiple `--ci` instances can coexist.
+        let ioc = if ci_enabled { Ioc::new_ci(true) } else { Ioc::new(true) };
+
+        // CI mode replaces the default TCP backend on channel B (tty1, the
+        // SGI serial console) with an in-process backend the control socket
+        // drives directly. Channel A (tty2) keeps its default TCP backend.
+        // Must happen before any peripheral `start()` call (which clones the
+        // current backend Arc into the RX/TX threads).
+        let ci_serial = if ci_enabled {
+            let b = Arc::new(crate::z85c30::CiSerialBackend::new());
+            ioc.scc().set_backend_b(b.clone());
+            Some(b)
+        } else {
+            None
+        };
         let timer_manager = Arc::new(TimerManager::new());
         ioc.set_timer_manager(timer_manager.clone());
         ioc.set_heartbeat(heartbeat.clone());
@@ -113,23 +137,31 @@ impl Machine {
         // Attach SCSI devices from config (IDs 1–7).
         let mut scsi_ids: Vec<u8> = cfg.scsi.keys().copied().collect();
         scsi_ids.sort();
+        // CI mode: isolate each COW overlay under /tmp so an interactive
+        // iris holding {base}.overlay can coexist with any number of `--ci`
+        // processes. Files are kept for post-mortem inspection; cleanup
+        // happens on machine drop below.
+        let ci_pid = std::process::id();
         for id in scsi_ids {
             let dev = &cfg.scsi[&id];
-            // For CD-ROMs: build ordered disc list; first entry is mounted now.
-            // For HDDs: disc list is unused (empty).
             let (path, discs) = if dev.cdrom {
                 let mut list = dev.discs.clone();
                 if list.is_empty() {
                     list.push(dev.path.clone());
                 } else if list[0] != dev.path {
-                    // Ensure path is front of list if explicitly set
                     list.insert(0, dev.path.clone());
                 }
                 (list[0].clone(), list)
             } else {
                 (dev.path.clone(), vec![])
             };
-            if let Err(e) = hpc3.add_scsi_device(id as usize, &path, dev.cdrom, discs, dev.overlay) {
+            let result = if ci_enabled && dev.overlay && !dev.cdrom {
+                let ci_overlay = format!("/tmp/iris-ci-{}-scsi{}.overlay", ci_pid, id);
+                hpc3.add_scsi_device_with_overlay(id as usize, &path, dev.cdrom, discs, dev.overlay, &ci_overlay)
+            } else {
+                hpc3.add_scsi_device(id as usize, &path, dev.cdrom, discs, dev.overlay)
+            };
+            if let Err(e) = result {
                 println!("Note: Could not attach {} to SCSI ID {}: {}", path, id, e);
             }
         }
@@ -292,6 +324,8 @@ impl Machine {
             event_tx,
             event_rx: Some(event_rx),
             timer_manager,
+            ci_serial,
+            last_restore: None,
         }
     }
 
@@ -301,10 +335,19 @@ impl Machine {
         self.hpc3.start();
         if let Some(rex3) = &self._phys.rex3 { rex3.start(); }
 
-        // Start monitor server on localhost:8888
-        self.monitor.clone().start_server("127.0.0.1:8888".to_string());
+        // Monitor server on localhost:8888. Skipped in CI mode — the control
+        // socket replaces it, and binding a fixed port would prevent parallel
+        // `--ci` instances.
+        if self.ci_serial.is_none() {
+            self.monitor.clone().start_server("127.0.0.1:8888".to_string());
+        }
+
+        // CI mode: the harness drives startup via `restore` / `start`. Don't
+        // autostart the CPU so the first command finds a quiet machine.
         #[cfg(not(any(debug_assertions, feature = "developer")))]
-        self.cpu.start();
+        if self.ci_serial.is_none() {
+            self.cpu.start();
+        }
     }
 
     /// Register a SystemController with the monitor so that `reset`, `save`,
@@ -424,6 +467,41 @@ impl Machine {
         MipsCpuDebugAdapter::new(self.cpu.clone())
     }
 
+    /// The in-process serial backend used by `--ci` mode. `None` in
+    /// interactive mode.
+    pub fn get_ci_serial(&self) -> Option<Arc<crate::z85c30::CiSerialBackend>> {
+        self.ci_serial.clone()
+    }
+
+    /// CPU thread, started explicitly by the CI `start` command or by
+    /// `ci_restore`. In `--ci` mode the CPU is not autostarted in `start()`
+    /// — the harness drives startup via `restore`.
+    pub fn cpu_start(&self) {
+        self.cpu.start();
+    }
+
+    /// Full rewind: load the named snapshot, which now captures the COW
+    /// overlay too so the filesystem state is deterministic per snapshot.
+    /// The CPU resumes automatically (load_snapshot restarts it).
+    pub fn ci_restore(&mut self, name: &str) -> Result<(), String> {
+        // Clear any leftover serial bytes from the previous run so the
+        // next command doesn't see stale output.
+        if let Some(ci) = &self.ci_serial {
+            ci.reset();
+        }
+
+        self.load_snapshot(name)?;
+        self.last_restore = Some(name.to_string());
+        Ok(())
+    }
+
+    /// Re-invoke `ci_restore` with the most recently restored snapshot.
+    pub fn ci_rollback(&mut self) -> Result<(), String> {
+        let name = self.last_restore.clone()
+            .ok_or_else(|| "no previous restore to roll back to".to_string())?;
+        self.ci_restore(&name)
+    }
+
     /// Restart peripherals (MC, HPC3, REX3) without restarting the monitor server.
     fn restart_peripherals(&mut self) {
         self.mc.start();
@@ -533,7 +611,26 @@ impl Machine {
             self._phys.save_bank(i, dir.join(format!("bank{}.bin", i))).map_err(|e| e.to_string())?;
         }
 
+        // COW overlays per SCSI device, plus a `cow.toml` with the dirty
+        // sector set for each one. Keeps the on-disk filesystem state
+        // consistent with the captured RAM.
+        let overlays = self.hpc3.scsi().export_overlays(&snap.dir)
+            .map_err(|e| format!("COW overlay export: {}", e))?;
+        let mut cow_tbl = toml::map::Map::new();
+        for (id, dirty) in overlays {
+            let arr: Vec<toml::Value> = dirty.into_iter()
+                .map(|v| toml::Value::Integer(v as i64))
+                .collect();
+            cow_tbl.insert(format!("scsi{}", id), toml::Value::Array(arr));
+        }
+        snap.write_toml("cow.toml", &toml::Value::Table(cow_tbl))
+            .map_err(|e| e.to_string())?;
+
         self.restart_peripherals();
+        // Resume execution so the session feels like it never paused.
+        // Without this the user sees JIT shutdown stats and a dead prompt
+        // after `save` — the CPU would otherwise stay stopped.
+        self.cpu.start();
         println!("Snapshot saved to saves/{}", name);
         Ok(())
     }
@@ -604,7 +701,30 @@ impl Machine {
             self._phys.load_bank(i, dir.join(format!("bank{}.bin", i))).map_err(|e| e.to_string())?;
         }
 
+        // COW overlays — best-effort for backward compatibility with
+        // snapshots saved before overlay capture was added.
+        if let Ok(cow_toml) = snap.read_toml("cow.toml") {
+            let mut sets: Vec<(usize, Vec<u64>)> = Vec::new();
+            if let Some(tbl) = cow_toml.as_table() {
+                for (k, v) in tbl {
+                    let Some(id_str) = k.strip_prefix("scsi") else { continue };
+                    let Ok(id) = id_str.parse::<usize>() else { continue };
+                    let Some(arr) = v.as_array() else { continue };
+                    let dirty: Vec<u64> = arr.iter()
+                        .filter_map(|x| x.as_integer().map(|i| i as u64))
+                        .collect();
+                    sets.push((id, dirty));
+                }
+            }
+            self.hpc3.scsi().import_overlays(&snap.dir, &sets)
+                .map_err(|e| format!("COW overlay import: {}", e))?;
+        } else {
+            eprintln!("load_snapshot: no cow.toml in snapshot — overlays left unchanged");
+        }
+
         self.restart_peripherals();
+        // Resume the guest so the session continues from the snapshotted PC.
+        self.cpu.start();
         println!("Snapshot loaded from saves/{}", name);
         Ok(())
     }
