@@ -238,6 +238,17 @@ impl Physical {
             bank.power_on();
         }
     }
+
+    /// Snapshot bank `bank` into a native-endian Vec<u32>. Used by the
+    /// in-memory rollback checkpoint to skip the disk byte-shuffle.
+    pub fn snapshot_bank_inmem(&self, bank: usize) -> Vec<u32> {
+        self.banks[bank].snapshot_words()
+    }
+
+    /// Restore bank `bank` from a buffer produced by `snapshot_bank_inmem`.
+    pub fn restore_bank_inmem(&self, bank: usize, src: &[u32]) {
+        self.banks[bank].restore_words(src);
+    }
 }
 
 impl Physical {

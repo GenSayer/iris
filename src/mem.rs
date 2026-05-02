@@ -82,6 +82,24 @@ impl Memory {
         }
         Ok(())
     }
+
+    /// Clone the bank's word buffer in native endian. Used by the in-memory
+    /// rollback checkpoint to capture state without touching disk. Caller
+    /// should ensure the CPU/peripheral threads are stopped to avoid a
+    /// torn read.
+    pub fn snapshot_words(&self) -> Vec<u32> {
+        let data = unsafe { self.data() };
+        data.to_vec()
+    }
+
+    /// Overwrite the bank's word buffer from `src`. Length is clamped to the
+    /// bank's word count; extra source words are dropped, missing tail words
+    /// are left untouched. Pair with `snapshot_words` for rollback.
+    pub fn restore_words(&self, src: &[u32]) {
+        let data = unsafe { self.data() };
+        let n = src.len().min(data.len());
+        data[..n].copy_from_slice(&src[..n]);
+    }
 }
 
 impl Resettable for Memory {
@@ -320,4 +338,51 @@ impl BusDevice for UnmappedRam {
     fn write32(&self, _addr: u32, _v: u32) -> u32 { BUS_OK }
     fn read64(&self, _addr: u32) -> BusRead64 { BusRead64::ok(0) }
     fn write64(&self, _addr: u32, _v: u64) -> u32 { BUS_OK }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::traits::BusDevice;
+
+    #[test]
+    fn snapshot_and_restore_words_roundtrip() {
+        let m = Memory::new(1); // 1 MB = 256 K words
+        // Seed unique data via the bus interface so storage layout matches
+        // production access patterns.
+        for i in 0..32 {
+            let addr = (i * 4) as u32;
+            m.write32(addr, 0xDEAD0000 + i as u32);
+        }
+        let snap = m.snapshot_words();
+        // Mutate in place.
+        for i in 0..32 {
+            let addr = (i * 4) as u32;
+            m.write32(addr, 0xCAFEBABE);
+        }
+        // Restore from snapshot, verify original data returns.
+        m.restore_words(&snap);
+        for i in 0..32 {
+            let addr = (i * 4) as u32;
+            let v = m.read32(addr).data;
+            assert_eq!(v, 0xDEAD0000 + i as u32, "word {} mismatch after restore", i);
+        }
+    }
+
+    #[test]
+    fn restore_words_clamps_to_bank_size() {
+        let m = Memory::new(1);
+        let words = m.snapshot_words();
+        let bank_words = words.len();
+        // Source buffer larger than bank — should not panic, should not write
+        // past end.
+        let mut larger = vec![0xAAAAAAAAu32; bank_words + 100];
+        for (i, w) in larger.iter_mut().enumerate().take(bank_words + 100) {
+            *w = (i as u32).wrapping_mul(7);
+        }
+        m.restore_words(&larger);
+        // Spot-check a word inside the bank.
+        let v = m.read32(0).data;
+        assert_eq!(v, 0);
+    }
 }

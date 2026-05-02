@@ -72,9 +72,48 @@ pub struct Machine {
     /// When `cfg.ci` is set, the channel-A backend is replaced by this
     /// in-process one so the CI control socket can drive the console.
     ci_serial: Option<Arc<crate::z85c30::CiSerialBackend>>,
-    /// Most recent snapshot restored via `ci_restore`. `rollback` re-invokes
-    /// `ci_restore` with this name.
+    /// Most recent snapshot restored via `ci_restore`. `rollback` reuses this
+    /// name as the fallback path if the in-memory checkpoint is absent.
     last_restore: Option<String>,
+    /// In-memory copy of the just-loaded state, taken at the end of every
+    /// successful `ci_restore`. Lets `ci_rollback` skip disk IO and TOML
+    /// re-parsing — paste back the cached `toml::Value`s and `memcpy` the
+    /// bank/framebuffer buffers. Cleared on any explicit `load_snapshot`
+    /// outside the CI path.
+    last_restore_checkpoint: Option<RollbackCheckpoint>,
+}
+
+/// In-memory snapshot of the just-restored guest state. Populated at the end
+/// of `ci_restore`; consumed by `ci_rollback`. Trades ~270 MB of RSS for
+/// disk-IO-free rollback.
+struct RollbackCheckpoint {
+    /// Snapshot directory (saves/<name>/) — re-used by rollback to reflink
+    /// the COW overlays back into place.
+    overlay_dir: std::path::PathBuf,
+    /// Per-SCSI-id dirty sector lists from cow.toml at the time of restore.
+    overlay_sets: Vec<(usize, Vec<u64>)>,
+
+    /// Native-endian RAM bank words. `bank_words[i].len() ==
+    /// banks[i].size_bytes / 4` for present banks; populated for all four.
+    bank_words: [Vec<u32>; 4],
+
+    /// Framebuffer contents (RGB, aux). `None` when running headless.
+    framebuffers: Option<(Vec<u32>, Vec<u32>)>,
+
+    /// Parsed device save_state TOMLs. Holding `toml::Value` directly skips
+    /// the ~80 ms cpu.toml string-parse cost on every rollback.
+    cpu: toml::Value,
+    mc: toml::Value,
+    ioc: toml::Value,
+    scc: toml::Value,
+    pit: toml::Value,
+    ps2: toml::Value,
+    rtc: toml::Value,
+    eeprom: toml::Value,
+    scsi: toml::Value,
+    seeq: toml::Value,
+    hpc3: toml::Value,
+    rex3: Option<toml::Value>,
 }
 
 impl Machine {
@@ -326,6 +365,7 @@ impl Machine {
             timer_manager,
             ci_serial,
             last_restore: None,
+            last_restore_checkpoint: None,
         }
     }
 
@@ -482,7 +522,9 @@ impl Machine {
 
     /// Full rewind: load the named snapshot, which now captures the COW
     /// overlay too so the filesystem state is deterministic per snapshot.
-    /// The CPU resumes automatically (load_snapshot restarts it).
+    /// The CPU resumes automatically (load_snapshot restarts it). After the
+    /// load, an in-memory checkpoint of the just-restored state is taken so
+    /// the next `ci_rollback` can run without touching disk.
     pub fn ci_restore(&mut self, name: &str) -> Result<(), String> {
         // Clear any leftover serial bytes from the previous run so the
         // next command doesn't see stale output.
@@ -492,14 +534,139 @@ impl Machine {
 
         self.load_snapshot(name)?;
         self.last_restore = Some(name.to_string());
+        // Capture the rollback checkpoint. If this fails, the restore still
+        // succeeded — rollback will fall back to the disk path.
+        match self.capture_rollback_checkpoint(name) {
+            Ok(cp) => self.last_restore_checkpoint = Some(cp),
+            Err(e) => {
+                eprintln!("ci_restore: rollback checkpoint capture failed: {} — rollback will use the disk path", e);
+                self.last_restore_checkpoint = None;
+            }
+        }
         Ok(())
     }
 
-    /// Re-invoke `ci_restore` with the most recently restored snapshot.
+    /// Roll back to the state captured at the last `ci_restore`. Uses the
+    /// in-memory checkpoint when present; falls back to a disk reload if it's
+    /// absent (legacy snapshot loaded outside CI, or capture failed).
     pub fn ci_rollback(&mut self) -> Result<(), String> {
-        let name = self.last_restore.clone()
-            .ok_or_else(|| "no previous restore to roll back to".to_string())?;
-        self.ci_restore(&name)
+        if let Some(ci) = &self.ci_serial {
+            ci.reset();
+        }
+
+        // Take the checkpoint out so the apply path can hold &cp without
+        // borrowing self at the same time. Restored after apply so repeated
+        // rollbacks work.
+        let cp = match self.last_restore_checkpoint.take() {
+            Some(cp) => cp,
+            None => {
+                let name = self.last_restore.clone()
+                    .ok_or_else(|| "no previous restore to roll back to".to_string())?;
+                eprintln!("ci_rollback: no in-memory checkpoint — falling back to disk reload");
+                return self.ci_restore(&name);
+            }
+        };
+        let result = self.apply_rollback_checkpoint(&cp);
+        self.last_restore_checkpoint = Some(cp);
+        result
+    }
+
+    /// Capture in-memory state for fast rollback. Stops the CPU briefly.
+    fn capture_rollback_checkpoint(&mut self, name: &str) -> Result<RollbackCheckpoint, String> {
+        self.stop();
+
+        let cpu = self.cpu.save_state();
+        let mc = self.mc.save_state();
+        let ioc = self.hpc3.ioc().save_state();
+        let scc = self.hpc3.ioc().scc().save_state();
+        let pit = self.hpc3.ioc().pit().save_state();
+        let ps2 = self.hpc3.ioc().ps2().save_state();
+        let rtc = self.hpc3.rtc().save_state();
+        let eeprom = self.hpc3.eeprom().lock().save_state_owned();
+        let scsi = self.hpc3.scsi().save_state();
+        let seeq = self.hpc3.seeq().save_state();
+        let hpc3 = self.hpc3.save_state();
+        let rex3 = self._phys.rex3.as_ref().map(|r| r.save_state());
+
+        let bank_words: [Vec<u32>; 4] = [
+            self._phys.snapshot_bank_inmem(0),
+            self._phys.snapshot_bank_inmem(1),
+            self._phys.snapshot_bank_inmem(2),
+            self._phys.snapshot_bank_inmem(3),
+        ];
+
+        let framebuffers = self._phys.rex3.as_ref()
+            .map(|r| r.snapshot_framebuffers_inmem());
+
+        // Re-read cow.toml so rollback knows which dirty sectors to import
+        // back. The file was just consumed by load_snapshot but it's tiny and
+        // re-reading from page cache is cheap (~µs).
+        let overlay_dir = std::path::PathBuf::from("saves").join(name);
+        let snap = Snapshot::new(&overlay_dir);
+        let mut overlay_sets: Vec<(usize, Vec<u64>)> = Vec::new();
+        if let Ok(cow_toml) = snap.read_toml("cow.toml") {
+            if let Some(tbl) = cow_toml.as_table() {
+                for (k, v) in tbl {
+                    let Some(id_str) = k.strip_prefix("scsi") else { continue };
+                    let Ok(id) = id_str.parse::<usize>() else { continue };
+                    let Some(arr) = v.as_array() else { continue };
+                    let dirty: Vec<u64> = arr.iter()
+                        .filter_map(|x| x.as_integer().map(|i| i as u64))
+                        .collect();
+                    overlay_sets.push((id, dirty));
+                }
+            }
+        }
+
+        self.restart_peripherals();
+        self.cpu.start();
+
+        Ok(RollbackCheckpoint {
+            overlay_dir,
+            overlay_sets,
+            bank_words,
+            framebuffers,
+            cpu, mc, ioc, scc, pit, ps2, rtc, eeprom, scsi, seeq, hpc3, rex3,
+        })
+    }
+
+    /// Apply an in-memory checkpoint, restoring the guest to the state at
+    /// the moment of capture. Skips disk IO and TOML string-parsing.
+    fn apply_rollback_checkpoint(&mut self, cp: &RollbackCheckpoint) -> Result<(), String> {
+        self.stop();
+        self.power_on_devices();
+
+        self.cpu.load_state(&cp.cpu)?;
+        self.mc.load_state(&cp.mc)?;
+        self.hpc3.ioc().load_state(&cp.ioc)?;
+        self.hpc3.ioc().scc().load_state(&cp.scc)?;
+        self.hpc3.ioc().pit().load_state(&cp.pit)?;
+        self.hpc3.ioc().ps2().load_state(&cp.ps2)?;
+        self.hpc3.rtc().load_state(&cp.rtc)?;
+        self.hpc3.eeprom().lock().load_state_mut(&cp.eeprom)?;
+        self.hpc3.scsi().load_state(&cp.scsi)?;
+        self.hpc3.seeq().load_state(&cp.seeq)?;
+        self.hpc3.load_state(&cp.hpc3)?;
+        if let (Some(rex3), Some(rex3_toml)) = (&self._phys.rex3, &cp.rex3) {
+            rex3.load_state(rex3_toml)?;
+        }
+
+        for (i, words) in cp.bank_words.iter().enumerate() {
+            self._phys.restore_bank_inmem(i, words);
+        }
+        if let (Some(rex3), Some((rgb, aux))) = (&self._phys.rex3, &cp.framebuffers) {
+            rex3.restore_framebuffers_inmem(rgb, aux);
+        }
+
+        // Reflink the overlay back into place. saves/<name>/scsi*.overlay is
+        // unchanged by guest writes (writes go to the live overlay), so this
+        // can re-import directly.
+        self.hpc3.scsi().import_overlays(&cp.overlay_dir, &cp.overlay_sets)
+            .map_err(|e| format!("rollback: COW overlay import: {}", e))?;
+
+        self.restart_peripherals();
+        self.cpu.start();
+        Ok(())
     }
 
     /// Restart peripherals (MC, HPC3, REX3) without restarting the monitor server.
@@ -651,6 +818,11 @@ impl Machine {
     /// (see `profile_stale` in dispatch.rs).
     pub fn load_snapshot(&mut self, name: &str) -> Result<(), String> {
         self.stop();
+
+        // Any prior in-memory rollback checkpoint is now stale (it described
+        // a different snapshot). ci_restore will recapture if reached via
+        // that path; the monitor `load` command leaves it cleared.
+        self.last_restore_checkpoint = None;
 
         // Reset to clean state before loading
         self.power_on_devices();

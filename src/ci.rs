@@ -184,6 +184,9 @@ fn dispatch(server: &CiServer, req: &Request) -> Response {
         "save" => cmd_save(server, &req.args),
         "restore" => cmd_restore(server, &req.args),
         "rollback" => cmd_rollback(server),
+        "list" => cmd_list(&req.args),
+        "info" => cmd_info(&req.args),
+        "delete" => cmd_delete(&req.args),
         "serial-send" => cmd_serial_send(server, &req.args),
         "serial-read" => cmd_serial_read(server),
         "wait-serial" => cmd_wait_serial(server, &req.args),
@@ -236,6 +239,114 @@ fn cmd_rollback(server: &CiServer) -> Response {
         Ok(()) => Response::ok(),
         Err(e) => Response::err(format!("rollback failed: {}", e)),
     }
+}
+
+fn cmd_list(_args: &Value) -> Response {
+    // Walk saves/ recursively, return every directory that contains a
+    // snapshot.toml (current format) OR a cpu.toml (legacy v0). Names are
+    // returned slash-joined relative to saves/.
+    let root = std::path::Path::new("saves");
+    if !root.is_dir() {
+        return Response::data(serde_json::json!({ "snapshots": [] }));
+    }
+    let mut out: Vec<String> = Vec::new();
+    let mut stack: Vec<std::path::PathBuf> = vec![root.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        let entries = match std::fs::read_dir(&dir) {
+            Ok(e) => e,
+            Err(_) => continue,
+        };
+        let mut subdirs: Vec<std::path::PathBuf> = Vec::new();
+        let mut is_snapshot = false;
+        for e in entries.flatten() {
+            let p = e.path();
+            if p.is_dir() {
+                subdirs.push(p);
+            } else if let Some(name) = p.file_name().and_then(|n| n.to_str()) {
+                if name == "snapshot.toml" || name == "cpu.toml" {
+                    is_snapshot = true;
+                }
+            }
+        }
+        if is_snapshot {
+            if let Ok(rel) = dir.strip_prefix(root) {
+                let s = rel.to_string_lossy().replace('\\', "/");
+                if !s.is_empty() {
+                    out.push(s);
+                }
+            }
+        }
+        for s in subdirs {
+            stack.push(s);
+        }
+    }
+    out.sort();
+    Response::data(serde_json::json!({ "snapshots": out }))
+}
+
+fn cmd_info(args: &Value) -> Response {
+    let name = match args.get("name").and_then(|v| v.as_str()) {
+        Some(n) => n,
+        None => return Response::err("info: missing 'name' arg"),
+    };
+    let dir = std::path::Path::new("saves").join(name);
+    if !dir.is_dir() {
+        return Response::err(format!("info: snapshot '{}' not found", name));
+    }
+    let snap = crate::snapshot::Snapshot::new(&dir);
+    let manifest = match snap.read_manifest() {
+        Ok(Some(m)) => Some(m),
+        Ok(None) => None,
+        Err(e) => return Response::err(format!("info: manifest read failed: {}", e)),
+    };
+
+    // Disk usage rollup: sum file sizes inside the snapshot dir.
+    let mut bytes_on_disk: u64 = 0;
+    if let Ok(walker) = std::fs::read_dir(&dir) {
+        for e in walker.flatten() {
+            if let Ok(meta) = e.metadata() {
+                if meta.is_file() {
+                    bytes_on_disk += meta.len();
+                }
+            }
+        }
+    }
+
+    let mut out = serde_json::Map::new();
+    out.insert("name".into(), Value::String(name.to_string()));
+    out.insert("bytes_on_disk".into(), Value::Number(bytes_on_disk.into()));
+    if let Some(m) = manifest {
+        out.insert("schema_version".into(), Value::Number(m.schema_version.into()));
+        out.insert("host_arch".into(), Value::String(m.host_arch));
+        out.insert("created_at_unix".into(), Value::Number(m.created_at_unix.into()));
+        if let Some(rev) = m.iris_git_rev { out.insert("iris_git_rev".into(), Value::String(rev)); }
+        if let Some(p) = m.parent { out.insert("parent".into(), Value::String(p)); }
+        if let Some(d) = m.description { out.insert("description".into(), Value::String(d)); }
+        out.insert("installed_bundles".into(),
+            Value::Array(m.installed_bundles.into_iter().map(Value::String).collect()));
+    } else {
+        out.insert("schema_version".into(), Value::Number(0.into()));
+        out.insert("legacy".into(), Value::Bool(true));
+    }
+    Response::data(Value::Object(out))
+}
+
+fn cmd_delete(args: &Value) -> Response {
+    let name = match args.get("name").and_then(|v| v.as_str()) {
+        Some(n) => n,
+        None => return Response::err("delete: missing 'name' arg"),
+    };
+    if name.is_empty() || name.contains("..") {
+        return Response::err("delete: invalid name");
+    }
+    let dir = std::path::Path::new("saves").join(name);
+    if !dir.is_dir() {
+        return Response::err(format!("delete: snapshot '{}' not found", name));
+    }
+    if let Err(e) = std::fs::remove_dir_all(&dir) {
+        return Response::err(format!("delete: {}: {}", dir.display(), e));
+    }
+    Response::ok()
 }
 
 fn cmd_serial_send(server: &CiServer, args: &Value) -> Response {

@@ -3671,6 +3671,28 @@ impl Rex3 {
         Ok(())
     }
 
+    /// Clone the framebuffers (RGB and aux) into native-endian Vec<u32>
+    /// buffers. Pair with `restore_framebuffers_inmem` for the in-memory
+    /// rollback checkpoint; bypasses the byte-shuffle the disk path needs.
+    pub fn snapshot_framebuffers_inmem(&self) -> (Vec<u32>, Vec<u32>) {
+        let rgb = unsafe { &*self.fb_rgb.get() };
+        let aux = unsafe { &*self.fb_aux.get() };
+        (rgb.to_vec(), aux.to_vec())
+    }
+
+    /// Restore framebuffers from buffers captured by
+    /// `snapshot_framebuffers_inmem`. Lengths are clamped to the actual
+    /// framebuffer size.
+    pub fn restore_framebuffers_inmem(&self, rgb: &[u32], aux: &[u32]) {
+        let dst_rgb = unsafe { &mut *self.fb_rgb.get() };
+        let n = rgb.len().min(dst_rgb.len());
+        dst_rgb[..n].copy_from_slice(&rgb[..n]);
+
+        let dst_aux = unsafe { &mut *self.fb_aux.get() };
+        let n = aux.len().min(dst_aux.len());
+        dst_aux[..n].copy_from_slice(&aux[..n]);
+    }
+
     pub fn load_framebuffers(&self, dir: &std::path::Path) -> std::io::Result<()> {
         let path_rgb = dir.join("rex3_rgb.bin");
         if path_rgb.exists() {
