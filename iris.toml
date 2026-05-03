@@ -13,9 +13,11 @@ no_audio = false
 # PROM ROM image (required).
 prom = "prom.bin"
 
-# Window scale factor: 1 = native resolution, 2 = 2× for HiDPI/4K monitors.
+# Window scale factor. Uses logical points (macOS) / DPI-scaled pixels, so
+# scale=2 is visibly ~2× bigger than scale=1 on every display.
+# Valid: 1, 2, 3, or 4.
 # Can also be set with the --2x command-line flag (CLI takes precedence).
-scale = 1
+scale = 2
 
 # RAM bank sizes in MB.
 # Each bank must be 0 (absent), 8, 16, 32, 64, or 128.
@@ -32,19 +34,45 @@ banks = [128, 128, 0, 0]
 
 # Internal hard disk
 [scsi.1]
-path   = "scsi1.raw"
+path   = "irix65_4g.raw"
 cdrom  = false
+overlay = true
 
 # Internal hard disk
+#[scsi.2]
+#path   = "scsi2.raw"
+#cdrom  = false
+
+# Scratch volume for host<->guest file injection without networking.
+# iris auto-creates the file at `path` if missing — first 4 KB hold a minimal
+# SGI Volume Header (so IRIX recognises the device); the rest (size_mb MB
+# minus 4 KB) is the host-controlled payload area. The CI socket exposes
+# scratch-write/scratch-read/scratch-clear/scratch-info; offsets passed to
+# those commands are relative to the payload start, so the VH is never
+# touched. The guest reads the same bytes at offset 0 of /dev/rdsk/dks0dNvol.
+# No higher-level format is imposed — typical use is a tar stream:
+#   host:  iris CI: scratch-write {host_path: "bundle.tar"}
+#   guest: dd if=/dev/rdsk/dks0d2s0 bs=512 | tar xf -
+#          tar cf - /var/log/foo | dd of=/dev/rdsk/dks0d2s0 bs=512 conv=notrunc
+#   host:  iris CI: scratch-read {to_path: "log.tar"}
+# IRIX raw block-device reads must be sector-aligned (bs must be a multiple
+# of 512); bs=64 etc returns "Read error: I/O error".
+# Implies cdrom=false, overlay=false (the volume must be host-writable, and
+# scratch contents intentionally survive snapshot rollback so a freshly
+# injected bundle isn't reverted).
 [scsi.2]
-path   = "scsi2.raw"
-cdrom  = false
+path    = "scratch.raw"
+cdrom   = false
+overlay = false
+scratch = true
+size_mb = 64
 
 # NFS share — requires unfsd on the host.
 # The shared directory is exported to the VM at 192.168.0.1:/path (standard NFS port 2049).
 # From IRIX: mount 192.168.0.1:/absolute/path /mnt
 [nfs]
 shared_dir = "./shared"
+unfsd = "/usr/local/sbin/unfsd"
 
 # Port forwarding rules — forward host ports into the guest (IRIX).
 # proto:      "tcp" or "udp"
@@ -77,7 +105,7 @@ bind       = "localhost"
 # For a single disc, set path only.
 # For a changer (cycled with "scsi eject 4" in the monitor), list all
 # ISO images in `discs`; the first entry is mounted at startup.
-[scsi.4]
-path   = "cdrom4.iso"
-cdrom  = true
-#discs = ["second.iso", "cdrom4.iso", "patches.iso"]
+#[scsi.4]
+#path   = "cdrom4.iso"
+#cdrom  = true
+##discs = ["second.iso", "cdrom4.iso", "patches.iso"]
