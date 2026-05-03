@@ -195,6 +195,7 @@ fn dispatch(server: &CiServer, req: &Request) -> Response {
         "scratch-read"  => cmd_scratch_read(server, &req.args),
         "scratch-clear" => cmd_scratch_clear(server),
         "scratch-info"  => cmd_scratch_info(server),
+        "validate"      => cmd_validate(server, &req.args),
         other => Response::err(format!("unknown command: {}", other)),
     }
 }
@@ -619,4 +620,36 @@ fn cmd_scratch_info(server: &CiServer) -> Response {
         "payload_offset": SCRATCH_PAYLOAD_OFFSET,
         "payload_size_bytes": size.saturating_sub(SCRATCH_PAYLOAD_OFFSET),
     }))
+}
+
+// ----------------------------------------------------------------------------
+// Snapshot determinism validator (Phase 3.3)
+// ----------------------------------------------------------------------------
+
+fn cmd_validate(server: &CiServer, args: &Value) -> Response {
+    let name = match args.get("name").and_then(|v| v.as_str()) {
+        Some(n) => n.to_string(),
+        None => return Response::err("validate: missing 'name' arg"),
+    };
+    let n = args
+        .get("n_instructions")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(1_000_000);
+
+    let report_result = server.with_machine(|m| {
+        crate::validate::validate_snapshot_determinism(m, &name, n)
+    });
+
+    match report_result {
+        Ok(report) => Response::data(serde_json::json!({
+            "deterministic": report.deterministic,
+            "instructions_run": report.instructions_run,
+            "summary": report.summary(),
+            "diffs": report.diffs.iter().map(|(f, a, b)| {
+                serde_json::json!({"field": f, "a": a, "b": b})
+            }).collect::<Vec<_>>(),
+            "pc": format!("0x{:016x}", report.state_a.pc),
+        })),
+        Err(e) => Response::err(format!("validate: {}", e)),
+    }
 }

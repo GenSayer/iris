@@ -742,46 +742,75 @@ impl Device for Z85c30 {
 
             threads.push(thread::Builder::new().name(format!("SCC-RX-{}", ch_name)).spawn(move || {
                 let mut last_rx_time = Instant::now();
+                // When the SCC's 8-byte rx_queue is full, hold the just-read
+                // byte here and retry on the next iteration instead of
+                // dropping it. This prevents loss when the host pushes a
+                // long line into CiSerialBackend faster than IRIX's tty
+                // driver clocks bytes off rx_queue. Without this hold, a
+                // ~30-char `dd if=/dev/rdsk/dks0d2s0 bs=512` arrives at
+                // the shell as `dd if=/d=512` (chars 9..24 dropped).
+                let mut pending: Option<u8> = None;
 
                 while running.load(Ordering::Relaxed) {
-                    if let Ok(mut byte) = rx_backend.recv_byte() {
-                        if byte == 0x05 {
-                            crate::dlog_dev!(LogModule::Scc, "SCC: Converting ^E to ^D (BREAK)");
-                            byte = 0x04;
-                        }
-                        let (lock, _cvar) = &*rx_channel;
-                        let mut channel = lock.lock();
-                        
-                        let wr3 = channel.regs[scc_regs::WR3 as usize];
-                        let rx_enabled = (wr3 & wr3::RX_ENABLE) != 0;
-
-                        // Get pre-calculated delay
-                        let delay_micros = channel.tx_delay;
-                        let char_duration = Duration::from_micros(delay_micros);
-
-                        if rx_enabled && channel.rx_queue.len() < 8 {
-                            crate::dlog_dev!(LogModule::Scc, "SCC: RX({}) '{}' ({:02x})", channel.name, if byte.is_ascii_graphic() { byte as char } else { '.' }, byte);
-                            channel.rx_queue.push_back(byte);
-                            channel.status |= rr0::RX_CHAR_AVAILABLE;
-                            channel.update_ip();
-                        }
-
-                        drop(channel);
-
-                        let now = Instant::now();
-                        if last_rx_time < now {
-                            if now.duration_since(last_rx_time) > Duration::from_millis(100) {
-                                last_rx_time = now;
+                    let mut byte = match pending.take() {
+                        Some(b) => b,
+                        None => match rx_backend.recv_byte() {
+                            Ok(b) => b,
+                            Err(_) => {
+                                thread::sleep(Duration::from_millis(10));
+                                continue;
                             }
+                        },
+                    };
+                    if byte == 0x05 {
+                        crate::dlog_dev!(LogModule::Scc, "SCC: Converting ^E to ^D (BREAK)");
+                        byte = 0x04;
+                    }
+
+                    let (lock, _cvar) = &*rx_channel;
+                    let mut channel = lock.lock();
+
+                    let wr3 = channel.regs[scc_regs::WR3 as usize];
+                    let rx_enabled = (wr3 & wr3::RX_ENABLE) != 0;
+                    let delay_micros = channel.tx_delay;
+                    let char_duration = Duration::from_micros(delay_micros);
+
+                    if !rx_enabled {
+                        // RX disabled — drop the byte (matches real hw with
+                        // RX off). Don't hold it in `pending` or we'd block
+                        // forever waiting for re-enable.
+                        drop(channel);
+                        continue;
+                    }
+
+                    if channel.rx_queue.len() >= 8 {
+                        // SCC FIFO full. Hold the byte and back off briefly
+                        // so the guest's tty driver gets a chance to drain
+                        // rx_queue. Don't drop — that's the bug this
+                        // section fixes.
+                        drop(channel);
+                        pending = Some(byte);
+                        thread::sleep(Duration::from_millis(1));
+                        continue;
+                    }
+
+                    crate::dlog_dev!(LogModule::Scc, "SCC: RX({}) '{}' ({:02x})", channel.name, if byte.is_ascii_graphic() { byte as char } else { '.' }, byte);
+                    channel.rx_queue.push_back(byte);
+                    channel.status |= rr0::RX_CHAR_AVAILABLE;
+                    channel.update_ip();
+                    drop(channel);
+
+                    // Pacing — simulate baud-rate inter-character spacing.
+                    let now = Instant::now();
+                    if last_rx_time < now {
+                        if now.duration_since(last_rx_time) > Duration::from_millis(100) {
+                            last_rx_time = now;
                         }
-                        last_rx_time += char_duration;
-                        let wait = last_rx_time.saturating_duration_since(now);
-                        if !wait.is_zero() {
-                            thread::sleep(wait);
-                        }
-                    } else {
-                        // Avoid busy loop on error
-                        thread::sleep(Duration::from_millis(10));
+                    }
+                    last_rx_time += char_duration;
+                    let wait = last_rx_time.saturating_duration_since(now);
+                    if !wait.is_zero() {
+                        thread::sleep(wait);
                     }
                 }
             }).unwrap());
@@ -1020,5 +1049,60 @@ mod tests {
         let v2 = dst.save_state();
 
         assert_eq!(v1, v2, "Z85c30 save_state mismatch after load_state round-trip");
+    }
+
+    /// Phase 3.5: a long single-line `serial-send` from the host must arrive
+    /// at the guest's tty intact. Before the rx-thread fix, bytes 9..N of any
+    /// burst were silently dropped when SCC's 8-byte rx_queue filled — a 53-
+    /// char `dd if=/dev/rdsk/dks0d2s0 of=/tmp/r.bin bs=512 count=1\r` arrived
+    /// at IRIX as `dd if=/d=512 count=1`, causing CI scripts to fabricate
+    /// shell errors out of thin air. This test pushes that exact line through
+    /// the loopback CiSerialBackend, drains the SCC rx_queue at the rate the
+    /// IRIX kernel would (one byte at a time, polled), and asserts every
+    /// byte arrives.
+    #[test]
+    fn long_input_round_trips_without_loss() {
+        use std::sync::Arc;
+        use std::time::{Duration, Instant};
+
+        let scc = Z85c30::new_null(None);
+        let backend = Arc::new(CiSerialBackend::new());
+        scc.set_backend_a(backend.clone());
+
+        // Enable RX on channel A so the rx thread queues bytes. tx_delay is
+        // tx-direction baud-rate emulation; set a small value so the test
+        // doesn't pay 19.2 kbaud-per-char latency.
+        {
+            let mut ch = scc.channel_a.0.lock();
+            ch.regs[scc_regs::WR3 as usize] |= wr3::RX_ENABLE;
+            ch.tx_delay = 50; // 50 µs/byte
+        }
+
+        scc.start();
+
+        let line = b"dd if=/dev/rdsk/dks0d2s0 of=/tmp/r.bin bs=512 count=1\r";
+        backend.push_host(line);
+
+        // Drain rx_queue at ~20 kHz so the rx thread always has space to
+        // push pending bytes. Mirrors how IRIX's tty driver consumes
+        // RR0::RX_CHAR_AVAILABLE.
+        let mut received = Vec::with_capacity(line.len());
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while received.len() < line.len() && Instant::now() < deadline {
+            let popped = {
+                let mut ch = scc.channel_a.0.lock();
+                ch.rx_queue.pop_front()
+            };
+            match popped {
+                Some(b) => received.push(b),
+                None    => std::thread::sleep(Duration::from_micros(50)),
+            }
+        }
+
+        scc.stop();
+
+        assert_eq!(received.len(), line.len(),
+            "expected {} bytes, got {} (lossy rx_queue?)", line.len(), received.len());
+        assert_eq!(&received, line, "byte content mismatch — bytes dropped or reordered");
     }
 }

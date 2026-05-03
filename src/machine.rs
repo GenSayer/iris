@@ -587,6 +587,19 @@ impl Machine {
         self.cpu.start();
     }
 
+    /// Step the CPU `n` instructions in-line on the calling thread, with all
+    /// peripheral threads stopped so the CPU sees no external interrupts.
+    /// Used by Phase 3.3 snapshot determinism validator.
+    /// Caller must arrange `load_snapshot_paused` first.
+    pub fn cpu_step_n_inline(&self, n: u64) -> Result<u64, String> {
+        self.cpu.step_n_inline(n)
+    }
+
+    /// Snapshot the deterministic-from-state CPU registers.
+    pub fn cpu_state_digest(&self) -> Result<crate::mips_exec::CpuStateDigest, String> {
+        self.cpu.state_digest()
+    }
+
     /// Full rewind: load the named snapshot, which now captures the COW
     /// overlay too so the filesystem state is deterministic per snapshot.
     /// The CPU resumes automatically (load_snapshot restarts it). After the
@@ -846,15 +859,38 @@ impl Machine {
         Ok(())
     }
 
+    /// Restore full machine snapshot from `saves/<name>/`. CPU is auto-started
+    /// at the end so the guest resumes from the snapshotted PC.
+    /// For determinism validation use `load_snapshot_paused` instead.
+    pub fn load_snapshot(&mut self, name: &str) -> Result<(), String> {
+        self.load_snapshot_inner(name)?;
+        self.cpu.start();
+        println!("Snapshot loaded from saves/{}", name);
+        Ok(())
+    }
+
+    /// Same body as `load_snapshot` but leaves CPU and peripheral threads
+    /// stopped on return. Used by the Phase 3.3 determinism validator which
+    /// must prevent any thread from running between load and digest, since
+    /// thread scheduling jitter would mask CPU determinism issues.
+    pub fn load_snapshot_paused(&mut self, name: &str) -> Result<(), String> {
+        self.load_snapshot_inner(name)?;
+        // load_snapshot_inner restarted peripherals; stop them again.
+        self.hpc3.stop();
+        self.mc.stop();
+        if let Some(rex3) = &self._phys.rex3 { rex3.stop(); }
+        Ok(())
+    }
+
     /// Restore full machine snapshot from `saves/<name>/`.
     ///
     /// JIT-cache invariant: `self.stop()` exits the CPU thread, which drops
-    /// the `CodeCache` owned by `run_jit_dispatch`. The new thread spawned
-    /// by `self.cpu.start()` at the end builds a fresh cache. So no explicit
-    /// invalidation is needed here as long as that ownership pattern holds.
-    /// The persistent JIT profile uses content_hash to skip stale entries
-    /// (see `profile_stale` in dispatch.rs).
-    pub fn load_snapshot(&mut self, name: &str) -> Result<(), String> {
+    /// the `CodeCache` owned by `run_jit_dispatch`. Subsequent `cpu.start()`
+    /// (in the public `load_snapshot` wrapper) builds a fresh cache. So no
+    /// explicit invalidation is needed here as long as that ownership
+    /// pattern holds. The persistent JIT profile uses content_hash to skip
+    /// stale entries (see `profile_stale` in dispatch.rs).
+    fn load_snapshot_inner(&mut self, name: &str) -> Result<(), String> {
         self.stop();
 
         // Any prior in-memory rollback checkpoint is now stale (it described
@@ -969,9 +1005,6 @@ impl Machine {
         }
 
         self.restart_peripherals();
-        // Resume the guest so the session continues from the snapshotted PC.
-        self.cpu.start();
-        println!("Snapshot loaded from saves/{}", name);
         Ok(())
     }
 }
