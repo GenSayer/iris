@@ -727,55 +727,26 @@ impl Machine {
         let mut manifest = Manifest::for_current_save();
         manifest.parent = self.last_restore.clone();
         snap.write_manifest(&manifest).map_err(|e| e.to_string())?;
+        let sv = manifest.schema_version;
 
-        // CPU + TLB
-        let cpu_toml = self.cpu.save_state();
-        snap.write_toml("cpu.toml", &cpu_toml).map_err(|e| e.to_string())?;
+        // Device state — schema_version=2 writes *.bin (postcard-encoded
+        // BinValue tree); legacy writes *.toml. write_state encapsulates the
+        // choice so this orchestrator stays format-agnostic.
+        snap.write_state("cpu",    &self.cpu.save_state(),                         sv).map_err(|e| e.to_string())?;
+        snap.write_state("mc",     &self.mc.save_state(),                          sv).map_err(|e| e.to_string())?;
+        snap.write_state("ioc",    &self.hpc3.ioc().save_state(),                  sv).map_err(|e| e.to_string())?;
+        snap.write_state("scc",    &self.hpc3.ioc().scc().save_state(),            sv).map_err(|e| e.to_string())?;
+        snap.write_state("pit",    &self.hpc3.ioc().pit().save_state(),            sv).map_err(|e| e.to_string())?;
+        snap.write_state("ps2",    &self.hpc3.ioc().ps2().save_state(),            sv).map_err(|e| e.to_string())?;
+        snap.write_state("rtc",    &self.hpc3.rtc().save_state(),                  sv).map_err(|e| e.to_string())?;
+        snap.write_state("eeprom", &self.hpc3.eeprom().lock().save_state_owned(),  sv).map_err(|e| e.to_string())?;
+        snap.write_state("scsi",   &self.hpc3.scsi().save_state(),                 sv).map_err(|e| e.to_string())?;
+        snap.write_state("seeq",   &self.hpc3.seeq().save_state(),                 sv).map_err(|e| e.to_string())?;
+        snap.write_state("hpc3",   &self.hpc3.save_state(),                        sv).map_err(|e| e.to_string())?;
 
-        // Memory Controller
-        let mc_toml = self.mc.save_state();
-        snap.write_toml("mc.toml", &mc_toml).map_err(|e| e.to_string())?;
-
-        // IOC
-        let ioc_toml = self.hpc3.ioc().save_state();
-        snap.write_toml("ioc.toml", &ioc_toml).map_err(|e| e.to_string())?;
-
-        // SCC (Z85C30 serial)
-        let scc_toml = self.hpc3.ioc().scc().save_state();
-        snap.write_toml("scc.toml", &scc_toml).map_err(|e| e.to_string())?;
-
-        // PIT (8254 timer)
-        let pit_toml = self.hpc3.ioc().pit().save_state();
-        snap.write_toml("pit.toml", &pit_toml).map_err(|e| e.to_string())?;
-
-        // PS2
-        let ps2_toml = self.hpc3.ioc().ps2().save_state();
-        snap.write_toml("ps2.toml", &ps2_toml).map_err(|e| e.to_string())?;
-
-        // RTC (DS1x86)
-        let rtc_toml = self.hpc3.rtc().save_state();
-        snap.write_toml("rtc.toml", &rtc_toml).map_err(|e| e.to_string())?;
-
-        // EEPROM (93C56)
-        let eeprom_toml = self.hpc3.eeprom().lock().save_state_owned();
-        snap.write_toml("eeprom.toml", &eeprom_toml).map_err(|e| e.to_string())?;
-
-        // SCSI (WD33C93A)
-        let scsi_toml = self.hpc3.scsi().save_state();
-        snap.write_toml("scsi.toml", &scsi_toml).map_err(|e| e.to_string())?;
-
-        // Seeq8003 (Ethernet)
-        let seeq_toml = self.hpc3.seeq().save_state();
-        snap.write_toml("seeq.toml", &seeq_toml).map_err(|e| e.to_string())?;
-
-        // HPC3
-        let hpc3_toml = self.hpc3.save_state();
-        snap.write_toml("hpc3.toml", &hpc3_toml).map_err(|e| e.to_string())?;
-
-        // REX3
+        // REX3 (optional — absent in headless config)
         if let Some(rex3) = &self._phys.rex3 {
-            let rex3_toml = rex3.save_state();
-            snap.write_toml("rex3.toml", &rex3_toml).map_err(|e| e.to_string())?;
+            snap.write_state("rex3", &rex3.save_state(), sv).map_err(|e| e.to_string())?;
             rex3.save_framebuffers(&snap.dir).map_err(|e| e.to_string())?;
         }
 
@@ -834,7 +805,7 @@ impl Machine {
         // (no snapshot.toml) are accepted with a warning. Cross-arch loads are
         // refused — FPU bit-layout differs between aarch64 and x86_64 and we
         // don't have migration plumbing yet.
-        match snap.read_manifest()? {
+        let schema_version = match snap.read_manifest()? {
             Some(m) => {
                 if m.host_arch != std::env::consts::ARCH {
                     return Err(format!(
@@ -855,60 +826,52 @@ impl Machine {
                         }
                     }
                 }
+                m.schema_version
             }
             None => {
                 eprintln!("load_snapshot: no snapshot.toml in {} — treating as legacy v0 (no manifest)", dir.display());
+                0
             }
-        }
+        };
 
-        // CPU + TLB
-        let cpu_toml = snap.read_toml("cpu.toml").map_err(|e| e.to_string())?;
-        self.cpu.load_state(&cpu_toml)?;
+        // Device state — read_state picks <base>.bin (v2+) or <base>.toml
+        // (legacy). v2 also falls back to .toml if .bin is absent.
+        let cpu = snap.read_state("cpu", schema_version).map_err(|e| e.to_string())?;
+        self.cpu.load_state(&cpu)?;
 
-        // Memory Controller
-        let mc_toml = snap.read_toml("mc.toml").map_err(|e| e.to_string())?;
-        self.mc.load_state(&mc_toml)?;
+        let mc = snap.read_state("mc", schema_version).map_err(|e| e.to_string())?;
+        self.mc.load_state(&mc)?;
 
-        // IOC
-        let ioc_toml = snap.read_toml("ioc.toml").map_err(|e| e.to_string())?;
-        self.hpc3.ioc().load_state(&ioc_toml)?;
+        let ioc = snap.read_state("ioc", schema_version).map_err(|e| e.to_string())?;
+        self.hpc3.ioc().load_state(&ioc)?;
 
-        // SCC (Z85C30 serial)
-        let scc_toml = snap.read_toml("scc.toml").map_err(|e| e.to_string())?;
-        self.hpc3.ioc().scc().load_state(&scc_toml)?;
+        let scc = snap.read_state("scc", schema_version).map_err(|e| e.to_string())?;
+        self.hpc3.ioc().scc().load_state(&scc)?;
 
-        // PIT (8254 timer)
-        let pit_toml = snap.read_toml("pit.toml").map_err(|e| e.to_string())?;
-        self.hpc3.ioc().pit().load_state(&pit_toml)?;
+        let pit = snap.read_state("pit", schema_version).map_err(|e| e.to_string())?;
+        self.hpc3.ioc().pit().load_state(&pit)?;
 
-        // PS2
-        let ps2_toml = snap.read_toml("ps2.toml").map_err(|e| e.to_string())?;
-        self.hpc3.ioc().ps2().load_state(&ps2_toml)?;
+        let ps2 = snap.read_state("ps2", schema_version).map_err(|e| e.to_string())?;
+        self.hpc3.ioc().ps2().load_state(&ps2)?;
 
-        // RTC (DS1x86)
-        let rtc_toml = snap.read_toml("rtc.toml").map_err(|e| e.to_string())?;
-        self.hpc3.rtc().load_state(&rtc_toml)?;
+        let rtc = snap.read_state("rtc", schema_version).map_err(|e| e.to_string())?;
+        self.hpc3.rtc().load_state(&rtc)?;
 
-        // EEPROM (93C56)
-        let eeprom_toml = snap.read_toml("eeprom.toml").map_err(|e| e.to_string())?;
-        self.hpc3.eeprom().lock().load_state_mut(&eeprom_toml)?;
+        let eeprom = snap.read_state("eeprom", schema_version).map_err(|e| e.to_string())?;
+        self.hpc3.eeprom().lock().load_state_mut(&eeprom)?;
 
-        // SCSI (WD33C93A)
-        let scsi_toml = snap.read_toml("scsi.toml").map_err(|e| e.to_string())?;
-        self.hpc3.scsi().load_state(&scsi_toml)?;
+        let scsi = snap.read_state("scsi", schema_version).map_err(|e| e.to_string())?;
+        self.hpc3.scsi().load_state(&scsi)?;
 
-        // Seeq8003 (Ethernet)
-        let seeq_toml = snap.read_toml("seeq.toml").map_err(|e| e.to_string())?;
-        self.hpc3.seeq().load_state(&seeq_toml)?;
+        let seeq = snap.read_state("seeq", schema_version).map_err(|e| e.to_string())?;
+        self.hpc3.seeq().load_state(&seeq)?;
 
-        // HPC3
-        let hpc3_toml = snap.read_toml("hpc3.toml").map_err(|e| e.to_string())?;
-        self.hpc3.load_state(&hpc3_toml)?;
+        let hpc3 = snap.read_state("hpc3", schema_version).map_err(|e| e.to_string())?;
+        self.hpc3.load_state(&hpc3)?;
 
-        // REX3
         if let Some(rex3) = &self._phys.rex3 {
-            let rex3_toml = snap.read_toml("rex3.toml").map_err(|e| e.to_string())?;
-            rex3.load_state(&rex3_toml)?;
+            let rex3_v = snap.read_state("rex3", schema_version).map_err(|e| e.to_string())?;
+            rex3.load_state(&rex3_v)?;
             rex3.load_framebuffers(&snap.dir).map_err(|e| e.to_string())?;
         }
 

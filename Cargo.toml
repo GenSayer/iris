@@ -40,6 +40,7 @@ cpal = "0.15"
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0"
 toml = "1.0.3"
+postcard = { version = "1", features = ["alloc"] }
 png = "0.17"
 parking_lot = "0.12"
 png = "0.17"

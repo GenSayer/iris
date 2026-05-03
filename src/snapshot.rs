@@ -1,16 +1,23 @@
 // System Snapshot — save and restore full machine state to/from a directory.
 //
-// Layout of saves/<name>/:
-//   cpu.toml       — CPU core (GPRs, CP0, FPU), TLB entries
-//   mc.toml        — Memory Controller registers + GIO DMA state
-//   ioc.toml       — IOC interrupt registers
-//   hpc3.toml      — HPC3 state register, PBUS PIO, DMA channel registers
-//   rex3.toml      — REX3 drawing registers, VC2, XMAP9, CMAP palette
+// Layout of saves/<name>/ (schema_version = 2):
+//   snapshot.toml  — manifest (always TOML, human-readable)
+//   cpu.bin        — CPU core (GPRs, CP0, FPU), TLB entries  (postcard BinValue)
+//   mc.bin         — Memory Controller registers + GIO DMA state
+//   ioc.bin        — IOC interrupt registers
+//   hpc3.bin       — HPC3 state register, PBUS PIO, DMA channel registers
+//   rex3.bin       — REX3 drawing registers, VC2, XMAP9, CMAP palette
+//   {scc,pit,ps2,rtc,eeprom,scsi,seeq}.bin — peripheral device state
+//   cow.toml       — COW overlay dirty sectors per SCSI device (stays TOML)
 //   bank0.bin      — 128 MB RAM bank A (raw u8, big-endian word layout)
 //   bank1.bin      — 128 MB RAM bank B
 //   bank2.bin      — 128 MB RAM bank C
 //   bank3.bin      — 128 MB RAM bank D
+//
+// schema_version = 1: same layout but device state is *.toml (hex strings).
+// schema_version = 0 (no manifest): legacy, also *.toml.
 
+use serde::{Deserialize, Serialize};
 use std::fs;
 use std::io::{Read, Write};
 use std::path::PathBuf;
@@ -19,7 +26,11 @@ use toml::Value;
 /// On-disk schema version for the snapshot directory layout. Bumped when a
 /// device's save_state format changes incompatibly. Old snapshots without a
 /// manifest are treated as v0 (legacy, best-effort load).
-pub const SCHEMA_VERSION: u32 = 1;
+///
+/// v1 → v2: device state moved from *.toml (hex strings, ~80 ms cpu.toml
+/// parse) to *.bin (postcard-encoded BinValue tree, sub-millisecond). Manifest
+/// and cow.toml stay TOML.
+pub const SCHEMA_VERSION: u32 = 2;
 
 const MANIFEST_FILE: &str = "snapshot.toml";
 
@@ -148,6 +159,49 @@ impl Snapshot {
         fs::read(path)
     }
 
+    /// Postcard-encode a `toml::Value` (via the tagged `BinValue` mirror) and
+    /// write it as `<name>`. Sub-millisecond for typical device tables vs ~80
+    /// ms TOML parse on cpu.toml.
+    pub fn write_value_bin(&self, name: &str, v: &Value) -> std::io::Result<()> {
+        let bv = BinValue::from_toml(v);
+        let bytes = postcard::to_allocvec(&bv)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+        self.write_bin(name, &bytes)
+    }
+
+    /// Inverse of `write_value_bin`. Returns the reconstructed `toml::Value`.
+    pub fn read_value_bin(&self, name: &str) -> std::io::Result<Value> {
+        let bytes = self.read_bin(name)?;
+        let bv: BinValue = postcard::from_bytes(&bytes)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+        Ok(bv.into_toml())
+    }
+
+    /// Write a device save_state value, picking `<base>.bin` for v2+ and
+    /// `<base>.toml` for legacy schemas. Centralizes the per-call branching
+    /// in machine.rs.
+    pub fn write_state(&self, base: &str, v: &Value, schema_version: u32) -> std::io::Result<()> {
+        if schema_version >= 2 {
+            self.write_value_bin(&format!("{}.bin", base), v)
+        } else {
+            self.write_toml(&format!("{}.toml", base), v)
+        }
+    }
+
+    /// Read a device save_state value. For v2+ tries `<base>.bin` first and
+    /// falls back to `<base>.toml` for snapshots half-migrated by external
+    /// tooling. For legacy schemas reads `<base>.toml` directly.
+    pub fn read_state(&self, base: &str, schema_version: u32) -> std::io::Result<Value> {
+        if schema_version >= 2 {
+            match self.read_value_bin(&format!("{}.bin", base)) {
+                Ok(v) => Ok(v),
+                Err(_) => self.read_toml(&format!("{}.toml", base)),
+            }
+        } else {
+            self.read_toml(&format!("{}.toml", base))
+        }
+    }
+
     pub fn ensure_dir(&self) -> std::io::Result<()> {
         fs::create_dir_all(&self.dir)
     }
@@ -166,6 +220,76 @@ impl Snapshot {
         }
         let v = self.read_toml(MANIFEST_FILE).map_err(|e| e.to_string())?;
         Manifest::from_toml(&v).map(Some)
+    }
+}
+
+// ---- BinValue: tagged binary mirror of toml::Value ----
+//
+// Postcard is non-self-describing — it cannot deserialize directly into the
+// untagged `toml::Value` enum (which relies on `deserialize_any`). BinValue
+// carries an explicit variant tag so postcard can round-trip it. The
+// conversion to/from `toml::Value` is a single tree walk and runs in low
+// milliseconds even for the largest device tables.
+//
+// Datetime is rare in our save_state output — encode it as an ISO-8601 string
+// and reparse on the way back. If parsing fails the value falls back to a
+// plain `toml::Value::String` so a malformed datetime never panics a load.
+
+/// Tagged binary mirror of `toml::Value`. Order-preserving for tables (matches
+/// `toml::Value::Table` which uses an `IndexMap` under the hood).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum BinValue {
+    String(String),
+    Integer(i64),
+    Float(f64),
+    Boolean(bool),
+    Array(Vec<BinValue>),
+    Table(Vec<(String, BinValue)>),
+    Datetime(String),
+}
+
+impl BinValue {
+    pub fn from_toml(v: &Value) -> Self {
+        match v {
+            Value::String(s) => BinValue::String(s.clone()),
+            Value::Integer(i) => BinValue::Integer(*i),
+            Value::Float(f) => BinValue::Float(*f),
+            Value::Boolean(b) => BinValue::Boolean(*b),
+            Value::Array(arr) => {
+                BinValue::Array(arr.iter().map(BinValue::from_toml).collect())
+            }
+            Value::Table(tbl) => {
+                let mut out = Vec::with_capacity(tbl.len());
+                for (k, v) in tbl {
+                    out.push((k.clone(), BinValue::from_toml(v)));
+                }
+                BinValue::Table(out)
+            }
+            Value::Datetime(dt) => BinValue::Datetime(dt.to_string()),
+        }
+    }
+
+    pub fn into_toml(self) -> Value {
+        match self {
+            BinValue::String(s) => Value::String(s),
+            BinValue::Integer(i) => Value::Integer(i),
+            BinValue::Float(f) => Value::Float(f),
+            BinValue::Boolean(b) => Value::Boolean(b),
+            BinValue::Array(arr) => {
+                Value::Array(arr.into_iter().map(BinValue::into_toml).collect())
+            }
+            BinValue::Table(entries) => {
+                let mut tbl = toml::map::Map::new();
+                for (k, v) in entries {
+                    tbl.insert(k, v.into_toml());
+                }
+                Value::Table(tbl)
+            }
+            BinValue::Datetime(s) => match s.parse::<toml::value::Datetime>() {
+                Ok(dt) => Value::Datetime(dt),
+                Err(_) => Value::String(s),
+            },
+        }
     }
 }
 
@@ -382,5 +506,151 @@ mod tests {
         assert_eq!(m.schema_version, SCHEMA_VERSION);
         assert_eq!(m.host_arch, std::env::consts::ARCH);
         assert!(m.parent.is_none());
+    }
+
+    fn sample_value() -> Value {
+        // Mirrors a slice of cpu.toml: top-level scalars + a sub-table with
+        // mixed integer/string/array entries. Order matters for the table
+        // round-trip assertion.
+        let mut cp0 = toml::map::Map::new();
+        cp0.insert("cp0_index".into(), Value::String("0x00000001".into()));
+        cp0.insert("cp0_count".into(), Value::String("0x000000000badf00d".into()));
+        cp0.insert("cp0_status".into(), Value::Integer(0x4040_0000));
+        let mut tbl = toml::map::Map::new();
+        tbl.insert("pc".into(), Value::String("0x9fc00000".into()));
+        tbl.insert(
+            "gpr".into(),
+            Value::Array(vec![
+                Value::String("0x0000000000000000".into()),
+                Value::String("0x0000000000000001".into()),
+                Value::String("0xffffffff80001234".into()),
+            ]),
+        );
+        tbl.insert("cp0".into(), Value::Table(cp0));
+        tbl.insert("running".into(), Value::Boolean(true));
+        tbl.insert("ratio".into(), Value::Float(1.5));
+        Value::Table(tbl)
+    }
+
+    #[test]
+    fn binvalue_round_trip_matches_toml() {
+        let v = sample_value();
+        let bv = BinValue::from_toml(&v);
+        let back = bv.into_toml();
+        assert_eq!(back, v);
+    }
+
+    #[test]
+    fn binvalue_postcard_round_trip() {
+        let v = sample_value();
+        let bv = BinValue::from_toml(&v);
+        let bytes = postcard::to_allocvec(&bv).expect("encode");
+        let bv2: BinValue = postcard::from_bytes(&bytes).expect("decode");
+        assert_eq!(bv2.into_toml(), v);
+    }
+
+    #[test]
+    fn write_state_v2_writes_bin_and_reads_back() {
+        let dir = unique_tmp_dir("state-v2");
+        let snap = Snapshot::new(&dir);
+        let v = sample_value();
+        snap.write_state("cpu", &v, 2).expect("write v2");
+        assert!(dir.join("cpu.bin").exists(), "expected cpu.bin to be written");
+        assert!(!dir.join("cpu.toml").exists(), "v2 must not write cpu.toml");
+        let back = snap.read_state("cpu", 2).expect("read v2");
+        assert_eq!(back, v);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn write_state_v1_writes_toml_and_reads_back() {
+        let dir = unique_tmp_dir("state-v1");
+        let snap = Snapshot::new(&dir);
+        let v = sample_value();
+        snap.write_state("cpu", &v, 1).expect("write v1");
+        assert!(dir.join("cpu.toml").exists(), "expected cpu.toml to be written");
+        assert!(!dir.join("cpu.bin").exists(), "v1 must not write cpu.bin");
+        let back = snap.read_state("cpu", 1).expect("read v1");
+        assert_eq!(back, v);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn read_state_v2_falls_back_to_toml_when_bin_missing() {
+        // External tooling may legitimately produce a v2 manifest with .toml
+        // device files (e.g. dump-and-edit workflow). Loader must be tolerant.
+        let dir = unique_tmp_dir("state-fallback");
+        let snap = Snapshot::new(&dir);
+        let v = sample_value();
+        snap.write_toml("cpu.toml", &v).expect("write toml");
+        let back = snap.read_state("cpu", 2).expect("read with fallback");
+        assert_eq!(back, v);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// Hand-runnable bench: `cargo test --release --features lightning -- --ignored bench_cpu_toml_vs_bin --nocapture`.
+    /// Reads saves/working/cpu.toml (3.6 MB legacy snapshot) and prints the
+    /// parse-time delta between toml::from_str and postcard::from_bytes.
+    #[test]
+    #[ignore]
+    fn bench_cpu_toml_vs_bin() {
+        let path = "saves/working/cpu.toml";
+        let s = match std::fs::read_to_string(path) {
+            Ok(s) => s,
+            Err(e) => {
+                eprintln!("skipping: cannot read {}: {}", path, e);
+                return;
+            }
+        };
+        println!("cpu.toml: {} bytes", s.len());
+
+        let runs = 5;
+        let mut toml_total_us = 0u128;
+        let mut toml_v: Option<Value> = None;
+        for _ in 0..runs {
+            let t = std::time::Instant::now();
+            toml_v = Some(toml::from_str::<Value>(&s).unwrap());
+            toml_total_us += t.elapsed().as_micros();
+        }
+        println!("toml::from_str avg over {} runs: {:.2} ms",
+                 runs, toml_total_us as f64 / runs as f64 / 1000.0);
+
+        let v = toml_v.take().unwrap();
+        let bv = BinValue::from_toml(&v);
+        let bytes = postcard::to_allocvec(&bv).unwrap();
+        println!("postcard encoded: {} bytes (vs toml {} bytes, ratio {:.2}x)",
+                 bytes.len(), s.len(), s.len() as f64 / bytes.len() as f64);
+
+        let mut bin_total_us = 0u128;
+        for _ in 0..runs {
+            let t = std::time::Instant::now();
+            let bv: BinValue = postcard::from_bytes(&bytes).unwrap();
+            let _ = bv.into_toml();
+            bin_total_us += t.elapsed().as_micros();
+        }
+        println!("postcard decode + into_toml avg over {} runs: {:.2} ms",
+                 runs, bin_total_us as f64 / runs as f64 / 1000.0);
+        println!("speedup: {:.1}x",
+                 toml_total_us as f64 / bin_total_us as f64);
+    }
+
+    #[test]
+    fn binvalue_payload_is_smaller_than_toml() {
+        // Sanity check the size win on a representative-ish payload.
+        let mut tbl = toml::map::Map::new();
+        let big_arr: Vec<Value> = (0..1024)
+            .map(|i| Value::String(format!("0x{:016x}", i as u64)))
+            .collect();
+        tbl.insert("gpr_big".into(), Value::Array(big_arr));
+        let v = Value::Table(tbl);
+        let toml_bytes = toml::to_string(&v).unwrap().into_bytes();
+        let bv = BinValue::from_toml(&v);
+        let bin_bytes = postcard::to_allocvec(&bv).unwrap();
+        assert!(
+            bin_bytes.len() < toml_bytes.len(),
+            "bin {} bytes should be smaller than toml {} bytes",
+            bin_bytes.len(),
+            toml_bytes.len()
+        );
     }
 }
