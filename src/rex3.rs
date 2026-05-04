@@ -5,7 +5,7 @@ use std::thread;
 use crossbeam_utils::CachePadded;
 use crate::traits::{BusRead8, BusRead16, BusRead32, BusRead64, BUS_OK, BUS_ERR, BusDevice, Device, Resettable, Saveable};
 use crate::devlog::{LogModule, devlog_is_active, devlog};
-use crate::snapshot::{get_field, u32_slice_to_toml, u16_slice_to_toml, load_u32_slice, load_u16_slice, toml_u32, toml_u64, hex_u32, hex_u64};
+use crate::snapshot::{get_field, u32_slice_to_toml, u16_slice_to_toml, u8_slice_to_toml, load_u32_slice, load_u16_slice, load_u8_slice, toml_u32, toml_u64, toml_u8, hex_u32, hex_u64, hex_u8};
 use std::cell::{Cell, UnsafeCell};
 use crate::vc2::Vc2;
 use crate::xmap9::Xmap9;
@@ -3671,6 +3671,28 @@ impl Rex3 {
         Ok(())
     }
 
+    /// Clone the framebuffers (RGB and aux) into native-endian Vec<u32>
+    /// buffers. Pair with `restore_framebuffers_inmem` for the in-memory
+    /// rollback checkpoint; bypasses the byte-shuffle the disk path needs.
+    pub fn snapshot_framebuffers_inmem(&self) -> (Vec<u32>, Vec<u32>) {
+        let rgb = unsafe { &*self.fb_rgb.get() };
+        let aux = unsafe { &*self.fb_aux.get() };
+        (rgb.to_vec(), aux.to_vec())
+    }
+
+    /// Restore framebuffers from buffers captured by
+    /// `snapshot_framebuffers_inmem`. Lengths are clamped to the actual
+    /// framebuffer size.
+    pub fn restore_framebuffers_inmem(&self, rgb: &[u32], aux: &[u32]) {
+        let dst_rgb = unsafe { &mut *self.fb_rgb.get() };
+        let n = rgb.len().min(dst_rgb.len());
+        dst_rgb[..n].copy_from_slice(&rgb[..n]);
+
+        let dst_aux = unsafe { &mut *self.fb_aux.get() };
+        let n = aux.len().min(dst_aux.len());
+        dst_aux[..n].copy_from_slice(&aux[..n]);
+    }
+
     pub fn load_framebuffers(&self, dir: &std::path::Path) -> std::io::Result<()> {
         let path_rgb = dir.join("rex3_rgb.bin");
         if path_rgb.exists() {
@@ -4657,6 +4679,13 @@ impl Saveable for Rex3 {
             tbl.insert("cmap1".into(), save_cmap(&cmap));
         }
 
+        // Bt445 RAMDAC (palette + registers) — missing this makes every
+        // pixel decode to black after restore.
+        {
+            let dac = self.bt445.lock();
+            tbl.insert("bt445".into(), save_bt445(&dac));
+        }
+
         toml::Value::Table(tbl)
     }
 
@@ -4691,6 +4720,7 @@ impl Saveable for Rex3 {
         if let Some(xv) = get_field(v, "xmap1") { load_xmap9(&mut self.xmap1.lock(), xv); }
         if let Some(cv) = get_field(v, "cmap0") { load_cmap(&mut self.cmap0.lock(), cv); }
         if let Some(cv) = get_field(v, "cmap1") { load_cmap(&mut self.cmap1.lock(), cv); }
+        if let Some(dv) = get_field(v, "bt445") { load_bt445(&mut self.bt445.lock(), dv); }
 
         Ok(())
     }
@@ -4730,6 +4760,63 @@ fn load_cmap(cmap: &mut crate::cmap::Cmap, v: &toml::Value) {
     if let Some(x) = get_field(v, "command")  { cmap.command  = toml_u32(x).unwrap_or(0) as u8; }
     if let Some(r) = get_field(v, "palette")  { load_u32_slice(r, &mut cmap.palette); }
     cmap.dirty = true;
+}
+
+// Bt445 RAMDAC: palette + control registers. Critical for snapshot restore
+// because `power_on` wipes the palette to all-zero, which makes every pixel
+// decode to black after the gamma lookup in disp.rs::refresh.
+fn save_bt445(dac: &crate::bt445::Bt445) -> toml::Value {
+    let flatten = |rgb: &[[u8; 3]]| -> Vec<u8> {
+        let mut v = Vec::with_capacity(rgb.len() * 3);
+        for e in rgb { v.extend_from_slice(e); }
+        v
+    };
+    let mut tbl = toml::map::Map::new();
+    tbl.insert("palette".into(),      u8_slice_to_toml(&flatten(&dac.palette)));
+    tbl.insert("overlay".into(),      u8_slice_to_toml(&flatten(&dac.overlay)));
+    tbl.insert("cursor_color".into(), u8_slice_to_toml(&flatten(&dac.cursor_color)));
+    tbl.insert("addr".into(),         hex_u8(dac.addr));
+    tbl.insert("rgb_counter".into(),  hex_u8(dac.rgb_counter));
+    tbl.insert("read_enable".into(),  hex_u8(dac.read_enable));
+    tbl.insert("blink_enable".into(), hex_u8(dac.blink_enable));
+    tbl.insert("cmd0".into(),         hex_u8(dac.cmd0));
+    tbl.insert("rgb_ctrl".into(),     u8_slice_to_toml(&dac.rgb_ctrl));
+    tbl.insert("setup".into(),        u8_slice_to_toml(&dac.setup));
+    toml::Value::Table(tbl)
+}
+
+fn load_bt445(dac: &mut crate::bt445::Bt445, v: &toml::Value) {
+    let unflatten = |bytes: &[u8], dest: &mut [[u8; 3]]| {
+        for (i, chunk) in bytes.chunks(3).enumerate() {
+            if i >= dest.len() { break; }
+            if chunk.len() == 3 {
+                dest[i] = [chunk[0], chunk[1], chunk[2]];
+            }
+        }
+    };
+    if let Some(r) = get_field(v, "palette") {
+        let mut buf = vec![0u8; dac.palette.len() * 3];
+        load_u8_slice(r, &mut buf);
+        unflatten(&buf, &mut dac.palette);
+    }
+    if let Some(r) = get_field(v, "overlay") {
+        let mut buf = vec![0u8; dac.overlay.len() * 3];
+        load_u8_slice(r, &mut buf);
+        unflatten(&buf, &mut dac.overlay);
+    }
+    if let Some(r) = get_field(v, "cursor_color") {
+        let mut buf = vec![0u8; dac.cursor_color.len() * 3];
+        load_u8_slice(r, &mut buf);
+        unflatten(&buf, &mut dac.cursor_color);
+    }
+    if let Some(x) = get_field(v, "addr")         { if let Some(n) = toml_u8(x) { dac.addr = n; } }
+    if let Some(x) = get_field(v, "rgb_counter")  { if let Some(n) = toml_u8(x) { dac.rgb_counter = n; } }
+    if let Some(x) = get_field(v, "read_enable")  { if let Some(n) = toml_u8(x) { dac.read_enable = n; } }
+    if let Some(x) = get_field(v, "blink_enable") { if let Some(n) = toml_u8(x) { dac.blink_enable = n; } }
+    if let Some(x) = get_field(v, "cmd0")         { if let Some(n) = toml_u8(x) { dac.cmd0 = n; } }
+    if let Some(r) = get_field(v, "rgb_ctrl")     { load_u8_slice(r, &mut dac.rgb_ctrl); }
+    if let Some(r) = get_field(v, "setup")        { load_u8_slice(r, &mut dac.setup); }
+    dac.dirty = true;
 }
 
 #[cfg(test)]

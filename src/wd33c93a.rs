@@ -234,12 +234,27 @@ impl Wd33c93a {
     /// For CD-ROMs, `discs` is the full ordered list of ISO paths; the first
     /// entry is mounted immediately.  For HDDs `discs` is ignored — only
     /// `path` is used.
-    pub fn add_device(&self, id: usize, path: &str, is_cdrom: bool, discs: Vec<String>, overlay: bool) -> std::io::Result<()> {
+    ///
+    /// If `overlay_path_override` is `Some`, it specifies where the COW
+    /// overlay file lives. This lets CI mode isolate its overlay from an
+    /// interactive session sharing the same base image. Ignored when
+    /// `overlay` is false.
+    pub fn add_device(
+        &self,
+        id: usize,
+        path: &str,
+        is_cdrom: bool,
+        discs: Vec<String>,
+        overlay: bool,
+        overlay_path_override: Option<&str>,
+    ) -> std::io::Result<()> {
         use crate::cow_disk::CowDisk;
         use crate::scsi::DiskBackend;
 
         let (backend, size) = if overlay && !is_cdrom {
-            let overlay_path = format!("{}.overlay", path);
+            let overlay_path = overlay_path_override
+                .map(|s| s.to_string())
+                .unwrap_or_else(|| format!("{}.overlay", path));
             let cow = CowDisk::new(path, &overlay_path)?;
             let sz = cow.size();
             (DiskBackend::Cow(cow), sz)
@@ -315,6 +330,59 @@ impl Wd33c93a {
                 Some((id, dev.current_disc().to_string(), dev.disc_list().to_vec(), phys, logical))
             })
             .collect()
+    }
+
+    /// Reset the COW overlay on every attached device that's using COW.
+    /// Direct-mode devices are left alone. Used by `Machine::ci_restore`.
+    pub fn reset_all_overlays(&self) -> Vec<(usize, std::io::Result<()>)> {
+        let mut state = self.state.lock();
+        let mut results = Vec::new();
+        for id in 0..8 {
+            if let Some(dev) = &mut state.devices[id] {
+                if dev.is_cow() {
+                    results.push((id, dev.cow_reset()));
+                }
+            }
+        }
+        results
+    }
+
+    /// Copy every COW overlay into `dir` as `scsi<id>.overlay`. Returns a
+    /// list of `(id, dirty_sector_list)` entries so snapshot save can
+    /// persist the dirty set alongside the raw overlay bytes.
+    pub fn export_overlays(&self, dir: &std::path::Path) -> std::io::Result<Vec<(usize, Vec<u64>)>> {
+        let mut state = self.state.lock();
+        let mut out = Vec::new();
+        for id in 0..8 {
+            if let Some(dev) = &mut state.devices[id] {
+                if dev.is_cow() {
+                    let dest = dir.join(format!("scsi{}.overlay", id));
+                    let dirty = dev.cow_export(&dest)?;
+                    out.push((id, dirty));
+                }
+            }
+        }
+        Ok(out)
+    }
+
+    /// Replace each COW overlay with its saved counterpart in `dir` and
+    /// adopt the matching dirty sector set. Devices with no corresponding
+    /// entry in `dirty_sets` keep their current overlay untouched.
+    pub fn import_overlays(
+        &self,
+        dir: &std::path::Path,
+        dirty_sets: &[(usize, Vec<u64>)],
+    ) -> std::io::Result<()> {
+        let mut state = self.state.lock();
+        for (id, dirty) in dirty_sets {
+            if let Some(dev) = &mut state.devices[*id] {
+                if dev.is_cow() {
+                    let src = dir.join(format!("scsi{}.overlay", id));
+                    dev.cow_import(&src, dirty.clone())?;
+                }
+            }
+        }
+        Ok(())
     }
 
     pub fn read_fifo(&self) -> u8 {
@@ -1374,5 +1442,43 @@ impl Wd33c93aState {
         self.regs[regs::TRANSFER_COUNT_MSB as usize] = ((count >> 16) & 0xFF) as u8;
         self.regs[regs::TRANSFER_COUNT_2ND as usize] = ((count >> 8)  & 0xFF) as u8;
         self.regs[regs::TRANSFER_COUNT_LSB as usize] = (count         & 0xFF) as u8;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn make_scsi() -> Wd33c93a {
+        Wd33c93a::new(None, None, Arc::new(AtomicU64::new(0)))
+    }
+
+    /// Phase 1.7 round-trip: a fresh SCSI controller loaded from a captured
+    /// save_state must re-serialize byte-identically. Mutates regs and the
+    /// scalar shadow fields (ar, asr, target_id, pending_*).
+    #[test]
+    fn save_load_round_trip() {
+        let src = make_scsi();
+        {
+            let mut s = src.state.lock();
+            s.regs[regs::CONTROL as usize]      = 0x60;
+            s.regs[regs::SCSI_STATUS as usize]  = 0x10;
+            s.regs[regs::COMMAND_PHASE as usize] = 0x46;
+            s.regs[regs::OWN_ID as usize]       = 0x07;
+            s.ar = 0x42;
+            s.asr = 0x10;
+            s.data_direction_in = true;
+            s.target_id = 4;
+            s.pending_status = 0x02;
+            s.pending_msg = 0x80;
+            s.advanced_mode = true;
+        }
+        let v1 = src.save_state();
+
+        let dst = make_scsi();
+        dst.load_state(&v1).expect("load_state");
+        let v2 = dst.save_state();
+
+        assert_eq!(v1, v2, "Wd33c93a save_state mismatch after load_state round-trip");
     }
 }

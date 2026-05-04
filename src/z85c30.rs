@@ -320,6 +320,17 @@ pub trait SerialBackend: Send + Sync {
     fn recv_byte(&self) -> io::Result<u8>;
 }
 
+/// Drops TX bytes and never yields RX. Used as a placeholder when a channel
+/// isn't wired to a host I/O source (e.g. CI mode unused channel).
+struct NullBackend;
+
+impl SerialBackend for NullBackend {
+    fn send_byte(&self, _byte: u8) {}
+    fn recv_byte(&self) -> io::Result<u8> {
+        Err(io::Error::new(io::ErrorKind::WouldBlock, "null"))
+    }
+}
+
 #[cfg(unix)]
 struct UnixSocketBackend {
     listener: UnixListener,
@@ -456,26 +467,66 @@ impl SerialBackend for TcpSocketBackend {
 pub struct Z85c30 {
     pub channel_a: Arc<(Mutex<Channel>, Condvar)>,
     pub channel_b: Arc<(Mutex<Channel>, Condvar)>,
-    backend_a: Arc<dyn SerialBackend>,
-    backend_b: Arc<dyn SerialBackend>,
+    // Swappable so CI mode can replace the default TCP backend with a
+    // `CiSerialBackend` before `start()` is called. Wrapped in `Arc<Mutex<_>>`
+    // so `Z85c30` stays `Clone` and the swap is thread-safe.
+    backend_a: Arc<Mutex<Arc<dyn SerialBackend>>>,
+    backend_b: Arc<Mutex<Arc<dyn SerialBackend>>>,
     running: Arc<AtomicBool>,
     threads: Arc<Mutex<Vec<thread::JoinHandle<()>>>>,
 }
 
 impl Z85c30 {
+    /// Default constructor: binds TCP serial backends on 127.0.0.1:8880
+    /// (channel A / tty2) and 127.0.0.1:8881 (channel B / tty1).
     pub fn new(callback: Option<Arc<dyn IrqCallback>>) -> Self {
+        Self::new_inner(callback, true)
+    }
+
+    /// CI-mode constructor: uses null backends instead of binding TCP. The
+    /// caller is expected to install real backends via `set_backend_a` /
+    /// `set_backend_b` before the first `start()`. Avoids port conflicts
+    /// when multiple `--ci` instances run in parallel.
+    pub fn new_null(callback: Option<Arc<dyn IrqCallback>>) -> Self {
+        Self::new_inner(callback, false)
+    }
+
+    fn new_inner(callback: Option<Arc<dyn IrqCallback>>, bind_tcp: bool) -> Self {
         let ip_a = Arc::new(AtomicU8::new(0));
         let ip_b = Arc::new(AtomicU8::new(0));
+
+        let (backend_a, backend_b): (Arc<dyn SerialBackend>, Arc<dyn SerialBackend>) = if bind_tcp {
+            (
+                Arc::new(TcpSocketBackend::new("127.0.0.1:8880")),
+                Arc::new(TcpSocketBackend::new("127.0.0.1:8881")),
+            )
+        } else {
+            (Arc::new(NullBackend), Arc::new(NullBackend))
+        };
 
         Self {
             channel_a: Arc::new((Mutex::new(Channel::new("A", ip_a.clone(), ip_b.clone(), callback.clone())), Condvar::new())),
             // Note: Channel B gets ip_b as its 'num' and ip_a as 'other'
             channel_b: Arc::new((Mutex::new(Channel::new("B", ip_b, ip_a, callback)), Condvar::new())),
-            backend_a: Arc::new(TcpSocketBackend::new("127.0.0.1:8880")),
-            backend_b: Arc::new(TcpSocketBackend::new("127.0.0.1:8881")),
+            backend_a: Arc::new(Mutex::new(backend_a)),
+            backend_b: Arc::new(Mutex::new(backend_b)),
             running: Arc::new(AtomicBool::new(false)),
             threads: Arc::new(Mutex::new(Vec::new())),
         }
+    }
+
+    /// Swap in an alternate backend for channel A (tty2 on Indy).
+    /// Must be called before `start()` — running RX/TX threads cache the
+    /// backend Arc at spawn time and will not observe the new one until
+    /// they are stopped and restarted.
+    pub fn set_backend_a(&self, backend: Arc<dyn SerialBackend>) {
+        *self.backend_a.lock() = backend;
+    }
+
+    /// Swap in an alternate backend for channel B (tty1, the PROM/IRIX
+    /// serial console on Indy). Same constraint as `set_backend_a`.
+    pub fn set_backend_b(&self, backend: Arc<dyn SerialBackend>) {
+        *self.backend_b.lock() = backend;
     }
 
     pub fn read_a_control(&self) -> u8 { 
@@ -610,8 +661,8 @@ impl Device for Z85c30 {
         }
 
         let pairs = [
-            (self.channel_a.clone(), self.backend_a.clone()),
-            (self.channel_b.clone(), self.backend_b.clone()),
+            (self.channel_a.clone(), self.backend_a.lock().clone()),
+            (self.channel_b.clone(), self.backend_b.lock().clone()),
         ];
 
         let mut threads = self.threads.lock();
@@ -691,46 +742,75 @@ impl Device for Z85c30 {
 
             threads.push(thread::Builder::new().name(format!("SCC-RX-{}", ch_name)).spawn(move || {
                 let mut last_rx_time = Instant::now();
+                // When the SCC's 8-byte rx_queue is full, hold the just-read
+                // byte here and retry on the next iteration instead of
+                // dropping it. This prevents loss when the host pushes a
+                // long line into CiSerialBackend faster than IRIX's tty
+                // driver clocks bytes off rx_queue. Without this hold, a
+                // ~30-char `dd if=/dev/rdsk/dks0d2s0 bs=512` arrives at
+                // the shell as `dd if=/d=512` (chars 9..24 dropped).
+                let mut pending: Option<u8> = None;
 
                 while running.load(Ordering::Relaxed) {
-                    if let Ok(mut byte) = rx_backend.recv_byte() {
-                        if byte == 0x05 {
-                            crate::dlog_dev!(LogModule::Scc, "SCC: Converting ^E to ^D (BREAK)");
-                            byte = 0x04;
-                        }
-                        let (lock, _cvar) = &*rx_channel;
-                        let mut channel = lock.lock();
-                        
-                        let wr3 = channel.regs[scc_regs::WR3 as usize];
-                        let rx_enabled = (wr3 & wr3::RX_ENABLE) != 0;
-
-                        // Get pre-calculated delay
-                        let delay_micros = channel.tx_delay;
-                        let char_duration = Duration::from_micros(delay_micros);
-
-                        if rx_enabled && channel.rx_queue.len() < 8 {
-                            crate::dlog_dev!(LogModule::Scc, "SCC: RX({}) '{}' ({:02x})", channel.name, if byte.is_ascii_graphic() { byte as char } else { '.' }, byte);
-                            channel.rx_queue.push_back(byte);
-                            channel.status |= rr0::RX_CHAR_AVAILABLE;
-                            channel.update_ip();
-                        }
-
-                        drop(channel);
-
-                        let now = Instant::now();
-                        if last_rx_time < now {
-                            if now.duration_since(last_rx_time) > Duration::from_millis(100) {
-                                last_rx_time = now;
+                    let mut byte = match pending.take() {
+                        Some(b) => b,
+                        None => match rx_backend.recv_byte() {
+                            Ok(b) => b,
+                            Err(_) => {
+                                thread::sleep(Duration::from_millis(10));
+                                continue;
                             }
+                        },
+                    };
+                    if byte == 0x05 {
+                        crate::dlog_dev!(LogModule::Scc, "SCC: Converting ^E to ^D (BREAK)");
+                        byte = 0x04;
+                    }
+
+                    let (lock, _cvar) = &*rx_channel;
+                    let mut channel = lock.lock();
+
+                    let wr3 = channel.regs[scc_regs::WR3 as usize];
+                    let rx_enabled = (wr3 & wr3::RX_ENABLE) != 0;
+                    let delay_micros = channel.tx_delay;
+                    let char_duration = Duration::from_micros(delay_micros);
+
+                    if !rx_enabled {
+                        // RX disabled — drop the byte (matches real hw with
+                        // RX off). Don't hold it in `pending` or we'd block
+                        // forever waiting for re-enable.
+                        drop(channel);
+                        continue;
+                    }
+
+                    if channel.rx_queue.len() >= 8 {
+                        // SCC FIFO full. Hold the byte and back off briefly
+                        // so the guest's tty driver gets a chance to drain
+                        // rx_queue. Don't drop — that's the bug this
+                        // section fixes.
+                        drop(channel);
+                        pending = Some(byte);
+                        thread::sleep(Duration::from_millis(1));
+                        continue;
+                    }
+
+                    crate::dlog_dev!(LogModule::Scc, "SCC: RX({}) '{}' ({:02x})", channel.name, if byte.is_ascii_graphic() { byte as char } else { '.' }, byte);
+                    channel.rx_queue.push_back(byte);
+                    channel.status |= rr0::RX_CHAR_AVAILABLE;
+                    channel.update_ip();
+                    drop(channel);
+
+                    // Pacing — simulate baud-rate inter-character spacing.
+                    let now = Instant::now();
+                    if last_rx_time < now {
+                        if now.duration_since(last_rx_time) > Duration::from_millis(100) {
+                            last_rx_time = now;
                         }
-                        last_rx_time += char_duration;
-                        let wait = last_rx_time.saturating_duration_since(now);
-                        if !wait.is_zero() {
-                            thread::sleep(wait);
-                        }
-                    } else {
-                        // Avoid busy loop on error
-                        thread::sleep(Duration::from_millis(10));
+                    }
+                    last_rx_time += char_duration;
+                    let wait = last_rx_time.saturating_duration_since(now);
+                    if !wait.is_zero() {
+                        thread::sleep(wait);
                     }
                 }
             }).unwrap());
@@ -832,5 +912,197 @@ impl Saveable for Z85c30 {
             self.channel_b.1.notify_all();
         }
         Ok(())
+    }
+}
+
+// ============================================================================
+// CiSerialBackend — in-process serial backend used by --ci mode.
+// ============================================================================
+
+/// Serial backend that the CI control socket reads from and writes to. The
+/// guest sees this as channel A (the IRIX console). Host pushes bytes into
+/// `host_to_guest` via `push_host`; the existing RX thread drains them into
+/// `channel_a.rx_queue`. Guest output reaches `send_byte`, which pushes into
+/// `guest_to_host` and wakes anyone waiting in `wait_for`.
+pub struct CiSerialBackend {
+    host_to_guest: Mutex<VecDeque<u8>>,
+    guest_to_host: Mutex<Vec<u8>>,
+    cv: Condvar,
+}
+
+impl CiSerialBackend {
+    pub fn new() -> Self {
+        Self {
+            host_to_guest: Mutex::new(VecDeque::new()),
+            guest_to_host: Mutex::new(Vec::new()),
+            cv: Condvar::new(),
+        }
+    }
+
+    /// Inject bytes from host to guest (the harness typing on the console).
+    pub fn push_host(&self, data: &[u8]) {
+        let mut q = self.host_to_guest.lock();
+        q.extend(data.iter().copied());
+    }
+
+    /// Drain everything the guest has produced since the last call. Empties
+    /// the buffer; the returned Vec is the guest output as raw bytes.
+    pub fn drain_guest(&self) -> Vec<u8> {
+        let mut q = self.guest_to_host.lock();
+        std::mem::take(&mut *q)
+    }
+
+    /// Block until `needle` is seen in guest output, or `timeout` expires.
+    /// On success returns the consumed bytes up to and including the match;
+    /// bytes that arrived after the match stay in the buffer for the next
+    /// `serial-read`. On timeout returns `None` without consuming anything.
+    pub fn wait_for(&self, needle: &[u8], timeout: Duration) -> Option<Vec<u8>> {
+        if needle.is_empty() {
+            return Some(Vec::new());
+        }
+        let deadline = Instant::now() + timeout;
+        let mut q = self.guest_to_host.lock();
+        loop {
+            if let Some(pos) = find_subseq(&q, needle) {
+                let end = pos + needle.len();
+                let consumed: Vec<u8> = q.drain(..end).collect();
+                return Some(consumed);
+            }
+            let now = Instant::now();
+            if now >= deadline {
+                return None;
+            }
+            if self.cv.wait_until(&mut q, deadline).timed_out() {
+                // One more scan in case bytes arrived between the last check
+                // and the timeout.
+                if let Some(pos) = find_subseq(&q, needle) {
+                    let end = pos + needle.len();
+                    let consumed: Vec<u8> = q.drain(..end).collect();
+                    return Some(consumed);
+                }
+                return None;
+            }
+        }
+    }
+
+    /// Clear both queues. Called on `restore`/`rollback` so stale serial
+    /// output from the previous run doesn't leak into the next test.
+    pub fn reset(&self) {
+        self.host_to_guest.lock().clear();
+        self.guest_to_host.lock().clear();
+    }
+}
+
+fn find_subseq(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+    if needle.is_empty() || haystack.len() < needle.len() {
+        return None;
+    }
+    haystack.windows(needle.len()).position(|w| w == needle)
+}
+
+impl SerialBackend for CiSerialBackend {
+    fn send_byte(&self, byte: u8) {
+        self.guest_to_host.lock().push(byte);
+        self.cv.notify_all();
+    }
+
+    fn recv_byte(&self) -> io::Result<u8> {
+        let mut q = self.host_to_guest.lock();
+        match q.pop_front() {
+            Some(b) => Ok(b),
+            None => Err(io::Error::new(io::ErrorKind::WouldBlock, "empty")),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Phase 1.7 round-trip: a fresh SCC loaded from a captured save_state must
+    /// re-serialize byte-identically. Use new_null so the test doesn't bind any
+    /// TCP ports.
+    #[test]
+    fn save_load_round_trip() {
+        let src = Z85c30::new_null(None);
+        {
+            let mut ch = src.channel_a.0.lock();
+            ch.regs[0]  = 0x44;
+            ch.regs[1]  = 0x12;
+            ch.regs[3]  = 0xc1;
+            ch.regs[5]  = 0xea;
+            ch.reg_ptr  = 7;
+            ch.status   = 0x40;
+        }
+        {
+            let mut ch = src.channel_b.0.lock();
+            ch.regs[0]  = 0x88;
+            ch.regs[2]  = 0x10;
+            ch.regs[15] = 0x05;
+            ch.reg_ptr  = 3;
+            ch.status   = 0x80;
+        }
+        let v1 = src.save_state();
+
+        let dst = Z85c30::new_null(None);
+        dst.load_state(&v1).expect("load_state");
+        let v2 = dst.save_state();
+
+        assert_eq!(v1, v2, "Z85c30 save_state mismatch after load_state round-trip");
+    }
+
+    /// Phase 3.5: a long single-line `serial-send` from the host must arrive
+    /// at the guest's tty intact. Before the rx-thread fix, bytes 9..N of any
+    /// burst were silently dropped when SCC's 8-byte rx_queue filled — a 53-
+    /// char `dd if=/dev/rdsk/dks0d2s0 of=/tmp/r.bin bs=512 count=1\r` arrived
+    /// at IRIX as `dd if=/d=512 count=1`, causing CI scripts to fabricate
+    /// shell errors out of thin air. This test pushes that exact line through
+    /// the loopback CiSerialBackend, drains the SCC rx_queue at the rate the
+    /// IRIX kernel would (one byte at a time, polled), and asserts every
+    /// byte arrives.
+    #[test]
+    fn long_input_round_trips_without_loss() {
+        use std::sync::Arc;
+        use std::time::{Duration, Instant};
+
+        let scc = Z85c30::new_null(None);
+        let backend = Arc::new(CiSerialBackend::new());
+        scc.set_backend_a(backend.clone());
+
+        // Enable RX on channel A so the rx thread queues bytes. tx_delay is
+        // tx-direction baud-rate emulation; set a small value so the test
+        // doesn't pay 19.2 kbaud-per-char latency.
+        {
+            let mut ch = scc.channel_a.0.lock();
+            ch.regs[scc_regs::WR3 as usize] |= wr3::RX_ENABLE;
+            ch.tx_delay = 50; // 50 µs/byte
+        }
+
+        scc.start();
+
+        let line = b"dd if=/dev/rdsk/dks0d2s0 of=/tmp/r.bin bs=512 count=1\r";
+        backend.push_host(line);
+
+        // Drain rx_queue at ~20 kHz so the rx thread always has space to
+        // push pending bytes. Mirrors how IRIX's tty driver consumes
+        // RR0::RX_CHAR_AVAILABLE.
+        let mut received = Vec::with_capacity(line.len());
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while received.len() < line.len() && Instant::now() < deadline {
+            let popped = {
+                let mut ch = scc.channel_a.0.lock();
+                ch.rx_queue.pop_front()
+            };
+            match popped {
+                Some(b) => received.push(b),
+                None    => std::thread::sleep(Duration::from_micros(50)),
+            }
+        }
+
+        scc.stop();
+
+        assert_eq!(received.len(), line.len(),
+            "expected {} bytes, got {} (lossy rx_queue?)", line.len(), received.len());
+        assert_eq!(&received, line, "byte content mismatch — bytes dropped or reordered");
     }
 }

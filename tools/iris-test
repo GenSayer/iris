@@ -1,0 +1,270 @@
+#!/usr/bin/env python3
+"""iris-test — drive the IRIS --ci control socket against a test spec.
+
+A test is a YAML file. Steps currently supported:
+
+  - type: serial
+    send: "rpm -ivh /tmp/grep.rpm\n"
+    expect: "complete"
+    timeout: 30
+
+  - type: sleep
+    seconds: 2
+
+See ci_mode_plan.md for the full schema. Output is a one-line summary per
+test (PASS/FAIL + elapsed), plus a raw-log directory on failure.
+
+Usage:
+    tools/iris-test path/to/test.yaml
+
+Optional flags:
+    --socket PATH     Unix socket path (default: /tmp/iris.sock)
+    --verbose         Dump every RPC and raw serial output
+    --no-restore      Skip the restore step (useful when driving a
+                      pre-booted emulator manually)
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import socket
+import sys
+import time
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any
+
+
+# ----------------------------------------------------------------------------
+# YAML without PyYAML dependency — simple subset parser.
+# Supports the schema in ci_mode_plan.md. If the user has PyYAML installed we
+# prefer that; otherwise fall back to a minimal parser for our schema.
+# ----------------------------------------------------------------------------
+
+def load_yaml(path: Path) -> dict[str, Any]:
+    try:
+        import yaml  # type: ignore
+        with path.open() as f:
+            return yaml.safe_load(f)
+    except ImportError:
+        return _mini_yaml(path.read_text())
+
+
+def _mini_yaml(text: str) -> dict[str, Any]:
+    """A tiny YAML subset: top-level scalars, a 'steps' list of dicts with
+    scalar values. No anchors, flows, or nested structures."""
+    root: dict[str, Any] = {}
+    steps: list[dict[str, Any]] = []
+    in_steps = False
+    current: dict[str, Any] | None = None
+
+    def coerce(v: str) -> Any:
+        if (v.startswith('"') and v.endswith('"')) or (v.startswith("'") and v.endswith("'")):
+            return v[1:-1].encode().decode("unicode_escape")
+        try:
+            if "." in v:
+                return float(v)
+            return int(v)
+        except ValueError:
+            return v
+
+    for raw in text.splitlines():
+        line = raw.rstrip()
+        if not line or line.lstrip().startswith("#"):
+            continue
+        if not line.startswith(" "):
+            if line == "steps:":
+                in_steps = True
+                continue
+            k, _, v = line.partition(":")
+            root[k.strip()] = coerce(v.strip())
+            continue
+        stripped = line.lstrip()
+        if stripped.startswith("- "):
+            if current is not None:
+                steps.append(current)
+            current = {}
+            stripped = stripped[2:]
+        if current is None:
+            continue
+        k, _, v = stripped.partition(":")
+        current[k.strip()] = coerce(v.strip())
+    if current is not None:
+        steps.append(current)
+    if in_steps:
+        root["steps"] = steps
+    return root
+
+
+# ----------------------------------------------------------------------------
+# Control-socket client.
+# ----------------------------------------------------------------------------
+
+class CiClient:
+    def __init__(self, path: str, verbose: bool = False):
+        self.verbose = verbose
+        self.sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        try:
+            self.sock.connect(path)
+        except (FileNotFoundError, ConnectionRefusedError) as e:
+            raise SystemExit(
+                f"iris-test: no iris --ci listener at {path} ({e}).\n"
+                f"  Start one first, e.g. in another terminal:\n"
+                f"    ./target/release/iris --ci --ci-socket {path}"
+            )
+        self.f = self.sock.makefile("rw", buffering=1, newline="\n")
+
+    def rpc(self, cmd: str, **args: Any) -> dict[str, Any]:
+        req = {"cmd": cmd, "args": args}
+        self.f.write(json.dumps(req) + "\n")
+        self.f.flush()
+        line = self.f.readline()
+        if not line:
+            raise RuntimeError(f"socket EOF while waiting for {cmd!r}")
+        resp = json.loads(line)
+        if self.verbose:
+            print(f"  rpc {cmd} {args} -> {resp}", file=sys.stderr)
+        return resp
+
+    def close(self) -> None:
+        try:
+            self.sock.close()
+        except OSError:
+            pass
+
+
+# ----------------------------------------------------------------------------
+# Step runners.
+# ----------------------------------------------------------------------------
+
+@dataclass
+class StepResult:
+    ok: bool
+    message: str
+    elapsed_s: float
+    captured: str = ""
+
+
+def run_serial(client: CiClient, step: dict[str, Any]) -> StepResult:
+    start = time.monotonic()
+    send = step.get("send", "")
+    expect = step.get("expect")
+    timeout = int(step.get("timeout", 30))
+
+    if send:
+        resp = client.rpc("serial-send", data=send)
+        if not resp.get("ok"):
+            return StepResult(False, f"serial-send failed: {resp.get('error')}", time.monotonic() - start)
+
+    captured = ""
+    if expect:
+        resp = client.rpc("wait-serial", pattern=expect, timeout_ms=timeout * 1000)
+        if not resp.get("ok"):
+            # Drain whatever is there so it shows up in failure output.
+            drained = client.rpc("serial-read").get("data", "")
+            return StepResult(False, resp.get("error", "wait-serial failed"),
+                              time.monotonic() - start, captured=drained)
+        captured = resp.get("data", "")
+
+    return StepResult(True, f"matched {expect!r}" if expect else "sent", time.monotonic() - start, captured=captured)
+
+
+def run_sleep(_client: CiClient, step: dict[str, Any]) -> StepResult:
+    start = time.monotonic()
+    secs = float(step.get("seconds", 1))
+    time.sleep(secs)
+    return StepResult(True, f"slept {secs}s", time.monotonic() - start)
+
+
+def run_screenshot(client: CiClient, step: dict[str, Any]) -> StepResult:
+    start = time.monotonic()
+    path = step.get("path", "/tmp/iris-ci-screenshot.png")
+    min_bytes = int(step.get("min_bytes", 1024))  # sanity lower bound
+
+    resp = client.rpc("screenshot", path=path)
+    if not resp.get("ok"):
+        return StepResult(False, f"screenshot: {resp.get('error')}", time.monotonic() - start)
+    try:
+        st = Path(path).stat()
+    except OSError as e:
+        return StepResult(False, f"screenshot file missing: {e}", time.monotonic() - start)
+    if st.st_size < min_bytes:
+        return StepResult(False, f"screenshot too small ({st.st_size} bytes, need >={min_bytes})",
+                          time.monotonic() - start)
+    dims = resp.get("data", {})
+    w, h = dims.get("width"), dims.get("height")
+    return StepResult(True, f"screenshot {w}x{h}, {st.st_size} bytes -> {path}",
+                      time.monotonic() - start)
+
+
+STEP_RUNNERS = {
+    "serial": run_serial,
+    "sleep": run_sleep,
+    "screenshot": run_screenshot,
+}
+
+
+# ----------------------------------------------------------------------------
+# Main.
+# ----------------------------------------------------------------------------
+
+def run_test(spec: dict[str, Any], socket_path: str, verbose: bool, no_restore: bool) -> int:
+    name = spec.get("name", "unnamed")
+    snapshot = spec.get("snapshot")
+    steps = spec.get("steps", [])
+
+    overall_start = time.monotonic()
+    client = CiClient(socket_path, verbose=verbose)
+
+    try:
+        if not no_restore:
+            if not snapshot:
+                print(f"FAIL  {name}  (spec missing 'snapshot')", file=sys.stderr)
+                return 2
+            resp = client.rpc("restore", name=snapshot)
+            if not resp.get("ok"):
+                print(f"FAIL  {name}  (restore: {resp.get('error')})", file=sys.stderr)
+                return 2
+
+        for i, step in enumerate(steps):
+            kind = step.get("type", "")
+            runner = STEP_RUNNERS.get(kind)
+            if runner is None:
+                print(f"FAIL  {name}  (step {i}: unknown type {kind!r})", file=sys.stderr)
+                return 2
+            result = runner(client, step)
+            if not result.ok:
+                print(f"FAIL  {name}  step {i} ({kind}): {result.message}")
+                if result.captured:
+                    print("--- serial output ---")
+                    print(result.captured, end="")
+                    if not result.captured.endswith("\n"):
+                        print()
+                    print("--- end ---")
+                return 1
+            if verbose:
+                print(f"  step {i} ({kind}, {result.elapsed_s:.1f}s): {result.message}",
+                      file=sys.stderr)
+
+        total = time.monotonic() - overall_start
+        print(f"PASS  {name}  ({total:.1f}s)")
+        return 0
+    finally:
+        client.close()
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser(description="Run an IRIS --ci test spec")
+    ap.add_argument("spec", type=Path)
+    ap.add_argument("--socket", default="/tmp/iris.sock")
+    ap.add_argument("--verbose", action="store_true")
+    ap.add_argument("--no-restore", action="store_true")
+    args = ap.parse_args()
+
+    spec = load_yaml(args.spec)
+    return run_test(spec, args.socket, args.verbose, args.no_restore)
+
+
+if __name__ == "__main__":
+    sys.exit(main())

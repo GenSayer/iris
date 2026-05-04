@@ -31,7 +31,8 @@ use crate::hpc3::Hpc3;
 use crate::ioc::Ioc;
 use crate::monitor::Monitor;
 use crate::rex3::Rex3;
-use crate::snapshot::Snapshot;
+use crate::snapshot::{Snapshot, Manifest, SCHEMA_VERSION, ChunksManifest};
+use crate::chunk_store::{ChunkStore, get_chunks_as_words, put_words_as_chunks};
 use crate::hptimer::TimerManager;
 
 pub fn emulator_name() -> &'static str {
@@ -69,10 +70,64 @@ pub struct Machine {
     pub event_tx: mpsc::SyncSender<MachineEvent>,
     event_rx: Option<mpsc::Receiver<MachineEvent>>,
     timer_manager: Arc<TimerManager>,
+    /// When `cfg.ci` is set, the channel-A backend is replaced by this
+    /// in-process one so the CI control socket can drive the console.
+    ci_serial: Option<Arc<crate::z85c30::CiSerialBackend>>,
+    /// Most recent snapshot restored via `ci_restore`. `rollback` reuses this
+    /// name as the fallback path if the in-memory checkpoint is absent.
+    last_restore: Option<String>,
+    /// In-memory copy of the just-loaded state, taken at the end of every
+    /// successful `ci_restore`. Lets `ci_rollback` skip disk IO and TOML
+    /// re-parsing — paste back the cached `toml::Value`s and `memcpy` the
+    /// bank/framebuffer buffers. Cleared on any explicit `load_snapshot`
+    /// outside the CI path.
+    last_restore_checkpoint: Option<RollbackCheckpoint>,
+    /// Path of the configured scratch SCSI volume, if any. The CI socket reads
+    /// and writes this file directly (with the machine briefly stopped) to
+    /// inject/exfiltrate files without going through the network. None when no
+    /// SCSI device has `scratch = true` set in the config.
+    scratch_path: Option<std::path::PathBuf>,
+}
+
+/// In-memory snapshot of the just-restored guest state. Populated at the end
+/// of `ci_restore`; consumed by `ci_rollback`. Trades ~270 MB of RSS for
+/// disk-IO-free rollback.
+struct RollbackCheckpoint {
+    /// Snapshot directory (saves/<name>/) — re-used by rollback to reflink
+    /// the COW overlays back into place.
+    overlay_dir: std::path::PathBuf,
+    /// Per-SCSI-id dirty sector lists from cow.toml at the time of restore.
+    overlay_sets: Vec<(usize, Vec<u64>)>,
+
+    /// Native-endian RAM bank words. `bank_words[i].len() ==
+    /// banks[i].size_bytes / 4` for present banks; populated for all four.
+    bank_words: [Vec<u32>; 4],
+
+    /// Framebuffer contents (RGB, aux). `None` when running headless.
+    framebuffers: Option<(Vec<u32>, Vec<u32>)>,
+
+    /// Parsed device save_state TOMLs. Holding `toml::Value` directly skips
+    /// the ~80 ms cpu.toml string-parse cost on every rollback.
+    cpu: toml::Value,
+    mc: toml::Value,
+    ioc: toml::Value,
+    scc: toml::Value,
+    pit: toml::Value,
+    ps2: toml::Value,
+    rtc: toml::Value,
+    eeprom: toml::Value,
+    scsi: toml::Value,
+    seeq: toml::Value,
+    hpc3: toml::Value,
+    rex3: Option<toml::Value>,
 }
 
 impl Machine {
     pub fn new(cfg: MachineConfig) -> Self {
+        // Capture config flags that are needed after the local `cfg` binding
+        // is shadowed later in this function.
+        let ci_enabled = cfg.ci;
+
         // 0. Shared EEPROM
         let eeprom = Arc::new(Mutex::new(Eeprom93c56::new()));
 
@@ -102,8 +157,22 @@ impl Machine {
         let l1i_fetch_count      = Arc::new(AtomicU64::new(0)); // L1-I fetch counter
         let uncached_fetch_count = Arc::new(AtomicU64::new(0)); // uncached instruction fetches
 
-        // HPC3 (512KB at 0x1FB80000)
-        let ioc = Ioc::new(true);
+        // HPC3 (512KB at 0x1FB80000). CI mode skips the SCC TCP backend
+        // bindings so multiple `--ci` instances can coexist.
+        let ioc = if ci_enabled { Ioc::new_ci(true) } else { Ioc::new(true) };
+
+        // CI mode replaces the default TCP backend on channel B (tty1, the
+        // SGI serial console) with an in-process backend the control socket
+        // drives directly. Channel A (tty2) keeps its default TCP backend.
+        // Must happen before any peripheral `start()` call (which clones the
+        // current backend Arc into the RX/TX threads).
+        let ci_serial = if ci_enabled {
+            let b = Arc::new(crate::z85c30::CiSerialBackend::new());
+            ioc.scc().set_backend_b(b.clone());
+            Some(b)
+        } else {
+            None
+        };
         let timer_manager = Arc::new(TimerManager::new());
         ioc.set_timer_manager(timer_manager.clone());
         ioc.set_heartbeat(heartbeat.clone());
@@ -113,23 +182,68 @@ impl Machine {
         // Attach SCSI devices from config (IDs 1–7).
         let mut scsi_ids: Vec<u8> = cfg.scsi.keys().copied().collect();
         scsi_ids.sort();
+        // CI mode: isolate each COW overlay under /tmp so an interactive
+        // iris holding {base}.overlay can coexist with any number of `--ci`
+        // processes. Files are kept for post-mortem inspection; cleanup
+        // happens on machine drop below.
+        let ci_pid = std::process::id();
+        // Track the on-disk path of any scratch device so the CI socket can
+        // read/write its bytes directly (Phase 2.4).
+        let mut scratch_path: Option<std::path::PathBuf> = None;
         for id in scsi_ids {
             let dev = &cfg.scsi[&id];
-            // For CD-ROMs: build ordered disc list; first entry is mounted now.
-            // For HDDs: disc list is unused (empty).
+            // Scratch volume: pre-create a raw file with a minimal SGI Volume
+            // Header if it doesn't exist. Refuse cdrom/overlay combinations —
+            // scratch must be a host-writable raw file. Default size 64 MB.
+            //
+            // The VH lays out partition 7 ("vol") spanning sectors 8..end and
+            // partition 8 ("vh") spanning sectors 0..7 (the VH itself).
+            // Without a VH, IRIX recognises the device but returns I/O error
+            // on every read because /dev/rdsk/dks0dNvh and /dev/rdsk/dks0dNvol
+            // both consult the partition table at sector 0.
+            //
+            // Convention: host writes payload via scratch-write at offset >=
+            // SCRATCH_PAYLOAD_OFFSET (4096). Guest reads from offset 0 of
+            // /dev/rdsk/dks0dNvol (which maps to sector 8 of the disk by
+            // partition 7's first_block=8).
+            if dev.scratch {
+                if dev.cdrom || dev.overlay {
+                    println!("Note: SCSI ID {}: scratch=true is incompatible with cdrom/overlay; ignoring scratch flag", id);
+                } else {
+                    let path = std::path::Path::new(&dev.path);
+                    if !path.exists() {
+                        let size_mb = dev.size_mb.unwrap_or(64) as u64;
+                        let bytes = size_mb * 1024 * 1024;
+                        match crate::sgi_vh::create_scratch_image(path, bytes) {
+                            Ok(()) => println!("iris: created scratch volume {} ({} MB, with SGI VH)", dev.path, size_mb),
+                            Err(e) => println!("Note: could not create scratch volume {}: {}", dev.path, e),
+                        }
+                    }
+                    if scratch_path.is_some() {
+                        println!("Note: multiple scratch SCSI devices configured; CI socket will use the lowest-id one");
+                    } else {
+                        scratch_path = Some(path.to_path_buf());
+                    }
+                }
+            }
             let (path, discs) = if dev.cdrom {
                 let mut list = dev.discs.clone();
                 if list.is_empty() {
                     list.push(dev.path.clone());
                 } else if list[0] != dev.path {
-                    // Ensure path is front of list if explicitly set
                     list.insert(0, dev.path.clone());
                 }
                 (list[0].clone(), list)
             } else {
                 (dev.path.clone(), vec![])
             };
-            if let Err(e) = hpc3.add_scsi_device(id as usize, &path, dev.cdrom, discs, dev.overlay) {
+            let result = if ci_enabled && dev.overlay && !dev.cdrom {
+                let ci_overlay = format!("/tmp/iris-ci-{}-scsi{}.overlay", ci_pid, id);
+                hpc3.add_scsi_device_with_overlay(id as usize, &path, dev.cdrom, discs, dev.overlay, &ci_overlay)
+            } else {
+                hpc3.add_scsi_device(id as usize, &path, dev.cdrom, discs, dev.overlay)
+            };
+            if let Err(e) = result {
                 println!("Note: Could not attach {} to SCSI ID {}: {}", path, id, e);
             }
         }
@@ -292,7 +406,35 @@ impl Machine {
             event_tx,
             event_rx: Some(event_rx),
             timer_manager,
+            ci_serial,
+            last_restore: None,
+            last_restore_checkpoint: None,
+            scratch_path,
         }
+    }
+
+    /// Path of the configured scratch SCSI volume, if any. Used by the CI
+    /// socket scratch-{write,read,clear,info} commands to act on the file
+    /// directly while the machine is briefly stopped.
+    pub fn scratch_path(&self) -> Option<&std::path::Path> {
+        self.scratch_path.as_deref()
+    }
+
+    /// Briefly stop the machine, run `work`, then restart peripherals and the
+    /// CPU only if it was running before. Used by the scratch-write/read/clear
+    /// CI commands to mutate the scratch file without racing the SCSI device's
+    /// in-flight reads. CPU stays stopped if the harness hasn't called `start`
+    /// yet — a file injected before boot stays injected, the CPU doesn't get
+    /// auto-started.
+    pub fn with_paused<R>(&mut self, work: impl FnOnce() -> R) -> R {
+        let was_running = self.cpu.is_running();
+        self.stop();
+        let r = work();
+        self.restart_peripherals();
+        if was_running {
+            self.cpu.start();
+        }
+        r
     }
 
     pub fn start(&mut self) {
@@ -301,10 +443,19 @@ impl Machine {
         self.hpc3.start();
         if let Some(rex3) = &self._phys.rex3 { rex3.start(); }
 
-        // Start monitor server on localhost:8888
-        self.monitor.clone().start_server("127.0.0.1:8888".to_string());
+        // Monitor server on localhost:8888. Skipped in CI mode — the control
+        // socket replaces it, and binding a fixed port would prevent parallel
+        // `--ci` instances.
+        if self.ci_serial.is_none() {
+            self.monitor.clone().start_server("127.0.0.1:8888".to_string());
+        }
+
+        // CI mode: the harness drives startup via `restore` / `start`. Don't
+        // autostart the CPU so the first command finds a quiet machine.
         #[cfg(not(any(debug_assertions, feature = "developer")))]
-        self.cpu.start();
+        if self.ci_serial.is_none() {
+            self.cpu.start();
+        }
     }
 
     /// Register a SystemController with the monitor so that `reset`, `save`,
@@ -424,6 +575,181 @@ impl Machine {
         MipsCpuDebugAdapter::new(self.cpu.clone())
     }
 
+    /// The in-process serial backend used by `--ci` mode. `None` in
+    /// interactive mode.
+    pub fn get_ci_serial(&self) -> Option<Arc<crate::z85c30::CiSerialBackend>> {
+        self.ci_serial.clone()
+    }
+
+    /// CPU thread, started explicitly by the CI `start` command or by
+    /// `ci_restore`. In `--ci` mode the CPU is not autostarted in `start()`
+    /// — the harness drives startup via `restore`.
+    pub fn cpu_start(&self) {
+        self.cpu.start();
+    }
+
+    /// Step the CPU `n` instructions in-line on the calling thread, with all
+    /// peripheral threads stopped so the CPU sees no external interrupts.
+    /// Used by Phase 3.3 snapshot determinism validator.
+    /// Caller must arrange `load_snapshot_paused` first.
+    pub fn cpu_step_n_inline(&self, n: u64) -> Result<u64, String> {
+        self.cpu.step_n_inline(n)
+    }
+
+    /// Snapshot the deterministic-from-state CPU registers.
+    pub fn cpu_state_digest(&self) -> Result<crate::mips_exec::CpuStateDigest, String> {
+        self.cpu.state_digest()
+    }
+
+    /// Full rewind: load the named snapshot, which now captures the COW
+    /// overlay too so the filesystem state is deterministic per snapshot.
+    /// The CPU resumes automatically (load_snapshot restarts it). After the
+    /// load, an in-memory checkpoint of the just-restored state is taken so
+    /// the next `ci_rollback` can run without touching disk.
+    pub fn ci_restore(&mut self, name: &str) -> Result<(), String> {
+        // Clear any leftover serial bytes from the previous run so the
+        // next command doesn't see stale output.
+        if let Some(ci) = &self.ci_serial {
+            ci.reset();
+        }
+
+        self.load_snapshot(name)?;
+        self.last_restore = Some(name.to_string());
+        // Capture the rollback checkpoint. If this fails, the restore still
+        // succeeded — rollback will fall back to the disk path.
+        match self.capture_rollback_checkpoint(name) {
+            Ok(cp) => self.last_restore_checkpoint = Some(cp),
+            Err(e) => {
+                eprintln!("ci_restore: rollback checkpoint capture failed: {} — rollback will use the disk path", e);
+                self.last_restore_checkpoint = None;
+            }
+        }
+        Ok(())
+    }
+
+    /// Roll back to the state captured at the last `ci_restore`. Uses the
+    /// in-memory checkpoint when present; falls back to a disk reload if it's
+    /// absent (legacy snapshot loaded outside CI, or capture failed).
+    pub fn ci_rollback(&mut self) -> Result<(), String> {
+        if let Some(ci) = &self.ci_serial {
+            ci.reset();
+        }
+
+        // Take the checkpoint out so the apply path can hold &cp without
+        // borrowing self at the same time. Restored after apply so repeated
+        // rollbacks work.
+        let cp = match self.last_restore_checkpoint.take() {
+            Some(cp) => cp,
+            None => {
+                let name = self.last_restore.clone()
+                    .ok_or_else(|| "no previous restore to roll back to".to_string())?;
+                eprintln!("ci_rollback: no in-memory checkpoint — falling back to disk reload");
+                return self.ci_restore(&name);
+            }
+        };
+        let result = self.apply_rollback_checkpoint(&cp);
+        self.last_restore_checkpoint = Some(cp);
+        result
+    }
+
+    /// Capture in-memory state for fast rollback. Stops the CPU briefly.
+    fn capture_rollback_checkpoint(&mut self, name: &str) -> Result<RollbackCheckpoint, String> {
+        self.stop();
+
+        let cpu = self.cpu.save_state();
+        let mc = self.mc.save_state();
+        let ioc = self.hpc3.ioc().save_state();
+        let scc = self.hpc3.ioc().scc().save_state();
+        let pit = self.hpc3.ioc().pit().save_state();
+        let ps2 = self.hpc3.ioc().ps2().save_state();
+        let rtc = self.hpc3.rtc().save_state();
+        let eeprom = self.hpc3.eeprom().lock().save_state_owned();
+        let scsi = self.hpc3.scsi().save_state();
+        let seeq = self.hpc3.seeq().save_state();
+        let hpc3 = self.hpc3.save_state();
+        let rex3 = self._phys.rex3.as_ref().map(|r| r.save_state());
+
+        let bank_words: [Vec<u32>; 4] = [
+            self._phys.snapshot_bank_inmem(0),
+            self._phys.snapshot_bank_inmem(1),
+            self._phys.snapshot_bank_inmem(2),
+            self._phys.snapshot_bank_inmem(3),
+        ];
+
+        let framebuffers = self._phys.rex3.as_ref()
+            .map(|r| r.snapshot_framebuffers_inmem());
+
+        // Re-read cow.toml so rollback knows which dirty sectors to import
+        // back. The file was just consumed by load_snapshot but it's tiny and
+        // re-reading from page cache is cheap (~µs).
+        let overlay_dir = std::path::PathBuf::from("saves").join(name);
+        let snap = Snapshot::new(&overlay_dir);
+        let mut overlay_sets: Vec<(usize, Vec<u64>)> = Vec::new();
+        if let Ok(cow_toml) = snap.read_toml("cow.toml") {
+            if let Some(tbl) = cow_toml.as_table() {
+                for (k, v) in tbl {
+                    let Some(id_str) = k.strip_prefix("scsi") else { continue };
+                    let Ok(id) = id_str.parse::<usize>() else { continue };
+                    let Some(arr) = v.as_array() else { continue };
+                    let dirty: Vec<u64> = arr.iter()
+                        .filter_map(|x| x.as_integer().map(|i| i as u64))
+                        .collect();
+                    overlay_sets.push((id, dirty));
+                }
+            }
+        }
+
+        self.restart_peripherals();
+        self.cpu.start();
+
+        Ok(RollbackCheckpoint {
+            overlay_dir,
+            overlay_sets,
+            bank_words,
+            framebuffers,
+            cpu, mc, ioc, scc, pit, ps2, rtc, eeprom, scsi, seeq, hpc3, rex3,
+        })
+    }
+
+    /// Apply an in-memory checkpoint, restoring the guest to the state at
+    /// the moment of capture. Skips disk IO and TOML string-parsing.
+    fn apply_rollback_checkpoint(&mut self, cp: &RollbackCheckpoint) -> Result<(), String> {
+        self.stop();
+        self.power_on_devices();
+
+        self.cpu.load_state(&cp.cpu)?;
+        self.mc.load_state(&cp.mc)?;
+        self.hpc3.ioc().load_state(&cp.ioc)?;
+        self.hpc3.ioc().scc().load_state(&cp.scc)?;
+        self.hpc3.ioc().pit().load_state(&cp.pit)?;
+        self.hpc3.ioc().ps2().load_state(&cp.ps2)?;
+        self.hpc3.rtc().load_state(&cp.rtc)?;
+        self.hpc3.eeprom().lock().load_state_mut(&cp.eeprom)?;
+        self.hpc3.scsi().load_state(&cp.scsi)?;
+        self.hpc3.seeq().load_state(&cp.seeq)?;
+        self.hpc3.load_state(&cp.hpc3)?;
+        if let (Some(rex3), Some(rex3_toml)) = (&self._phys.rex3, &cp.rex3) {
+            rex3.load_state(rex3_toml)?;
+        }
+
+        for (i, words) in cp.bank_words.iter().enumerate() {
+            self._phys.restore_bank_inmem(i, words);
+        }
+        if let (Some(rex3), Some((rgb, aux))) = (&self._phys.rex3, &cp.framebuffers) {
+            rex3.restore_framebuffers_inmem(rgb, aux);
+        }
+
+        // Reflink the overlay back into place. saves/<name>/scsi*.overlay is
+        // unchanged by guest writes (writes go to the live overlay), so this
+        // can re-import directly.
+        self.hpc3.scsi().import_overlays(&cp.overlay_dir, &cp.overlay_sets)
+            .map_err(|e| format!("rollback: COW overlay import: {}", e))?;
+
+        self.restart_peripherals();
+        self.cpu.start();
+        Ok(())
+    }
+
     /// Restart peripherals (MC, HPC3, REX3) without restarting the monitor server.
     fn restart_peripherals(&mut self) {
         self.mc.start();
@@ -477,70 +803,127 @@ impl Machine {
         let snap = Snapshot::new(&dir);
         snap.ensure_dir().map_err(|e| e.to_string())?;
 
-        // CPU + TLB
-        let cpu_toml = self.cpu.save_state();
-        snap.write_toml("cpu.toml", &cpu_toml).map_err(|e| e.to_string())?;
+        // Write the manifest first so `read_manifest` succeeds even if a later
+        // step crashes — the partial snapshot is at least diagnosable.
+        let mut manifest = Manifest::for_current_save();
+        manifest.parent = self.last_restore.clone();
+        snap.write_manifest(&manifest).map_err(|e| e.to_string())?;
+        let sv = manifest.schema_version;
 
-        // Memory Controller
-        let mc_toml = self.mc.save_state();
-        snap.write_toml("mc.toml", &mc_toml).map_err(|e| e.to_string())?;
+        // Device state — schema_version=2 writes *.bin (postcard-encoded
+        // BinValue tree); legacy writes *.toml. write_state encapsulates the
+        // choice so this orchestrator stays format-agnostic.
+        snap.write_state("cpu",    &self.cpu.save_state(),                         sv).map_err(|e| e.to_string())?;
+        snap.write_state("mc",     &self.mc.save_state(),                          sv).map_err(|e| e.to_string())?;
+        snap.write_state("ioc",    &self.hpc3.ioc().save_state(),                  sv).map_err(|e| e.to_string())?;
+        snap.write_state("scc",    &self.hpc3.ioc().scc().save_state(),            sv).map_err(|e| e.to_string())?;
+        snap.write_state("pit",    &self.hpc3.ioc().pit().save_state(),            sv).map_err(|e| e.to_string())?;
+        snap.write_state("ps2",    &self.hpc3.ioc().ps2().save_state(),            sv).map_err(|e| e.to_string())?;
+        snap.write_state("rtc",    &self.hpc3.rtc().save_state(),                  sv).map_err(|e| e.to_string())?;
+        snap.write_state("eeprom", &self.hpc3.eeprom().lock().save_state_owned(),  sv).map_err(|e| e.to_string())?;
+        snap.write_state("scsi",   &self.hpc3.scsi().save_state(),                 sv).map_err(|e| e.to_string())?;
+        snap.write_state("seeq",   &self.hpc3.seeq().save_state(),                 sv).map_err(|e| e.to_string())?;
+        snap.write_state("hpc3",   &self.hpc3.save_state(),                        sv).map_err(|e| e.to_string())?;
 
-        // IOC
-        let ioc_toml = self.hpc3.ioc().save_state();
-        snap.write_toml("ioc.toml", &ioc_toml).map_err(|e| e.to_string())?;
-
-        // SCC (Z85C30 serial)
-        let scc_toml = self.hpc3.ioc().scc().save_state();
-        snap.write_toml("scc.toml", &scc_toml).map_err(|e| e.to_string())?;
-
-        // PIT (8254 timer)
-        let pit_toml = self.hpc3.ioc().pit().save_state();
-        snap.write_toml("pit.toml", &pit_toml).map_err(|e| e.to_string())?;
-
-        // PS2
-        let ps2_toml = self.hpc3.ioc().ps2().save_state();
-        snap.write_toml("ps2.toml", &ps2_toml).map_err(|e| e.to_string())?;
-
-        // RTC (DS1x86)
-        let rtc_toml = self.hpc3.rtc().save_state();
-        snap.write_toml("rtc.toml", &rtc_toml).map_err(|e| e.to_string())?;
-
-        // EEPROM (93C56)
-        let eeprom_toml = self.hpc3.eeprom().lock().save_state_owned();
-        snap.write_toml("eeprom.toml", &eeprom_toml).map_err(|e| e.to_string())?;
-
-        // SCSI (WD33C93A)
-        let scsi_toml = self.hpc3.scsi().save_state();
-        snap.write_toml("scsi.toml", &scsi_toml).map_err(|e| e.to_string())?;
-
-        // Seeq8003 (Ethernet)
-        let seeq_toml = self.hpc3.seeq().save_state();
-        snap.write_toml("seeq.toml", &seeq_toml).map_err(|e| e.to_string())?;
-
-        // HPC3
-        let hpc3_toml = self.hpc3.save_state();
-        snap.write_toml("hpc3.toml", &hpc3_toml).map_err(|e| e.to_string())?;
-
-        // REX3
+        // REX3 (optional — absent in headless config). Framebuffers are
+        // included in the chunks manifest below for v3+; v2 wrote them as
+        // standalone .bin files.
         if let Some(rex3) = &self._phys.rex3 {
-            let rex3_toml = rex3.save_state();
-            snap.write_toml("rex3.toml", &rex3_toml).map_err(|e| e.to_string())?;
-            rex3.save_framebuffers(&snap.dir).map_err(|e| e.to_string())?;
+            snap.write_state("rex3", &rex3.save_state(), sv).map_err(|e| e.to_string())?;
+            if sv < 3 {
+                rex3.save_framebuffers(&snap.dir).map_err(|e| e.to_string())?;
+            }
         }
 
-        // Bulk memory (raw binary, big-endian word layout) — 4 × 128MB banks
-        for i in 0..4 {
-            self._phys.save_bank(i, dir.join(format!("bank{}.bin", i))).map_err(|e| e.to_string())?;
+        // Bulk memory: v3+ goes to the content-addressable chunk store
+        // shared across all snapshots in `saves/.cas/`. v2 (legacy) writes
+        // raw bank{N}.bin files. Chunk hashes go in chunks.bin so load can
+        // walk the right chunks back out.
+        if sv >= 3 {
+            let store = ChunkStore::new("saves");
+            let mut chunks = ChunksManifest::default();
+            for i in 0..4 {
+                let words = self._phys.snapshot_bank_inmem(i);
+                chunks.bank_chunks[i] = put_words_as_chunks(&store, &words)
+                    .map_err(|e| format!("CAS bank{} put: {}", i, e))?;
+            }
+            if let Some(rex3) = &self._phys.rex3 {
+                let (rgb, aux) = rex3.snapshot_framebuffers_inmem();
+                let rgb_chunks = put_words_as_chunks(&store, &rgb)
+                    .map_err(|e| format!("CAS rex3 rgb put: {}", e))?;
+                let aux_chunks = put_words_as_chunks(&store, &aux)
+                    .map_err(|e| format!("CAS rex3 aux put: {}", e))?;
+                chunks.framebuffer_chunks = Some((rgb_chunks, aux_chunks));
+            }
+            snap.write_chunks_manifest(&chunks).map_err(|e| e.to_string())?;
+        } else {
+            for i in 0..4 {
+                self._phys.save_bank(i, dir.join(format!("bank{}.bin", i))).map_err(|e| e.to_string())?;
+            }
         }
+
+        // COW overlays per SCSI device, plus a `cow.toml` with the dirty
+        // sector set for each one. Keeps the on-disk filesystem state
+        // consistent with the captured RAM.
+        let overlays = self.hpc3.scsi().export_overlays(&snap.dir)
+            .map_err(|e| format!("COW overlay export: {}", e))?;
+        let mut cow_tbl = toml::map::Map::new();
+        for (id, dirty) in overlays {
+            let arr: Vec<toml::Value> = dirty.into_iter()
+                .map(|v| toml::Value::Integer(v as i64))
+                .collect();
+            cow_tbl.insert(format!("scsi{}", id), toml::Value::Array(arr));
+        }
+        snap.write_toml("cow.toml", &toml::Value::Table(cow_tbl))
+            .map_err(|e| e.to_string())?;
 
         self.restart_peripherals();
+        // Resume execution so the session feels like it never paused.
+        // Without this the user sees JIT shutdown stats and a dead prompt
+        // after `save` — the CPU would otherwise stay stopped.
+        self.cpu.start();
         println!("Snapshot saved to saves/{}", name);
         Ok(())
     }
 
-    /// Restore full machine snapshot from `saves/<name>/`.
+    /// Restore full machine snapshot from `saves/<name>/`. CPU is auto-started
+    /// at the end so the guest resumes from the snapshotted PC.
+    /// For determinism validation use `load_snapshot_paused` instead.
     pub fn load_snapshot(&mut self, name: &str) -> Result<(), String> {
+        self.load_snapshot_inner(name)?;
+        self.cpu.start();
+        println!("Snapshot loaded from saves/{}", name);
+        Ok(())
+    }
+
+    /// Same body as `load_snapshot` but leaves CPU and peripheral threads
+    /// stopped on return. Used by the Phase 3.3 determinism validator which
+    /// must prevent any thread from running between load and digest, since
+    /// thread scheduling jitter would mask CPU determinism issues.
+    pub fn load_snapshot_paused(&mut self, name: &str) -> Result<(), String> {
+        self.load_snapshot_inner(name)?;
+        // load_snapshot_inner restarted peripherals; stop them again.
+        self.hpc3.stop();
+        self.mc.stop();
+        if let Some(rex3) = &self._phys.rex3 { rex3.stop(); }
+        Ok(())
+    }
+
+    /// Restore full machine snapshot from `saves/<name>/`.
+    ///
+    /// JIT-cache invariant: `self.stop()` exits the CPU thread, which drops
+    /// the `CodeCache` owned by `run_jit_dispatch`. Subsequent `cpu.start()`
+    /// (in the public `load_snapshot` wrapper) builds a fresh cache. So no
+    /// explicit invalidation is needed here as long as that ownership
+    /// pattern holds. The persistent JIT profile uses content_hash to skip
+    /// stale entries (see `profile_stale` in dispatch.rs).
+    fn load_snapshot_inner(&mut self, name: &str) -> Result<(), String> {
         self.stop();
+
+        // Any prior in-memory rollback checkpoint is now stale (it described
+        // a different snapshot). ci_restore will recapture if reached via
+        // that path; the monitor `load` command leaves it cleared.
+        self.last_restore_checkpoint = None;
 
         // Reset to clean state before loading
         self.power_on_devices();
@@ -548,64 +931,130 @@ impl Machine {
         let dir = std::path::PathBuf::from("saves").join(name);
         let snap = Snapshot::new(&dir);
 
-        // CPU + TLB
-        let cpu_toml = snap.read_toml("cpu.toml").map_err(|e| e.to_string())?;
-        self.cpu.load_state(&cpu_toml)?;
+        // Validate the manifest before reading anything else. Legacy snapshots
+        // (no snapshot.toml) are accepted with a warning. Cross-arch loads are
+        // refused — FPU bit-layout differs between aarch64 and x86_64 and we
+        // don't have migration plumbing yet.
+        let schema_version = match snap.read_manifest()? {
+            Some(m) => {
+                if m.host_arch != std::env::consts::ARCH {
+                    return Err(format!(
+                        "snapshot host_arch '{}' does not match current host '{}'; cross-arch load is not supported",
+                        m.host_arch, std::env::consts::ARCH
+                    ));
+                }
+                if m.schema_version > SCHEMA_VERSION {
+                    return Err(format!(
+                        "snapshot schema_version {} is newer than this iris build supports ({})",
+                        m.schema_version, SCHEMA_VERSION
+                    ));
+                }
+                if let Some(rev) = &m.iris_git_rev {
+                    if let Some(my_rev) = option_env!("IRIS_GIT_REV") {
+                        if rev != my_rev {
+                            eprintln!("load_snapshot: snapshot was captured at iris {} but current build is {}", rev, my_rev);
+                        }
+                    }
+                }
+                m.schema_version
+            }
+            None => {
+                eprintln!("load_snapshot: no snapshot.toml in {} — treating as legacy v0 (no manifest)", dir.display());
+                0
+            }
+        };
 
-        // Memory Controller
-        let mc_toml = snap.read_toml("mc.toml").map_err(|e| e.to_string())?;
-        self.mc.load_state(&mc_toml)?;
+        // Device state — read_state picks <base>.bin (v2+) or <base>.toml
+        // (legacy). v2 also falls back to .toml if .bin is absent.
+        let cpu = snap.read_state("cpu", schema_version).map_err(|e| e.to_string())?;
+        self.cpu.load_state(&cpu)?;
 
-        // IOC
-        let ioc_toml = snap.read_toml("ioc.toml").map_err(|e| e.to_string())?;
-        self.hpc3.ioc().load_state(&ioc_toml)?;
+        let mc = snap.read_state("mc", schema_version).map_err(|e| e.to_string())?;
+        self.mc.load_state(&mc)?;
 
-        // SCC (Z85C30 serial)
-        let scc_toml = snap.read_toml("scc.toml").map_err(|e| e.to_string())?;
-        self.hpc3.ioc().scc().load_state(&scc_toml)?;
+        let ioc = snap.read_state("ioc", schema_version).map_err(|e| e.to_string())?;
+        self.hpc3.ioc().load_state(&ioc)?;
 
-        // PIT (8254 timer)
-        let pit_toml = snap.read_toml("pit.toml").map_err(|e| e.to_string())?;
-        self.hpc3.ioc().pit().load_state(&pit_toml)?;
+        let scc = snap.read_state("scc", schema_version).map_err(|e| e.to_string())?;
+        self.hpc3.ioc().scc().load_state(&scc)?;
 
-        // PS2
-        let ps2_toml = snap.read_toml("ps2.toml").map_err(|e| e.to_string())?;
-        self.hpc3.ioc().ps2().load_state(&ps2_toml)?;
+        let pit = snap.read_state("pit", schema_version).map_err(|e| e.to_string())?;
+        self.hpc3.ioc().pit().load_state(&pit)?;
 
-        // RTC (DS1x86)
-        let rtc_toml = snap.read_toml("rtc.toml").map_err(|e| e.to_string())?;
-        self.hpc3.rtc().load_state(&rtc_toml)?;
+        let ps2 = snap.read_state("ps2", schema_version).map_err(|e| e.to_string())?;
+        self.hpc3.ioc().ps2().load_state(&ps2)?;
 
-        // EEPROM (93C56)
-        let eeprom_toml = snap.read_toml("eeprom.toml").map_err(|e| e.to_string())?;
-        self.hpc3.eeprom().lock().load_state_mut(&eeprom_toml)?;
+        let rtc = snap.read_state("rtc", schema_version).map_err(|e| e.to_string())?;
+        self.hpc3.rtc().load_state(&rtc)?;
 
-        // SCSI (WD33C93A)
-        let scsi_toml = snap.read_toml("scsi.toml").map_err(|e| e.to_string())?;
-        self.hpc3.scsi().load_state(&scsi_toml)?;
+        let eeprom = snap.read_state("eeprom", schema_version).map_err(|e| e.to_string())?;
+        self.hpc3.eeprom().lock().load_state_mut(&eeprom)?;
 
-        // Seeq8003 (Ethernet)
-        let seeq_toml = snap.read_toml("seeq.toml").map_err(|e| e.to_string())?;
-        self.hpc3.seeq().load_state(&seeq_toml)?;
+        let scsi = snap.read_state("scsi", schema_version).map_err(|e| e.to_string())?;
+        self.hpc3.scsi().load_state(&scsi)?;
 
-        // HPC3
-        let hpc3_toml = snap.read_toml("hpc3.toml").map_err(|e| e.to_string())?;
-        self.hpc3.load_state(&hpc3_toml)?;
+        let seeq = snap.read_state("seeq", schema_version).map_err(|e| e.to_string())?;
+        self.hpc3.seeq().load_state(&seeq)?;
 
-        // REX3
+        let hpc3 = snap.read_state("hpc3", schema_version).map_err(|e| e.to_string())?;
+        self.hpc3.load_state(&hpc3)?;
+
         if let Some(rex3) = &self._phys.rex3 {
-            let rex3_toml = snap.read_toml("rex3.toml").map_err(|e| e.to_string())?;
-            rex3.load_state(&rex3_toml)?;
-            rex3.load_framebuffers(&snap.dir).map_err(|e| e.to_string())?;
+            let rex3_v = snap.read_state("rex3", schema_version).map_err(|e| e.to_string())?;
+            rex3.load_state(&rex3_v)?;
+            // v3+ stores framebuffers in the chunk store; v2 used .bin files.
+            if schema_version < 3 {
+                rex3.load_framebuffers(&snap.dir).map_err(|e| e.to_string())?;
+            }
         }
 
-        // Bulk memory — 4 × 128MB banks
-        for i in 0..4 {
-            self._phys.load_bank(i, dir.join(format!("bank{}.bin", i))).map_err(|e| e.to_string())?;
+        // Bulk memory: v3+ comes from the content-addressable chunk store
+        // shared across snapshots; v2 reads raw bank{N}.bin files.
+        if schema_version >= 3 {
+            let store = ChunkStore::new("saves");
+            let chunks = snap.read_chunks_manifest()
+                .map_err(|e| format!("read chunks.bin: {}", e))?;
+            for (i, hashes) in chunks.bank_chunks.iter().enumerate() {
+                if hashes.is_empty() { continue; }
+                let words = get_chunks_as_words(&store, hashes)
+                    .map_err(|e| format!("CAS bank{} get: {}", i, e))?;
+                self._phys.restore_bank_inmem(i, &words);
+            }
+            if let (Some(rex3), Some((rgb_h, aux_h))) = (&self._phys.rex3, &chunks.framebuffer_chunks) {
+                let rgb = get_chunks_as_words(&store, rgb_h)
+                    .map_err(|e| format!("CAS rex3 rgb get: {}", e))?;
+                let aux = get_chunks_as_words(&store, aux_h)
+                    .map_err(|e| format!("CAS rex3 aux get: {}", e))?;
+                rex3.restore_framebuffers_inmem(&rgb, &aux);
+            }
+        } else {
+            for i in 0..4 {
+                self._phys.load_bank(i, dir.join(format!("bank{}.bin", i))).map_err(|e| e.to_string())?;
+            }
+        }
+
+        // COW overlays — best-effort for backward compatibility with
+        // snapshots saved before overlay capture was added.
+        if let Ok(cow_toml) = snap.read_toml("cow.toml") {
+            let mut sets: Vec<(usize, Vec<u64>)> = Vec::new();
+            if let Some(tbl) = cow_toml.as_table() {
+                for (k, v) in tbl {
+                    let Some(id_str) = k.strip_prefix("scsi") else { continue };
+                    let Ok(id) = id_str.parse::<usize>() else { continue };
+                    let Some(arr) = v.as_array() else { continue };
+                    let dirty: Vec<u64> = arr.iter()
+                        .filter_map(|x| x.as_integer().map(|i| i as u64))
+                        .collect();
+                    sets.push((id, dirty));
+                }
+            }
+            self.hpc3.scsi().import_overlays(&snap.dir, &sets)
+                .map_err(|e| format!("COW overlay import: {}", e))?;
+        } else {
+            eprintln!("load_snapshot: no cow.toml in snapshot — overlays left unchanged");
         }
 
         self.restart_peripherals();
-        println!("Snapshot loaded from saves/{}", name);
         Ok(())
     }
 }

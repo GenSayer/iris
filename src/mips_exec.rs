@@ -4820,6 +4820,106 @@ impl<T: Tlb + Send + 'static, C: MipsCache + Send + 'static> MipsCpu<T, C> {
     fn try_lock_executor(&self) -> Result<parking_lot::MutexGuard<MipsExecutor<T, C>>, String> {
         self.executor.try_lock().ok_or_else(|| "CPU thread holds the executor lock; try 'cpu stop' first".to_string())
     }
+
+    /// Step the executor `n` times in-line on the calling thread. Caller must
+    /// have stopped the runtime CPU thread first (otherwise we deadlock on
+    /// the executor mutex). Returns the number of steps actually executed —
+    /// will be `< n` only if the CPU stops itself (e.g. soft-reset).
+    ///
+    /// Used by Phase 3.3 snapshot determinism validator. Single-threaded,
+    /// no thread scheduling jitter, so two runs from identical state should
+    /// reach identical state after the same number of steps.
+    pub fn step_n_inline(&self, n: u64) -> Result<u64, String> {
+        let mut exec = self.try_lock_executor()?;
+        let mut executed = 0u64;
+        for _ in 0..n {
+            let _status = exec.step();
+            executed += 1;
+            // Don't break on exceptions — they're part of normal CPU
+            // operation and a deterministic run should re-enter and continue.
+        }
+        exec.flush_cycles();
+        Ok(executed)
+    }
+
+    /// Snapshot the deterministic-from-state CPU registers. Excludes host
+    /// wallclock anchors like `compare_last_instant` (they're meaningless
+    /// across runs) but includes their calibrated equivalents (count_step,
+    /// compare_delta_*).
+    pub fn state_digest(&self) -> Result<CpuStateDigest, String> {
+        let exec = self.try_lock_executor()?;
+        let c = &exec.core;
+        Ok(CpuStateDigest {
+            gpr: c.gpr,
+            pc: c.pc,
+            hi: c.hi,
+            lo: c.lo,
+            cp0_count: c.cp0_count,
+            cp0_compare: c.cp0_compare,
+            cp0_status: c.cp0_status,
+            cp0_cause: c.cp0_cause,
+            cp0_epc: c.cp0_epc,
+            cp0_badvaddr: c.cp0_badvaddr,
+            cp0_entryhi: c.cp0_entryhi,
+            count_step: c.count_step,
+            in_delay_slot: exec.in_delay_slot,
+        })
+    }
+}
+
+/// Deterministic-from-state CPU register snapshot. Excludes host wallclock
+/// anchors so two runs from the same starting state can be diffed cleanly.
+/// `local_cycles` is intentionally not included — it's a runtime perf counter
+/// that's not part of save_state and stays stale across `load_snapshot`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CpuStateDigest {
+    pub gpr: [u64; 32],
+    pub pc: u64,
+    pub hi: u64,
+    pub lo: u64,
+    pub cp0_count: u64,
+    pub cp0_compare: u64,
+    pub cp0_status: u32,
+    pub cp0_cause: u32,
+    pub cp0_epc: u64,
+    pub cp0_badvaddr: u64,
+    pub cp0_entryhi: u64,
+    pub count_step: u64,
+    pub in_delay_slot: bool,
+}
+
+impl CpuStateDigest {
+    /// Return a list of (field_name, lhs_repr, rhs_repr) for every field that
+    /// differs. Empty if states are bit-identical. For arrays, only diverging
+    /// indices are reported.
+    pub fn diff(&self, other: &CpuStateDigest) -> Vec<(String, String, String)> {
+        let mut out = Vec::new();
+        for (i, (a, b)) in self.gpr.iter().zip(other.gpr.iter()).enumerate() {
+            if a != b {
+                out.push((format!("gpr[{}]", i), format!("0x{:016x}", a), format!("0x{:016x}", b)));
+            }
+        }
+        macro_rules! cmp {
+            ($name:ident, $fmt:expr) => {
+                if self.$name != other.$name {
+                    out.push((stringify!($name).to_string(), format!($fmt, self.$name), format!($fmt, other.$name)));
+                }
+            };
+        }
+        cmp!(pc,           "0x{:016x}");
+        cmp!(hi,           "0x{:016x}");
+        cmp!(lo,           "0x{:016x}");
+        cmp!(cp0_count,    "0x{:016x}");
+        cmp!(cp0_compare,  "0x{:016x}");
+        cmp!(cp0_status,   "0x{:08x}");
+        cmp!(cp0_cause,    "0x{:08x}");
+        cmp!(cp0_epc,      "0x{:016x}");
+        cmp!(cp0_badvaddr, "0x{:016x}");
+        cmp!(cp0_entryhi,  "0x{:016x}");
+        cmp!(count_step,   "{}");
+        cmp!(in_delay_slot, "{}");
+        out
+    }
 }
 
 fn is_call_instruction(instr: u32) -> bool {
@@ -5951,7 +6051,16 @@ impl<T: Tlb + Send + 'static, C: MipsCache + Send + 'static> Saveable for MipsCp
             ($f:ident) => { cp0.insert(stringify!($f).into(), hex_u64(c.$f)); }
         }
         cp0u32!(cp0_index); cp0u32!(cp0_random); cp0u32!(cp0_wired);
-        cp0u64!(cp0_count); cp0u64!(cp0_compare); cp0u32!(cp0_status); cp0u32!(cp0_cause);
+        cp0u64!(cp0_count); cp0u64!(cp0_compare);
+        // Timer calibration state. Without these, restore loses the kernel's
+        // learned tick rate and runs at the default count_step until IRIX
+        // touches Compare again — guest scheduler drifts noticeably for the
+        // first few seconds after every restore. compare_last_cycles and
+        // compare_last_instant are intentionally not saved: they're host-wall
+        // anchors, not calibrated state, and must be reset on load.
+        cp0u64!(count_step); cp0u64!(compare_delta_prev);
+        cp0u64!(compare_delta_slow); cp0u64!(compare_delta_fast);
+        cp0u32!(cp0_status); cp0u32!(cp0_cause);
         cp0u32!(cp0_prid); cp0u32!(cp0_config); cp0u32!(cp0_lladdr);
         cp0u32!(cp0_watchlo); cp0u32!(cp0_watchhi); cp0u32!(cp0_ecc); cp0u32!(cp0_cacheerr);
         cp0u32!(cp0_taglo); cp0u32!(cp0_taghi);
@@ -6005,6 +6114,19 @@ impl<T: Tlb + Send + 'static, C: MipsCache + Send + 'static> Saveable for MipsCp
             }}
             ld32!(cp0_index); ld32!(cp0_random); ld32!(cp0_wired);
             ld64!(cp0_count); ld64!(cp0_compare);
+            ld64!(count_step); ld64!(compare_delta_prev);
+            ld64!(compare_delta_slow); ld64!(compare_delta_fast);
+            // Mirror count_step into its atomic shadow (read by the display
+            // thread) so the live UI matches the restored core state.
+            c.count_step_atomic.store(c.count_step, std::sync::atomic::Ordering::Relaxed);
+            // Re-anchor the host-wall calibration timer. Setting cycles to 0
+            // forces the next CP0 Compare write to take the "first write"
+            // path (no calibration), which is what we want — dt_ns measured
+            // against an Instant from the previous run would be garbage. The
+            // saved count_step keeps the rate steady until calibration catches
+            // up over the next few Compare writes.
+            c.compare_last_cycles = 0;
+            c.compare_last_instant = std::time::Instant::now();
             ld32!(cp0_status); ld32!(cp0_cause); ld32!(cp0_prid);
             ld32!(cp0_config); ld32!(cp0_lladdr); ld32!(cp0_watchlo); ld32!(cp0_watchhi);
             ld32!(cp0_ecc); ld32!(cp0_cacheerr); ld32!(cp0_taglo); ld32!(cp0_taghi);

@@ -80,9 +80,13 @@ pub struct MipsCore {
     /// Shared with the display refresh thread for status bar display.
     pub count_step_atomic: Arc<AtomicU64>,
     /// Cycle count when cp0_compare was last written (0 = never written yet).
-    compare_last_cycles: u64,
-    /// Wall-clock instant when cp0_compare was last written.
-    compare_last_instant: std::time::Instant,
+    /// `pub(crate)` so snapshot load in `mips_exec.rs` can re-anchor the
+    /// calibration after restoring CP0 fields.
+    pub(crate) compare_last_cycles: u64,
+    /// Wall-clock instant when cp0_compare was last written. Reset to
+    /// `Instant::now()` on snapshot load — Instants from a previous run are
+    /// meaningless across a restore.
+    pub(crate) compare_last_instant: std::time::Instant,
     /// Frequency map of CP0 Compare delta values (hardware counts, rounded to nearest 100).
     /// Key = `(delta >> 16) / 100 * 100`, value = number of occurrences.
     #[cfg(feature = "developer_ip7")]
@@ -542,10 +546,23 @@ impl MipsCore {
                 // Formula: count_step = delta * dt_ns / (dc * 1_000_000)
                 //   delta = count units to next compare (what the kernel programmed)
                 //   dc    = instructions executed in last interval
-                //   dt_ns = wall-clock ns elapsed in last interval
-                // = (count units per instruction) * (wall-clock stretch factor)
+                //   dt_ns = ns elapsed in last interval
+                // = (count units per instruction) * (rate-stretch factor)
                 // Only calibrate for ~1ms timer intervals (IRIX 1000 Hz scheduler);
                 // leave count_step unchanged for other timer uses (one-shot, low-freq).
+                //
+                // Two clock sources, gated by `ci_clock`:
+                //   default (interactive desktop): dt_ns from host `Instant::now()`,
+                //     so the guest timer tracks real wall-clock. Sensitive to host
+                //     scheduling jitter, but that's the price of a real-time desktop.
+                //   --features ci_clock: dt_ns = dc * 10 ns (synthetic R4400 ~100 MIPS).
+                //     Decouples guest-perceived time from host scheduling so the Phase
+                //     3.3 snapshot determinism validator passes at any N. Tradeoff: a
+                //     CI run that takes 5 host minutes may present as 30 guest minutes
+                //     depending on host MIPS — exactly what reproducible CI wants.
+                #[cfg(feature = "ci_clock")]
+                const NS_PER_GUEST_CYCLE: u64 = 10;
+                #[cfg(not(feature = "ci_clock"))]
                 let now = std::time::Instant::now();
                 let cycles_now = self.local_cycles;
                 // Compute new_delta before the calibration block so we can guard on it.
@@ -554,9 +571,13 @@ impl MipsCore {
                 let new_delta = self.cp0_compare.wrapping_sub(self.cp0_count);
                 if new_delta >> 63 != 0 {
                     self.compare_last_cycles = cycles_now;
-                    self.compare_last_instant = now;
+                    #[cfg(not(feature = "ci_clock"))]
+                    { self.compare_last_instant = now; }
                 } else if self.compare_last_cycles != 0 {
                     let dc = cycles_now.wrapping_sub(self.compare_last_cycles);
+                    #[cfg(feature = "ci_clock")]
+                    let dt_ns = dc.saturating_mul(NS_PER_GUEST_CYCLE);
+                    #[cfg(not(feature = "ci_clock"))]
                     let dt_ns = now.duration_since(self.compare_last_instant).as_nanos() as u64;
                     // new_delta: what the *next* interval will fire at, stored as 32.32 fp.
                     #[cfg(feature = "developer_ip7")]
@@ -598,7 +619,8 @@ impl MipsCore {
                 }
                 // First write: keep default count_step (1<<15), just record state.
                 self.compare_last_cycles = cycles_now;
-                self.compare_last_instant = now;
+                #[cfg(not(feature = "ci_clock"))]
+                { self.compare_last_instant = now; }
             }
             12 => {
                 let old = self.cp0_status;

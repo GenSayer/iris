@@ -71,6 +71,7 @@ cargo run --release --features lightning             # disable emulator breakpoi
 cargo run --release --features jit                   # enable Cranelift MIPS JIT compiler
 cargo run --release --features rex-jit               # enable REX3 graphics JIT compiler
 cargo run --release --features tlbvmap               # enable 8k slot to tlb entry map (increases cache use but may help depending on host cpu arch)
+cargo run --release --features ci_clock              # synthetic deterministic CP0 Compare clock (CI/snapshot validator only; loses realtime desktop timing)
 cargo run --release --features lightning,rex-jit,tlbvmap     # recommended for best speed right now
 ```
 
@@ -131,6 +132,122 @@ Writes go to `scsi1.raw.overlay`. Monitor commands:
 - `cow reset` - discard all overlay writes
 
 
+## Snapshots and rollback
+
+Capture the full machine state — RAM, every device, plus the COW overlay — into
+`saves/<name>/`, and restore it later. CPU, MC, IOC, HPC3, REX3, RTC, EEPROM,
+SCSI controller, and the Seeq Ethernet chip all round-trip. Current schema
+version is 3: postcard-encoded binary device state plus content-addressable
+chunked RAM under `saves/.cas/`. A second snapshot taken from the same parent
+adds **zero bytes** to disk for any RAM region that didn't change — same
+storage model as Docker layers.
+
+From the interactive monitor (`telnet 127.0.0.1 8888`):
+```
+save base/desktop          # writes saves/base/desktop/
+load base/desktop          # restore everything (RAM, devices, disk overlay)
+```
+
+From `iris-ci` (the wrapper — see CI socket section below):
+```bash
+iris-ci save base/desktop
+iris-ci restore base/desktop          # full disk-backed reload (~150 ms cold)
+iris-ci rollback                      # in-memory rewind to last restore (~40 ms)
+iris-ci diff base/desktop tests/grep  # what changed: devices, RAM chunks, COW sectors
+iris-ci validate base/desktop -n 1000000  # bit-deterministic re-execution check (build with --features ci_clock)
+iris-ci tree                          # snapshot parent-chain hierarchy
+iris-ci gc                            # sweep CAS chunks no kept snapshot references
+iris-ci pull http://reg/snapshots/base   # fetch a snapshot from another machine
+```
+
+Two restore tiers:
+- **`restore <name>`** — full disk-backed reload. ~150 ms. Use after a hard
+  reset or to switch to a different snapshot.
+- **`rollback`** — in-memory rewind to the last `restore` checkpoint. ~40 ms,
+  no disk I/O. Use this in tight inner test loops where you keep returning to
+  the same starting state.
+
+Reflinks are used on APFS / btrfs / xfs so capturing a snapshot of a 4 GB disk
+image takes <10 ms and uses ~18 MB of actual disk.
+
+See [CHANGELOG.md](CHANGELOG.md) for the full feature set, and
+[manual_test_runbook.md](manual_test_runbook.md) for a copy-paste tour.
+
+
+## CI control socket and `iris-ci`
+
+`--ci` enables a Unix-socket control plane for headless automation, plus a
+small in-process serial backend so the harness can drive the IRIX console
+directly. The default socket path is `/tmp/iris.sock`.
+
+```
+cargo run --release --features lightning -- --ci
+```
+
+`cargo build` produces a companion binary, `iris-ci`, that's the **canonical
+way** to drive the socket. Don't bother with raw `nc` + JSON unless you're
+debugging the wrapper itself.
+
+```bash
+# In one terminal: launch iris (Newport window opens, --ci is just an extra channel)
+./target/release/iris --ci
+
+# In another terminal: drive it
+./target/release/iris-ci boot          # PROM menu → IRIS console login (one cmd)
+./target/release/iris-ci login         # send root + dismiss vt100 prompt + wait #
+./target/release/iris-ci run 'ls /'    # send shell command, get stdout + exit code
+./target/release/iris-ci save base/multiuser
+./target/release/iris-ci put localfile.tar   # copy file into guest, no bs=512 math
+./target/release/iris-ci get /tmp/out --to ./out.tar
+./target/release/iris-ci diff base mutated   # per-device + chunk + cow-sector deltas
+./target/release/iris-ci tree
+./target/release/iris-ci script tests/scenario.iris   # batch-run a sequence of cmds
+```
+
+Run `iris-ci --help` for the full list, or `iris-ci <subcmd> --help` for any
+subcommand. Every operation has a typed clap arg — no JSON quoting, no
+hand-managed timeouts.
+
+For automation that doesn't want to depend on `iris-ci`, the underlying socket
+protocol is newline-delimited JSON; `cmd` and `args` per request, `{ok, data,
+error}` per response. See `src/ci.rs` for the dispatch table.
+
+
+## Scratch volume — file injection without networking
+
+A SCSI device with `scratch = true` is a host-controlled raw block device for
+pushing files into the guest (and pulling artifacts back out) without bringing
+up NFS or anything else. iris pre-formats the underlying file with a minimal
+SGI Volume Header on first run, and exposes it inside IRIX as
+`/dev/rdsk/dks0d2s0`.
+
+Enable in `iris.toml`:
+```toml
+[scsi.2]
+path    = "scratch.raw"
+cdrom   = false
+overlay = false
+scratch = true
+size_mb = 64
+```
+
+The easy way (via `iris-ci`):
+```bash
+iris-ci put localfile.tar                 # copies host file into the guest
+iris-ci get /tmp/output.log --to ./out.log  # pulls a guest file out
+```
+
+`iris-ci put`/`get` handle the IRIX `dd bs=512` sector-alignment quirk
+transparently — they compute the right block count from the host file size,
+issue the right `dd` recipe to the guest, and truncate to the original byte
+length on the receiving end.
+
+Manual/raw paths (if you want to drive `dd` yourself):
+- Reads MUST use `bs=512` (or any 512-multiple); `bs=64` returns "I/O error".
+- Writes must be padded to `bs`; add `conv=sync` for short inputs.
+- Inside IRIX: `dd if=/dev/rdsk/dks0d2s0 bs=512 | tar xf -`
+
+
 ## Input
 
 Click the window to grab mouse and keyboard. Right Ctrl releases the grab.
@@ -148,8 +265,9 @@ getting IRIX running. These are meant for both humans and AI assistants working
 on the codebase.
 
 - `rules/jit/` - dispatch architecture, store compilation, sync, verify mode, probe tuning
-- `rules/irix/` - networking config, keyboard quirks
+- `rules/irix/` - networking config, keyboard quirks, csh + scratch raw-device gotchas
 - `rules/testing/` - disk image handling, avoiding filesystem corruption
+- `rules/snapshot/` - snapshot binary format, scratch-volume conventions, round-trip tests, CI overlay paths, **iris-ci as the canonical CI interface**
 
 If you're about to touch the JIT dispatch loop, read `rules/jit/dispatch-architecture.md`
 first. It'll save you a few days.
