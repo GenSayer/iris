@@ -17,7 +17,7 @@ prom = "prom.bin"
 # scale=2 is visibly ~2× bigger than scale=1 on every display.
 # Valid: 1, 2, 3, or 4.
 # Can also be set with the --2x command-line flag (CLI takes precedence).
-scale = 2
+scale = 1
 
 # RAM bank sizes in MB.
 # Each bank must be 0 (absent), 8, 16, 32, 64, or 128.
@@ -34,14 +34,14 @@ banks = [128, 128, 0, 0]
 
 # Internal hard disk
 [scsi.1]
-path   = "irix65_4g.raw"
+path   = "scsi1.raw"
 cdrom  = false
-overlay = true
+#overlay = true
 
 # Internal hard disk
-#[scsi.2]
-#path   = "scsi2.raw"
-#cdrom  = false
+[scsi.2]
+path   = "scsi2.raw"
+cdrom  = false
 
 # Scratch volume for host<->guest file injection without networking.
 # iris auto-creates the file at `path` if missing — first 4 KB hold a minimal
@@ -60,12 +60,12 @@ overlay = true
 # Implies cdrom=false, overlay=false (the volume must be host-writable, and
 # scratch contents intentionally survive snapshot rollback so a freshly
 # injected bundle isn't reverted).
-[scsi.2]
-path    = "scratch.raw"
-cdrom   = false
-overlay = false
-scratch = true
-size_mb = 64
+#[scsi.2]
+#path    = "scratch.raw"
+#cdrom   = false
+#overlay = false
+#scratch = true
+#size_mb = 64
 
 # NFS share — requires unfsd on the host.
 # The shared directory is exported to the VM at 192.168.0.1:/path (standard NFS port 2049).
