@@ -2551,7 +2551,7 @@ impl Rex3 {
         // DW_3 is ambiguous — skipped for now.
         if (dcb.dcbmode & DCBMODE_SWAPENDIAN) != 0 {
             val = match data_width {
-                DCBMODE_DATAWIDTH_2 => ((val & 0xFF) << 8) | ((val >> 8) & 0xFF),
+                DCBMODE_DATAWIDTH_2 => ((val & 0x00FF00FF) << 8) | ((val >> 8) & 0x00FF00FF),
                 DCBMODE_DATAWIDTH_4 => val.swap_bytes(),
                 _                   => val,
             };
@@ -2569,6 +2569,8 @@ impl Rex3 {
                 let vc2_val = if data_width == DCBMODE_DATAWIDTH_2 {
                     let hi = val >> 16;
                     if hi != 0 { hi } else { val & 0xFFFF }
+                } else if data_width == DCBMODE_DATAWIDTH_1 {
+                    val >> 24
                 } else {
                     val
                 };
@@ -2581,10 +2583,10 @@ impl Rex3 {
                     if addr == 1 || addr == 3 { self.cmap1.lock().write_crs(crs, byte); }
                 };
                 match data_width {
-                    DCBMODE_DATAWIDTH_1 => { write_cmap(dcb.inc_crs(1), val as u8); }
+                    DCBMODE_DATAWIDTH_1 => { write_cmap(dcb.inc_crs(1), (val >> 24) as u8); }
                     DCBMODE_DATAWIDTH_2 => {
-                        write_cmap(dcb.inc_crs(1), (val >> 8) as u8);
-                        write_cmap(dcb.inc_crs(1), val as u8);
+                        write_cmap(dcb.inc_crs(1), (val >> 24) as u8);
+                        write_cmap(dcb.inc_crs(1), (val >> 16) as u8);
                     }
                     DCBMODE_DATAWIDTH_3 => { // write32 only — MSB-packed
                         write_cmap(dcb.inc_crs(1), (val >> 24) as u8);
@@ -2611,10 +2613,10 @@ impl Rex3 {
                     }
                 };
                 match data_width {
-                    DCBMODE_DATAWIDTH_1 => { write_xmap(dcb.inc_crs(1), val & 0xFF); }
+                    DCBMODE_DATAWIDTH_1 => { write_xmap(dcb.inc_crs(1), (val >> 24) & 0xFF); }
                     DCBMODE_DATAWIDTH_2 => {
-                        write_xmap(dcb.inc_crs(1), (val >> 8) & 0xFF);
-                        write_xmap(dcb.inc_crs(1), val & 0xFF);
+                        write_xmap(dcb.inc_crs(1), (val >> 24) & 0xFF);
+                        write_xmap(dcb.inc_crs(1), (val >> 16) & 0xFF);
                     }
                     DCBMODE_DATAWIDTH_3 => { // write32 only — MSB-packed
                         write_xmap(dcb.inc_crs(1), (val >> 24) & 0xFF);
@@ -2628,10 +2630,10 @@ impl Rex3 {
             }
             7 => { // RAMDAC (Bt445)
                 match data_width {
-                    DCBMODE_DATAWIDTH_1 => { self.bt445.lock().write_crs(dcb.inc_crs(1), val as u8); }
+                    DCBMODE_DATAWIDTH_1 => { self.bt445.lock().write_crs(dcb.inc_crs(1), (val >> 24) as u8); }
                     DCBMODE_DATAWIDTH_2 => {
-                        self.bt445.lock().write_crs(dcb.inc_crs(1), (val >> 8) as u8);
-                        self.bt445.lock().write_crs(dcb.inc_crs(1), val as u8);
+                        self.bt445.lock().write_crs(dcb.inc_crs(1), (val >> 24) as u8);
+                        self.bt445.lock().write_crs(dcb.inc_crs(1), (val >> 16) as u8);
                     }
                     DCBMODE_DATAWIDTH_3 => { // write32 only — MSB-packed
                         self.bt445.lock().write_crs(dcb.inc_crs(1), (val >> 24) as u8);
@@ -2672,7 +2674,7 @@ impl Rex3 {
                     DCBMODE_DATAWIDTH_1 => 1,
                     DCBMODE_DATAWIDTH_2 => 2,
                     DCBMODE_DATAWIDTH_3 => 3,
-                    _ =>                  4,
+                    _ =>                   4,
                 };
                 let raw = self.vc2.lock().read(dcb.inc_crs(nbytes));
                 // DW_2: replicate 16-bit value in both halves so drivers using
@@ -2680,6 +2682,8 @@ impl Rex3 {
                 val = if data_width == DCBMODE_DATAWIDTH_2 {
                     let v = raw & 0xFFFF;
                     (v << 16) | v
+                } else if data_width == DCBMODE_DATAWIDTH_1 {
+                    raw << 24
                 } else {
                     raw
                 };
@@ -2697,12 +2701,12 @@ impl Rex3 {
                 };
                 match data_width {
                     DCBMODE_DATAWIDTH_1 => {
-                        val = read_byte(dcb.inc_crs(1)) as u32;
+                        val = (read_byte(dcb.inc_crs(1)) as u32) << 24;
                     }
                     DCBMODE_DATAWIDTH_2 => {
                         let b0 = read_byte(dcb.inc_crs(1)) as u32;
                         let b1 = read_byte(dcb.inc_crs(1)) as u32;
-                        val = (b0 << 8) | b1;
+                        val = (b0 << 24) | (b1 << 16);
                     }
                     DCBMODE_DATAWIDTH_3 => { // read32 only — MSB-packed
                         let b0 = read_byte(dcb.inc_crs(1)) as u32;
@@ -2731,7 +2735,7 @@ impl Rex3 {
         // DCBMODE bit 28 "Swap Byte Ordering": swap within the data width.
         if (dcb.dcbmode & DCBMODE_SWAPENDIAN) != 0 {
             val = match data_width {
-                DCBMODE_DATAWIDTH_2 => ((val & 0xFF) << 8) | ((val >> 8) & 0xFF),
+                DCBMODE_DATAWIDTH_2 => ((val & 0x00FF00FF) << 8) | ((val >> 8) & 0x00FF00FF),
                 DCBMODE_DATAWIDTH_4 => val.swap_bytes(),
                 _                   => val,
             };
@@ -4352,7 +4356,7 @@ impl BusDevice for Rex3 {
         let offset = addr & (REX3_SIZE - 1);
         let is_dcb = (offset & !7) == REX3_DCBDATA0;
         let res = if is_dcb {
-            let val = self.dcb_read() as u8;
+            let val = (self.dcb_read() >> ((offset & 3) << 3)) as u8;
             dlog_dev!(LogModule::Dcb, "DCB Read8: Offset {:04x} -> {:02x}", offset, val);
             BusRead8::ok(val)
         } else {
@@ -4380,7 +4384,7 @@ impl BusDevice for Rex3 {
 
         if is_dcb {
             dlog_dev!(LogModule::Dcb, "DCB Write8: Offset {:04x} Val {:02x} -> dcb_write({:08x})", offset, val, val as u32);
-            self.dcb_write(val as u32);
+            self.dcb_write((val as u32) << ((offset & 3) << 3));
             return BUS_OK;
         }
         eprintln!("REX3 Write8: unhandled offset {:04x} val {:02x}", offset, val);
@@ -4396,7 +4400,7 @@ impl BusDevice for Rex3 {
         let offset = addr & (REX3_SIZE - 1);
         let is_dcb = (offset & !7) == REX3_DCBDATA0;
         let res = if is_dcb {
-            let val = self.dcb_read() as u16;
+            let val = (self.dcb_read() >> ((offset & 2) << 3)) as u16;
             dlog_dev!(LogModule::Dcb, "DCB Read16: Offset {:04x} -> {:04x}", offset, val);
             BusRead16::ok(val)
         } else {
@@ -4423,8 +4427,8 @@ impl BusDevice for Rex3 {
         dlog_dev!(LogModule::Rex3, "REX3 Write16: Offset {:04x} Val {:04x}", offset, val);
 
         if is_dcb {
-            dlog_dev!(LogModule::Dcb, "DCB Write16: Offset {:04x} Val {:04x} -> dcb_write({:08x})", offset, val, val as u32);
-            self.dcb_write(val as u32);
+            dlog_dev!(LogModule::Dcb, "DCB Write16: Offset {:04x} Val {:04x} -> dcb_write({:08x})", offset, val, (val as u32) << ((offset & 2) << 3));
+            self.dcb_write((val as u32) << ((offset & 2) << 3));
             return BUS_OK;
         }
         eprintln!("REX3 Write16: unhandled offset {:04x} val {:04x}", offset, val);

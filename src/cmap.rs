@@ -34,7 +34,7 @@ impl Cmap {
             red_temp: 0,
             green_temp: 0,
             command: 0,
-            revision: 0x02, // XL24 (Indy 24-bit): cmap_revision=0x02; XL8 would be 0xa1?
+            revision: if id == 0 {0x02 } else {0xA2}, // XL24 (Indy 24-bit): cmap_revision=0x02, cmap1 has monitor id (10) in upper nibble
             dirty: true,
         }
     }
