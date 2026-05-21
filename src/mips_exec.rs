@@ -758,9 +758,16 @@ For R4000SC/MC CPUs:
         let va_page = va & !0xFFF;
         let slot = &self.core.nanotlb[AT as usize];
         if slot.matches(va_page) {
+            #[cfg(feature = "tlbstats")]
+            {
+                let at = unsafe { std::mem::transmute::<u8, AccessType>(AT) };
+                self.tlb.stats_nanotlb_hit(at);
+            }
             return TranslateResult::ok(slot.phys_addr(va), slot.cache_attr_raw());
         }
         let at = unsafe { std::mem::transmute::<u8, AccessType>(AT) };
+        #[cfg(feature = "tlbstats")]
+        self.tlb.stats_nanotlb_miss(at);
         let result = (self.translate_fn)(self, va, at);
         if !result.is_exception() {
             self.core.nanotlb[AT as usize].fill_raw(va_page, result.phys as u64, result.status & 0x7);
@@ -3115,8 +3122,8 @@ For R4000SC/MC CPUs:
 
         // Write to CP0 registers, clearing G bit from EntryHi
         self.core.cp0_entryhi = entry.entry_hi & !0x1000; // Clear bit 12 (G bit)
-        self.core.cp0_entrylo0 = (entry.entry_lo0 & !1) | g_bit; // Set G bit from EntryHi
-        self.core.cp0_entrylo1 = (entry.entry_lo1 & !1) | g_bit; // Set G bit from EntryHi
+        self.core.cp0_entrylo0 = (entry.entry_lo[0] & !1) | g_bit; // Set G bit from EntryHi
+        self.core.cp0_entrylo1 = (entry.entry_lo[1] & !1) | g_bit; // Set G bit from EntryHi
         self.core.cp0_pagemask = entry.page_mask;
 
         if mips_log(MIPS_LOG_TLB) { dlog_dev!(LogModule::Mips, "TLBR: Read Index {}\n{}", index, self.tlb.format_entry(index)); }
@@ -3140,8 +3147,10 @@ For R4000SC/MC CPUs:
         TlbEntry {
             page_mask: self.core.cp0_pagemask,
             entry_hi: (self.core.cp0_entryhi & EH_WM & !0x1000) | g_combined,
-            entry_lo0: self.core.cp0_entrylo0,
-            entry_lo1: self.core.cp0_entrylo1,
+            entry_lo: [self.core.cp0_entrylo0, self.core.cp0_entrylo1],
+            selector_bit_shift: 0, // all derived fields overwritten by MipsTlb::write()
+            vcmp32: 0, vpn_hi32: 0, vcmp64: 0, vpn_hi64: 0,
+            offset_mask: 0, pfn_base: [0; 2],
         }
     }
 
@@ -3150,7 +3159,7 @@ For R4000SC/MC CPUs:
     fn exec_tlbwi(&mut self) -> ExecStatus {
         let index = (self.core.cp0_index as usize) % self.tlb.num_entries();
         let entry = self.create_tlb_entry_from_cp0();
-        //eprintln!("TLBWI idx={} entryhi={:#018x} lo0={:#018x} lo1={:#018x} pc={:#018x}", index, entry.entry_hi, entry.entry_lo0, entry.entry_lo1, self.core.pc);
+        //eprintln!("TLBWI idx={} entryhi={:#018x} lo0={:#018x} lo1={:#018x} pc={:#018x}", index, entry.entry_hi, entry.entry_lo[0], entry.entry_lo[1], self.core.pc);
         self.tlb.write(index, entry);
         self.core.nanotlb_invalidate();
 
@@ -4952,6 +4961,8 @@ impl<T: Tlb + Send + 'static, C: MipsCache + Send + 'static> Device for MipsCpu<
         if let Some(handle) = self.thread.lock().take() {
             let _ = handle.join();
         }
+        #[cfg(feature = "tlbstats")]
+        self.executor.lock().tlb.stats_print();
         #[cfg(feature = "developer_ip7")]
         {
             let map = &self.executor.lock().core.compare_delta_stats;

@@ -17,9 +17,14 @@ ci_clock = []
 # Lightning: pedal-to-the-metal build — disables breakpoint checks and traceback buffer updates.
 # Incompatible with interactive debugging. For end-user / benchmarking builds only.
 lightning = []
-# O(1) TLB fast path: 512KB inline vmap indexed by VA[31:13] replaces MRU linear scan
-# for 32-bit and sign-extended 64-bit VAs. Disable to benchmark against baseline.
+# O(1) TLB fast path: 512KB inline vmap indexed by VA[31:13] replaces linear scan
+# for 32-bit and sign-extended 64-bit VAs. Always on; kept as a feature flag so
+# downstream tooling that passes --features tlbvmap still compiles cleanly.
 tlbvmap = []
+# TLB translation statistics: per-AccessType counters for nanotlb, vmap, and
+# MRU scan paths including entries-walked totals.  Print at emulator exit.
+tlbstats = []
+default = ["tlbvmap"]
 # Cranelift-based JIT compiler for MIPS → native translation.
 jit = ["cranelift-codegen", "cranelift-frontend", "cranelift-jit", "cranelift-module", "cranelift-native", "target-lexicon"]
 # Cranelift-based JIT compiler for REX3 graphics draw shaders.
