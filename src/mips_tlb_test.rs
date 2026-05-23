@@ -289,23 +289,30 @@ mod tests {
     /// that save_state writes.
     #[test]
     fn save_load_round_trip() {
-        let mut src = MipsTlb::new(TLB_NUM_ENTRIES);
-        // Write a few entries with varied bit patterns so we're not just
-        // testing all-zero defaults.
-        for (slot, vpn2) in [(0usize, 0x100u64), (5, 0x800), (17, 0x4000), (47, 0xffff)].iter().copied() {
-            let mut e = TlbEntry::new();
-            e.page_mask = (slot as u64) << 13;
-            e.entry_hi  = (2u64 << 62) | (vpn2 << 13) | (slot as u64 & 0xff);
-            e.entry_lo[0] = ((slot as u64) << 6) | (3 << 3) | 0x6;
-            e.entry_lo[1] = ((slot as u64 + 1) << 6) | (3 << 3) | 0x6;
-            src.write(slot, e);
-        }
-        let v1 = src.save_state();
+        // MipsTlb contains a 512KB vmap array; two instances exceed the default
+        // test thread stack (8KB on Linux), so run the body in a larger thread.
+        std::thread::Builder::new()
+            .stack_size(4 * 1024 * 1024)
+            .spawn(|| {
+                let mut src = MipsTlb::new(TLB_NUM_ENTRIES);
+                for (slot, vpn2) in [(0usize, 0x100u64), (5, 0x800), (17, 0x4000), (47, 0xffff)].iter().copied() {
+                    let mut e = TlbEntry::new();
+                    e.page_mask = (slot as u64) << 13;
+                    e.entry_hi  = (2u64 << 62) | (vpn2 << 13) | (slot as u64 & 0xff);
+                    e.entry_lo[0] = ((slot as u64) << 6) | (3 << 3) | 0x6;
+                    e.entry_lo[1] = ((slot as u64 + 1) << 6) | (3 << 3) | 0x6;
+                    src.write(slot, e);
+                }
+                let v1 = src.save_state();
 
-        let mut dst = MipsTlb::new(TLB_NUM_ENTRIES);
-        dst.load_state(&v1).expect("load_state");
-        let v2 = dst.save_state();
+                let mut dst = MipsTlb::new(TLB_NUM_ENTRIES);
+                dst.load_state(&v1).expect("load_state");
+                let v2 = dst.save_state();
 
-        assert_eq!(v1, v2, "MipsTlb save_state mismatch after load_state round-trip");
+                assert_eq!(v1, v2, "MipsTlb save_state mismatch after load_state round-trip");
+            })
+            .expect("spawn")
+            .join()
+            .expect("thread panicked");
     }
 }
