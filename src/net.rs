@@ -1306,7 +1306,15 @@ impl NatEngine {
         }
 
         // NFS/mountd: rewrite destination to localhost high port.
-        let (dst_ip, dport) = self.nfs_remap_dst(dst_ip, dport);
+        // Don't remap if this port already has a tcp_nat entry keyed on the
+        // original dst — port-forward entries use gateway_ip as the key and
+        // the generic loopback remap would cause a key miss on follow-on packets.
+        let pre_remap_key = (u32::from(dst_ip), dport, sport);
+        let (dst_ip, dport) = if self.tcp_nat.contains_key(&pre_remap_key) {
+            (dst_ip, dport)
+        } else {
+            self.nfs_remap_dst(dst_ip, dport)
+        };
 
         let key = (u32::from(dst_ip), dport, sport);
 
