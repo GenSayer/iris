@@ -113,5 +113,10 @@ path = "src/coffdump.rs"
 name = "iris-ci"
 path = "src/iris_ci_main.rs"
 
+[[bin]]
+name = "chd_extract"
+path = "src/bin/chd_extract.rs"
+required-features = ["chd"]
+
 
 
