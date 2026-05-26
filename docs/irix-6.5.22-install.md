@@ -1,0 +1,294 @@
+# Installing IRIX 6.5.22 on iris (from scratch)
+
+Adapted from <https://sgi.neocities.org/installguide> (which targets MAME)
+with the corrections and shortcuts we found running it through iris.
+
+## What you need
+
+- `iris` built with `--features chd,camera,lightning` (the WD33C93 +
+  HPC3 fixes for the miniroot install path are part of mainline now;
+  see `rules/irix/miniroot-install-hang-scsi0-dma-irq-storm.md`).
+- An **empty** `irix65.chd` (any size ≥ 4 GB) at SCSI ID 1.
+- The seven 6.5.22 ISOs in `irix/6.5.22/`:
+  - Overlay 1 of 3 ← bootable (miniroot + fx.ARCS + sashARCS)
+  - Overlay 2 of 3
+  - Overlay 3 of 3
+  - Applications November-2003
+  - Foundation 1
+  - Foundation 2
+  - Development Foundation 1.2 (optional — not in the recipe below)
+
+## iris.toml
+
+The disk at SCSI 1, CD changer at SCSI 4 with Overlay 1 active and the
+rest in the cycle order. Keep `[vino] source = "test_pattern"` for the
+install (avoid the 30 fps camera interrupt rate while booting); flip to
+`"camera"` after.
+
+```toml
+headless = true
+no_audio = false
+banks = [128, 128, 0, 0]
+serial_log = "irix-install-console.log"
+
+[scsi.1]
+path  = "irix65.chd"
+cdrom = false
+
+[scsi.4]
+path  = "irix/6.5.22/IRIX 6.5.22 Overlay 1 of 3.iso"
+cdrom = true
+discs = [
+  "irix/6.5.22/IRIX 6.5.22 Overlay 1 of 3.iso",
+  "irix/6.5.22/IRIX 6.5.22 Overlay 2 of 3.iso",
+  "irix/6.5.22/IRIX 6.5.22 Overlay 3 of 3.iso",
+  "irix/6.5.22/IRIX 6.5.22 Applications November-2003.iso",
+  "irix/6.5.22/IRIX-6.5-Foundation1.iso",
+  "irix/6.5.22/IRIX-6.5-Foundation2.iso",
+]
+
+[vino]
+source = "test_pattern"
+
+[[port_forward]]
+proto = "tcp"; host_port = 2323; guest_port = 23; bind = "localhost"
+```
+
+## Driving the install
+
+All commands go through `iris-ci`. Boot iris with `--ci`, then in another
+shell:
+
+```bash
+alias ic=./target/release/iris-ci
+```
+
+### 1. PROM env (one-time)
+
+```bash
+ic serial-send "5"                # Command Monitor
+ic serial-send "setenv -f eaddr 08:00:69:de:ad:01"
+ic serial-send "setenv -f SystemPartition scsi(0)disk(1)rdisk(0)partition(8)"
+ic serial-send "setenv -f OSLoadPartition scsi(0)disk(1)rdisk(0)partition(0)"
+ic rtc-save                       # persist nvram.bin
+ic serial-send "exit"
+```
+
+### 2. Label the disk via fx (one-time per fresh disk)
+
+```bash
+ic serial-send "5"
+ic serial-send "boot -f dksc(0,4,8)sashARCS dksc(0,4,7)stand/fx.ARCS --x"
+# accept three defaults (device-name dksc, ctlr 0, drive 1)
+ic serial-send ""; ic serial-send ""; ic serial-send ""
+# label/create/all  →  ..  →  sync  →  ..  →  exit
+ic serial-send "l"; ic serial-send "c"; ic serial-send "a"
+ic serial-send ".."; ic serial-send "sync"
+ic serial-send ".."; ic serial-send "exit"
+```
+
+### 3. Install System Software → miniroot
+
+```bash
+ic serial-send "2"                # PROM "Install System Software"
+ic serial-send ""                 # accept default Local CD-ROM 4
+ic serial-send ""                 # confirm CD inserted (Overlay 1)
+# wait ~2 min for miniroot kernel boot + Inst 4.1 Main Menu
+ic serial-wait --timeout 300 "Inst>"
+```
+
+If the disk is truly empty (no XFS yet), miniroot will ask
+`Make new file system on /dev/dsk/realroot [yes/no/sh/help]:` — answer
+`yes`, then `y` to confirm, then **`4096`** for block size (the magic
+number for ≥ 4 GB disks).
+
+### 4. Turn off pagination and conflict-rules **first**
+
+```bash
+ic serial-send "set page_output off"     # no more "more?" pages
+ic serial-send "set rulesoverride on"    # auto-resolve conflicts
+```
+
+These two settings are what makes the rest of the recipe a straight
+shot. Without them you'll spend an hour resolving 71 + 62 + ... cascading
+conflicts by hand — most of which are old-version-vs-new incompatibilities
+inst would happily skip if you let it.
+
+### 5. Load all six install distributions
+
+The order matters because each CD is mounted as `/CDROM/dist` (or
+`/CDROM/dist/unbundled` for Overlay 2's variant). Eject between each
+with `iris-ci cdrom-eject 4`.
+
+```bash
+# Overlay 1 (already mounted) — Inst already pointed at /CDROM/dist
+ic serial-send "from"
+ic serial-send "1"                # /CDROM/dist
+ic serial-send "q"                # skip README pager (now harmless)
+# wait for "Reading product descriptions ... Done."
+ic serial-wait --timeout 180 "Done\\."
+# stream choice — pick "feature" (2)
+ic serial-send "2"
+ic serial-wait --timeout 60 "Install software from:"
+
+# Overlay 2  → /CDROM/dist/unbundled  (guide-special path)
+ic cdrom-eject 4
+ic serial-send "/CDROM/dist/unbundled"
+ic serial-wait --timeout 180 "Install software from:"
+
+# Overlay 3 → /CDROM/dist
+ic cdrom-eject 4
+ic serial-send "/CDROM/dist"
+ic serial-wait --timeout 180 "Install software from:"
+
+# Applications → /CDROM/dist (README pager pops; q to dismiss)
+ic cdrom-eject 4
+ic serial-send "/CDROM/dist"
+ic serial-send "q"
+ic serial-wait --timeout 240 "Install software from:"
+
+# Foundation 1 → /CDROM/dist
+ic cdrom-eject 4
+ic serial-send "/CDROM/dist"
+ic serial-wait --timeout 180 "Install software from:"
+
+# Foundation 2 → /CDROM/dist
+ic cdrom-eject 4
+ic serial-send "/CDROM/dist"
+ic serial-wait --timeout 180 "Install software from:"
+
+# Done scanning
+ic serial-send "done"
+ic serial-wait --timeout 30 "Inst>"
+```
+
+### 6. The package-selection recipe
+
+This is the sgi.neocities recipe verbatim — `keep *` then carve out
+the standard set. With `rulesoverride on` from step 4, conflicting
+older versions get auto-deselected during `go` so you don't have to
+hand-resolve.
+
+```bash
+ic serial-send "keep *"
+ic serial-send "install standard"
+ic serial-send "keep java2_plugin.sw32.mozilla_freeware"
+ic serial-send "keep inventor_dev.sw.base"
+ic serial-send "keep inventor_dev.sw.lib"
+ic serial-send "install eoe.sw.fonttools"
+ic serial-send "install eoe.sw.uucp"
+ic serial-send "install eoe.sw.xlv"
+ic serial-send "install ftn_eoe"
+ic serial-send "install eoe.sw.spell"
+ic serial-send "install inventor_eoe.sw64"
+ic serial-send "install ifl_eoe.sw64"
+ic serial-send "install dmedia_eoe.sw64"      # "no matches" warning is fine
+ic serial-send "install prereqs"
+ic serial-send "keep incompleteoverlays"
+ic serial-send "go"
+```
+
+### 7. The long bit
+
+`go` runs the actual install. Expect 1–2 hours of emulated CPU
+chewing through tar streams, writing to the XFS root. The installer
+will prompt to swap CDs ("Insert ..."); answer by ejecting via the
+iris monitor (`iris-ci cdrom-eject 4`) and then pressing Enter.
+
+When it finishes:
+
+```
+Restart the system. (y/n)?
+```
+
+Answer `y` to reboot into the freshly-installed system.
+
+### 8. First multi-user boot
+
+PROM lands at the System Maintenance Menu; option `1` (Start System)
+boots from `dks0d1s0`. Watch the serial console for the IRIX login
+prompt.
+
+## Conflict resolution without `rulesoverride on`
+
+The sgi.neocities recipe assumes `rulesoverride on` so inst silently drops
+packages whose prerequisites can't be met from the loaded CDs. That works
+but it leaves you with no record of *what* got skipped. The honest path is:
+
+```bash
+ic serial-send "set page_output off"
+# Skip 'set rulesoverride on'.  Use the parser instead.
+```
+
+When `go` returns `ERROR: Conflicts must be resolved.`, dump the
+conflicts list, run it through `tools/inst-resolve.py`, and pipe the
+result back in:
+
+```bash
+ic serial-send "conflicts"
+sleep 8
+ic serial-read > /tmp/conf.txt
+python3 tools/inst-resolve.py < /tmp/conf.txt > /tmp/resolve.txt 2> /tmp/skipped.txt
+cat /tmp/skipped.txt    # which packages are getting skipped + why
+while IFS= read -r line; do
+  ic serial-send "$line"
+  sleep 2
+done < /tmp/resolve.txt
+ic serial-send "go"
+```
+
+The resolver picks the highest-letter option (`c` over `b` over `a`)
+whose text doesn't mention "from an additional distribution" or
+"Open new distribution" — i.e. an option whose prereqs are on one of
+the already-scanned distributions. Falls back to `a` (don't install)
+only when nothing else works, and *reports* every fallback.
+
+If `tools/inst-resolve.py` reports any fallback at all, that's your
+signal that the install isn't complete for the recipe as written —
+some product wanted a prereq that isn't on any loaded CD.
+
+## Known missing CD: 6.5.22-era Foundations 1.1
+
+With the 7 CDs in `irix/6.5.22/` listed above, `tools/inst-resolve.py`
+falls back on a ~40-package set whose required base versions are
+`1274627340` (e.g. `eoe.sw.base`, `eoe.sw.gfx`, `x_eoe.sw.eoe`, etc.).
+That version is the **2002–2003 Foundations 1.1 refresh** that SGI
+shipped alongside the 6.5.22 media kit. Our `IRIX-6.5-Foundation1.iso`
+is the original 1998 Foundation 1 with version `1274627333`, which is
+too old for the 6.5.22 overlays.
+
+We have a `Foundations 1.1.iso` in `irix/6.5.29/` but the 6.5.22
+miniroot's inst rejects it with `ERROR: This software distribution is
+not meant to install on the version of IRIX currently running on this
+machine.` — SGI rev'd it for each release wave.
+
+**To get a fully clean install you need the IRIX 6.5 Foundations 1.1
+CD from the 6.5.22 media kit specifically** (look for an ISO dated
+late 2002 / 2003 with the "1.1" label, not the 6.5.29-era one).
+
+Without it, the install still completes a *core* 6.5.22 base
+(Overlays + Apps that don't depend on the missing base versions) but
+loses these optionals:
+
+- `eoe.sw.{base,gfx,gifts_perl}` overlay updates
+- `x_eoe.sw.{eoe,plugin}` overlay updates
+- `motif21_dev`, `ViewKit21_dev`
+- `cosmoplayer`, `netscape`, `mozilla`, `appletalk`, `arraysvcs`
+- `performer_eoe.sw.performer` (demo)
+- `media_warehouse` viewers
+- `il_eoe.sw.{c++,vk}`, `ifl_eoe.sw.c++`
+- `webviewer`, `infosearch`, `sysmon` desktop pieces
+
+## Iris-specific gotchas
+
+- **PROM `console=d`** — already the default; means PROM and IRIX
+  early boot output go to `/dev/ttyd1` → TCP 8881 → mirrored to
+  `irix-install-console.log` via the `serial_log` setting.
+- **fx defaults** are correct on iris; `label/create/all` writes a
+  standard SGI volume header with a root partition that mkfs will
+  later format as XFS.
+- **`scsi eject 4`** vs `iris-ci cdrom-eject 4` are the same thing.
+  Use the iris-ci form so it's scriptable.
+- The bundled MAME pre-installed CHD (`irix-6.5.22m-MAME.tar.xz`)
+  remains a backup — extract its `irix65.chd` over the empty one
+  if you'd rather skip the install entirely.
