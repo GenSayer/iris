@@ -3,6 +3,7 @@ use parking_lot::{Condvar, Mutex};
 use std::sync::atomic::{AtomicU8, AtomicBool, Ordering};
 use std::collections::VecDeque;
 use std::io::{self, Write, Read};
+use std::fs::OpenOptions;
 #[cfg(unix)]
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::Path;
@@ -331,6 +332,35 @@ impl SerialBackend for NullBackend {
     }
 }
 
+/// Tees guest-emitted bytes to a host file in addition to delegating to an
+/// inner backend.  Used by `--serial-log <file>` to capture the serial
+/// console transcript while the real TCP listener on port 8881 keeps
+/// working unchanged.
+pub struct TeeBackend {
+    inner: Arc<dyn SerialBackend>,
+    log: Mutex<std::fs::File>,
+}
+
+impl TeeBackend {
+    pub fn new(inner: Arc<dyn SerialBackend>, path: &str) -> io::Result<Self> {
+        let log = OpenOptions::new().create(true).append(true).open(path)?;
+        Ok(Self { inner, log: Mutex::new(log) })
+    }
+}
+
+impl SerialBackend for TeeBackend {
+    fn send_byte(&self, byte: u8) {
+        let mut f = self.log.lock();
+        let _ = f.write_all(&[byte]);
+        let _ = f.flush();
+        drop(f);
+        self.inner.send_byte(byte);
+    }
+    fn recv_byte(&self) -> io::Result<u8> {
+        self.inner.recv_byte()
+    }
+}
+
 #[cfg(unix)]
 struct UnixSocketBackend {
     listener: UnixListener,
@@ -527,6 +557,13 @@ impl Z85c30 {
     /// serial console on Indy). Same constraint as `set_backend_a`.
     pub fn set_backend_b(&self, backend: Arc<dyn SerialBackend>) {
         *self.backend_b.lock() = backend;
+    }
+
+    /// Read the currently-installed backend for channel B.  Used by
+    /// non-CI `--serial-log` wiring to wrap the live TCP backend in a
+    /// `TeeBackend` without replacing the listener.
+    pub fn backend_b(&self) -> Arc<dyn SerialBackend> {
+        self.backend_b.lock().clone()
     }
 
     pub fn read_a_control(&self) -> u8 { 

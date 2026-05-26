@@ -178,6 +178,22 @@ impl Machine {
             ioc.scc().set_backend_b(b.clone());
             Some(b)
         } else {
+            // Non-CI mode: channel B already has its TCP listener on
+            // 127.0.0.1:8881.  If --serial-log was passed, wrap it in a
+            // TeeBackend so guest-emitted bytes get mirrored to the file
+            // in addition to whatever client is attached to the TCP socket.
+            if let Some(path) = cfg.serial_log.as_deref() {
+                let inner = ioc.scc().backend_b();
+                match crate::z85c30::TeeBackend::new(inner, path) {
+                    Ok(tee) => {
+                        ioc.scc().set_backend_b(Arc::new(tee));
+                        eprintln!("iris: serial console mirroring to {}", path);
+                    }
+                    Err(e) => {
+                        eprintln!("iris: serial_log: failed to open {}: {}", path, e);
+                    }
+                }
+            }
             None
         };
         let timer_manager = Arc::new(TimerManager::new());
