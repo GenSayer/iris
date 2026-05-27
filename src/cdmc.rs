@@ -11,9 +11,18 @@
 /// configure without errors; visual effect of register changes is not (yet)
 /// reflected in the captured pixels.
 ///
-/// I2C address: 0xAE write / 0xAF read.
+/// I2C address: 0x56 write / 0x57 read (7-bit address 0x2B).
+///
+/// Note: a previous comment here said "0xAE/0xAF" based on a stale read of
+/// the IRIX 6.5 `indycam.h`. The actual I2C address bytes the IRIX 5.3
+/// vino driver puts on the bus are 0x56 (write) / 0x57 (read) — verified
+/// by tracing `vino.write_reg(I2C_DATA, …)` while running `videod` +
+/// `vidtomem`, and by literal scan of `vino_i2c.o` / `vino_input.o` /
+/// `vino_ctrls.o` (the 0x56 / 0x57 / 0x2b immediates appear dozens of
+/// times; 0xAE appears exactly once in `vino_input.o`).
 ///
 /// References:
+///   IRIX 5.3 vino driver `.text` literals (vino_i2c.o, vino_input.o)
 ///   IRIX 6.5 indycam.h (kernel header) for register layout
 
 use parking_lot::Mutex;
@@ -56,8 +65,8 @@ enum I2cState {
 struct CdmcState {
     regs:           [u8; reg::COUNT],
 
-    i2c_write_addr: u8, // 0xAE
-    i2c_read_addr:  u8, // 0xAF
+    i2c_write_addr: u8, // 0x56 (= 7-bit 0x2B << 1, R/W=0)
+    i2c_read_addr:  u8, // 0x57
     i2c_subaddr:    u8,
     i2c_state:      I2cState,
 }
@@ -68,8 +77,8 @@ impl Default for CdmcState {
         regs[reg::VERSION as usize] = reg::VERSION_VAL;
         Self {
             regs,
-            i2c_write_addr: 0xAE,
-            i2c_read_addr:  0xAF,
+            i2c_write_addr: 0x56,
+            i2c_read_addr:  0x57,
             i2c_subaddr:    0x00,
             i2c_state:      I2cState::Idle,
         }
@@ -102,12 +111,35 @@ impl Cdmc {
 
     pub fn i2c_write(&self, data: u8) {
         let mut st = self.state.lock();
+        // REPEATED START: a slave-address byte arriving in any non-Idle
+        // state means the master issued repeated-start and is re-addressing
+        // the bus. Recognise our own write/read addresses and transition
+        // appropriately, preserving subaddr if we already had one set.
+        if st.i2c_state != I2cState::Idle {
+            if data == st.i2c_write_addr {
+                st.i2c_state = I2cState::SubaddrWrite;
+                return;
+            }
+            if data == st.i2c_read_addr {
+                // Caller set subaddr earlier (typical IndyCam probe:
+                // write 0x56, subaddr 0x00, then repeated start + 0x57 to
+                // read VERSION). Jump straight to DataRead — i2c_read()
+                // returns regs[subaddr] then auto-increments.
+                st.i2c_state = I2cState::DataRead;
+                return;
+            }
+        }
         match st.i2c_state {
             I2cState::Idle => {
                 if data == st.i2c_write_addr {
                     st.i2c_state = I2cState::SubaddrWrite;
                 } else if data == st.i2c_read_addr {
-                    st.i2c_state = I2cState::SubaddrRead;
+                    // Standalone read without prior subaddr write: use the
+                    // current subaddr (zero on reset, or whatever the last
+                    // transaction left it at). IRIX's vino driver always
+                    // pairs subaddr-write + repeated-start + read, so this
+                    // path mostly matters for fall-throughs.
+                    st.i2c_state = I2cState::DataRead;
                 }
                 // Address didn't match — silently stay idle.  Another device
                 // on the shared bus may pick it up.

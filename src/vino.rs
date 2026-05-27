@@ -176,7 +176,7 @@ pub mod i2c_addr {
     /// Philips SAA7191 DMSD (composite / S-Video decoder).
     pub const DMSD: u8 = 0x8A;
     /// SGI CDMC camera controller.
-    pub const CDMC: u8 = 0xAE;
+    pub const CDMC: u8 = 0x56;
 }
 
 // ─── Clip register encoding ───────────────────────────────────────────────────
@@ -312,7 +312,7 @@ struct VinoState {
     i2c_data:   u32,
     channels:   [ChannelState; 2],
     dmsd:       Saa7191,  // Philips SAA7191B on the VINO I2C bus (addr 0x8A/0x8B)
-    cdmc:       Cdmc,     // SGI IndyCam controller on the same bus (addr 0xAE/0xAF)
+    cdmc:       Cdmc,     // SGI IndyCam controller on the same bus (addr 0x56/0x57)
 }
 
 impl Default for VinoState {
@@ -913,11 +913,25 @@ impl Vino {
                     // since either (or neither) could have been the target.
                     st.dmsd.i2c_stop();
                     st.cdmc.i2c_stop();
-                } else if val & i2c_ctrl::NOT_IDLE != 0 {
-                    // Transfer request: execute one byte.  Two devices share
-                    // the bus, so route by address: whichever is mid-transfer
-                    // gets subsequent bytes; the initial address byte is
-                    // broadcast so the matching device can claim it.
+                } else if val & i2c_ctrl::NOT_IDLE != 0
+                    && (val & i2c_ctrl::READ != 0
+                        || prev & i2c_ctrl::NOT_IDLE == 0)
+                {
+                    // Transfer request. Two cases:
+                    //   (a) NOT_IDLE just transitioned clear→set (start of
+                    //       transaction). Send the current I2C_DATA byte as
+                    //       the slave-address byte.
+                    //   (b) READ direction. The READ bit being set means the
+                    //       caller wants to read the next byte from the slave
+                    //       (driver writes NOT_IDLE|READ for every byte it
+                    //       wants to receive). Always re-fire even if
+                    //       NOT_IDLE was already set.
+                    //
+                    // Mid-write streaming is handled by the I2C_DATA write
+                    // path below; we must not re-fire here when NOT_IDLE was
+                    // already set in write direction, otherwise every kernel
+                    // I2C_DATA write would be sent twice (once by I2C_DATA,
+                    // once by the I2C_CONTROL poll/re-arm that follows).
                     if val & i2c_ctrl::READ != 0 {
                         let byte = if st.dmsd.is_active() {
                             st.dmsd.i2c_read()
@@ -944,6 +958,27 @@ impl Vino {
             }
             reg::I2C_DATA    => {
                 st.i2c_data = val & i2c_data::MASK;
+                // If the bus is currently active (NOT_IDLE set), each
+                // I2C_DATA write triggers a byte transfer. IRIX 5.3 vino
+                // driver writes I2C_CONTROL once at start (NOT_IDLE |
+                // HOLD_BUS) and then streams bytes via I2C_DATA, polling
+                // I2C_CONTROL.XFER_BUSY between writes. Without this, only
+                // the very first byte (the one written immediately before
+                // the I2C_CONTROL.NOT_IDLE write) ever reaches the slave.
+                if st.i2c_ctrl & i2c_ctrl::NOT_IDLE != 0
+                    && st.i2c_ctrl & i2c_ctrl::READ == 0
+                {
+                    let data = st.i2c_data as u8;
+                    let saa_active  = st.dmsd.is_active();
+                    let cdmc_active = st.cdmc.is_active();
+                    if saa_active  { st.dmsd.i2c_write(data); }
+                    if cdmc_active { st.cdmc.i2c_write(data); }
+                    if !saa_active && !cdmc_active {
+                        st.dmsd.i2c_write(data);
+                        st.cdmc.i2c_write(data);
+                    }
+                    st.i2c_ctrl &= !i2c_ctrl::XFER_BUSY;
+                }
             }
             _ => {
                 eprintln!("VINO: unknown write at offset {:#06x} = {:#010x}", offset, val);
@@ -1417,13 +1452,14 @@ mod tests {
 
     /// Helper: read one byte from a device register via I2C.
     ///
-    /// Protocol: START → read-addr → subaddr → READ → STOP.  The current
-    /// saa7191/cdmc state machine routes the byte after a read-address as
-    /// the subaddress (it's a simplified model — real I2C uses a repeated
-    /// start instead, which is a future enhancement to support).
+    /// Protocol: START → write-addr → subaddr → REPEATED START → read-addr
+    /// → READ → STOP. This matches what the real IRIX vino driver puts on
+    /// the bus, which the CDMC / SAA7191 state machines recognise.
     fn i2c_read_reg(vino: &Vino, read_addr: u8, subaddr: u8) -> u8 {
-        i2c_byte_write(vino, read_addr);
+        let write_addr = read_addr & !1;
+        i2c_byte_write(vino, write_addr);
         i2c_byte_write(vino, subaddr);
+        i2c_byte_write(vino, read_addr); // repeated-start re-addresses
         let v = i2c_byte_read(vino);
         i2c_stop(vino);
         v
@@ -1441,7 +1477,7 @@ mod tests {
     #[test]
     fn cdmc_version_register_reads_as_identification_value() {
         let vino = Vino::new();
-        let v = i2c_read_reg(&vino, 0xAF, crate::cdmc::reg::VERSION);
+        let v = i2c_read_reg(&vino, 0x57, crate::cdmc::reg::VERSION);
         assert_eq!(v, crate::cdmc::reg::VERSION_VAL,
             "CDMC subaddress 0x00 should return the identification byte");
     }
@@ -1449,8 +1485,8 @@ mod tests {
     #[test]
     fn cdmc_register_write_then_read_round_trips() {
         let vino = Vino::new();
-        i2c_write_reg(&vino, 0xAE, crate::cdmc::reg::GAIN, 0x42);
-        let v = i2c_read_reg(&vino, 0xAF, crate::cdmc::reg::GAIN);
+        i2c_write_reg(&vino, 0x56, crate::cdmc::reg::GAIN, 0x42);
+        let v = i2c_read_reg(&vino, 0x57, crate::cdmc::reg::GAIN);
         assert_eq!(v, 0x42, "CDMC GAIN register write should round-trip");
     }
 
@@ -1459,7 +1495,7 @@ mod tests {
         let vino = Vino::new();
 
         // Write CDMC GAIN = 0x77
-        i2c_write_reg(&vino, 0xAE, crate::cdmc::reg::GAIN, 0x77);
+        i2c_write_reg(&vino, 0x56, crate::cdmc::reg::GAIN, 0x77);
         {
             let st = vino.state.lock();
             assert!(!st.dmsd.is_active() && !st.cdmc.is_active(),
@@ -1470,7 +1506,7 @@ mod tests {
         i2c_write_reg(&vino, 0x8A, crate::saa7191::reg::HUEC, 0x55);
 
         // CDMC GAIN must still be 0x77.
-        let v = i2c_read_reg(&vino, 0xAF, crate::cdmc::reg::GAIN);
+        let v = i2c_read_reg(&vino, 0x57, crate::cdmc::reg::GAIN);
         assert_eq!(v, 0x77, "CDMC state must survive SAA7191 traffic");
     }
 
