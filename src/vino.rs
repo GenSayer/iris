@@ -604,8 +604,18 @@ impl Vino {
 
         if interleave {
             chan.line_counter += 8;
-            if chan.line_counter >= chan.line_size {
+            // CH_LINE_SIZE is encoded as "last dword's start offset within
+            // the line" — i.e. one dword (8 bytes) short of the actual
+            // stride. So an N-dword line has line_size = (N-1)*8, the
+            // last dword writes when line_counter == line_size, and the
+            // *next* dword (line_counter == line_size + 8) is the first
+            // dword of the next interleaved row. Trigger on strict ">"
+            // so we capture the last dword in this row before skipping —
+            // not on ">=", which dropped the last dword and cascaded a
+            // 2-pixel-per-row diagonal across the captured frame.
+            if chan.line_counter > chan.line_size {
                 chan.line_counter = 0;
+                // Skip is the full row stride: (line_size + 8).
                 let skip = chan.line_size.wrapping_add(8);
                 let new_page = chan.page_index.wrapping_add(skip);
                 chan.page_index = new_page & 0x0FFF;
@@ -646,18 +656,65 @@ impl Vino {
     /// to the channel's output format before pushing dwords through DMA.
     /// Raises the channel's end-of-field interrupt regardless of drop state.
     fn pump_field(&self, ch: usize, field: &Field, mem: &Arc<dyn BusDevice>) {
-        let (clip_start, clip_end, format, dec_h_only, decimation, frame_rate, field_counter)
+        let (clip_start, clip_end, format, dec_h_only, decimation, frame_rate, field_counter, interleave, line_size, start_desc_ptr)
             = {
             let st   = self.state.lock();
             let chan = &st.channels[ch];
             let dec_h_only_bit = if ch == 0 { ctrl::CHA_DECIMATE_HORIZ } else { ctrl::CHB_DECIMATE_HORIZ };
+            let interleave_bit = if ch == 0 { ctrl::CHA_INTERLEAVE_EN } else { ctrl::CHB_INTERLEAVE_EN };
             (chan.clip_start, chan.clip_end,
              Self::channel_format(st.control, ch),
              st.control & dec_h_only_bit != 0,
              chan.decimation,
              chan.frame_rate,
-             chan.field_counter)
+             chan.field_counter,
+             st.control & interleave_bit != 0,
+             chan.line_size,
+             chan.start_desc_ptr)
         };
+
+        // Interlace placement: at the start of every field, position the
+        // DMA cursor at the appropriate row offset within the destination
+        // buffer. Even field writes rows 0, 2, 4, …; Odd field writes
+        // rows 1, 3, 5, …. The per-line "skip one row" stride is handled
+        // inside emit_byte's interleave branch; what we have to do here is
+        // pick the *starting* row each time the field changes.
+        //
+        // Without this, Even field's writes advance page_index across the
+        // whole buffer and Odd field continues from wherever Even left off
+        // (out past the end), so the captured frame ends up with the Odd
+        // field's rows untouched (all zeros). Visible as alternating
+        // bright/black scanlines in the user-visible captured image.
+        // Interlace placement: at the start of every field, rewind the
+        // DMA cursor to the start of the descriptor chain and pick the
+        // appropriate row offset within the frame buffer. Even field
+        // starts at byte 0; Odd field starts one full row in
+        // (= line_size + 8, since CH_LINE_SIZE is encoded as
+        // actual_stride - 8 — see the interleave-skip code in
+        // dma_write_dword). Without this reset the Odd field never
+        // makes it into the buffer's odd-indexed rows; they stay zero
+        // and the captured frame shows alternating bright/black
+        // scanlines.
+        //
+        // KNOWN GAP: a 1-pixel-per-row diagonal artifact remains in
+        // Even-field rows after this fix. The drift is consistent
+        // (-1 col per output row from col 638 at row 0 toward col 0
+        // at row 478) which suggests the kernel's frame buffer stride
+        // or descriptor layout differs from what we infer from
+        // line_size alone. Leaving as a follow-up — geometry and
+        // colour are right; the artifact is a thin dark diagonal line
+        // not a structural failure.
+        if interleave && start_desc_ptr != 0 {
+            let mut st = self.state.lock();
+            let chan = &mut st.channels[ch];
+            Self::descriptor_fetch(chan, start_desc_ptr, mem);
+            chan.next_desc_ptr = start_desc_ptr.wrapping_add(16);
+            chan.line_counter  = 0;
+            chan.page_index    = match field.parity {
+                FieldParity::Even => 0,
+                FieldParity::Odd  => line_size.wrapping_add(8),
+            };
+        }
 
         let pal     = frame_rate & frame_rate::PAL != 0;
         let modulus = if pal { 10 } else { 12 };
