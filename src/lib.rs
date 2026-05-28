@@ -23,6 +23,7 @@ pub mod ioc;
 pub mod physical;
 pub mod ds1x86;
 pub mod z85c30;
+pub mod telnet;
 pub mod monitor;
 pub mod locks;
 pub mod pit8254;
@@ -53,7 +54,11 @@ pub mod ci;
 pub mod hptimer;
 pub mod hptimer_tests;
 pub mod vga_font;
+pub mod cdmc;
+#[cfg(feature = "camera")]
+pub mod camera;
 pub mod saa7191;
+pub mod video_source;
 pub mod vino;
 #[cfg(feature = "jit")]
 pub mod jit;

@@ -57,8 +57,9 @@ boots to a usable system: shell, networking, X11, the works.
 ## Getting started
 
 You need:
-- `scsi1.raw` — raw hard disk image with IRIX 6.5.22 for Indy
-  (for a quick start get the MAME IRIX image from https://mirror.rqsall.com/sgi-mame/ and convert to raw using `chdman extractraw`)
+- A hard-disk image with IRIX 6.5.22 for Indy. To produce one, follow
+  `docs/irix-6.5.22-install.md` (install from the original 6.5.22 media
+  CDs into an empty CHD/raw disk).
 - `070-9101-011.bin` — Indy PROM image (optional; a default is embedded)
 
 ```
@@ -73,6 +74,7 @@ cargo run --release --features rex-jit               # enable REX3 graphics JIT 
 cargo run --release --features tlbvmap               # enable 8k slot to tlb entry map (increases cache use but may help depending on host cpu arch)
 cargo run --release --features ci_clock              # synthetic deterministic CP0 Compare clock (CI/snapshot validator only; loses realtime desktop timing)
 cargo run --release --features chd                   # mount .chd disk/CD-ROM images directly (via libchdman-rs); off by default to keep builds light
+cargo run --release --features camera                # use host camera as the IndyCam video source (macOS AVFoundation via nokhwa). See [vino] in iris.toml.
 cargo run --release --features lightning,rex-jit,tlbvmap     # recommended for best speed right now
 ```
 

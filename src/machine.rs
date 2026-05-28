@@ -168,9 +168,32 @@ impl Machine {
         // current backend Arc into the RX/TX threads).
         let ci_serial = if ci_enabled {
             let b = Arc::new(crate::z85c30::CiSerialBackend::new());
+            if let Some(path) = cfg.serial_log.as_deref() {
+                if let Err(e) = b.set_log_file(path) {
+                    eprintln!("iris: serial_log: failed to open {}: {}", path, e);
+                } else {
+                    eprintln!("iris: serial console mirroring to {}", path);
+                }
+            }
             ioc.scc().set_backend_b(b.clone());
             Some(b)
         } else {
+            // Non-CI mode: channel B already has its TCP listener on
+            // 127.0.0.1:8881.  If --serial-log was passed, wrap it in a
+            // TeeBackend so guest-emitted bytes get mirrored to the file
+            // in addition to whatever client is attached to the TCP socket.
+            if let Some(path) = cfg.serial_log.as_deref() {
+                let inner = ioc.scc().backend_b();
+                match crate::z85c30::TeeBackend::new(inner, path) {
+                    Ok(tee) => {
+                        ioc.scc().set_backend_b(Arc::new(tee));
+                        eprintln!("iris: serial console mirroring to {}", path);
+                    }
+                    Err(e) => {
+                        eprintln!("iris: serial_log: failed to open {}: {}", path, e);
+                    }
+                }
+            }
             None
         };
         let timer_manager = Arc::new(TimerManager::new());
@@ -318,8 +341,38 @@ impl Machine {
         // Connect HPC3 to System Memory (via Physical)
         hpc3.set_phys(phys.clone());
 
-        // Connect VINO to System Memory and start its DMA thread
+        // Connect VINO to System Memory, install a video source, start DMA.
+        // Source kind + broadcast standard come from `[vino]` in iris.toml.
         phys.vino.set_phys(phys.clone());
+        let standard = match cfg.vino.standard {
+            crate::config::VinoStandard::Ntsc => crate::video_source::VideoStandard::Ntsc,
+            crate::config::VinoStandard::Pal  => crate::video_source::VideoStandard::Pal,
+        };
+        let source: Arc<dyn crate::video_source::VideoSource> = match cfg.vino.source {
+            crate::config::VinoSource::Camera => {
+                #[cfg(feature = "camera")]
+                {
+                    let idx = cfg.vino.camera_index;
+                    match crate::camera::CameraSource::new_with_index(standard, idx) {
+                        Ok(c)  => Arc::new(c),
+                        Err(e) => {
+                            eprintln!("VINO: camera {} unavailable ({}); using black source", idx, e);
+                            Arc::new(crate::video_source::BlackSource::new(standard))
+                        }
+                    }
+                }
+                #[cfg(not(feature = "camera"))]
+                {
+                    eprintln!("VINO: source=\"camera\" set but iris was built without --features camera; using test pattern");
+                    Arc::new(crate::video_source::TestPatternSource::new(standard))
+                }
+            }
+            crate::config::VinoSource::TestPattern =>
+                Arc::new(crate::video_source::TestPatternSource::new(standard)),
+            crate::config::VinoSource::Black =>
+                Arc::new(crate::video_source::BlackSource::new(standard)),
+        };
+        phys.vino.set_source(source);
         phys.vino.start();
 
         // 5. CPU config + TLB + Executor
@@ -443,12 +496,10 @@ impl Machine {
         self.hpc3.start();
         if let Some(rex3) = &self._phys.rex3 { rex3.start(); }
 
-        // Monitor server on localhost:8888. Skipped in CI mode — the control
-        // socket replaces it, and binding a fixed port would prevent parallel
-        // `--ci` instances.
-        if self.ci_serial.is_none() {
-            self.monitor.clone().start_server("127.0.0.1:8888".to_string());
-        }
+        // Monitor server on localhost:8888 — always start, even in CI mode,
+        // so debug helpers (status/regs/bt/dis) stay reachable while iris-ci
+        // drives the serial console.
+        self.monitor.clone().start_server("127.0.0.1:8888".to_string());
 
         // CI mode: the harness drives startup via `restore` / `start`. Don't
         // autostart the CPU so the first command finds a quiet machine.
@@ -560,6 +611,12 @@ impl Machine {
 
     pub fn get_ps2(&self) -> Arc<crate::ps2::Ps2Controller> {
         self.hpc3.ioc().ps2()
+    }
+
+    /// Borrow the HPC3 controller — used by CI socket commands that touch
+    /// RTC/SCSI directly (`rtc-save`, `cdrom-eject`).
+    pub fn hpc3(&self) -> &Hpc3 {
+        &self.hpc3
     }
 
     pub fn get_rex3(&self) -> Option<Arc<crate::rex3::Rex3>> {
