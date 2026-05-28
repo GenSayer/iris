@@ -792,7 +792,7 @@ impl Device for Ps2Controller {
     fn get_clock(&self) -> u64 { 0 }
 
     fn register_commands(&self) -> Vec<(String, String)> {
-        vec![("ps2".to_string(), "PS/2 commands: ps2 debug <on|off> [DEV]".to_string())]
+        vec![("ps2".to_string(), "PS/2 commands: ps2 debug <on|off> | ps2 type <ascii> | ps2 enter | ps2 status".to_string())]
     }
 
     fn execute_command(&self, cmd: &str, args: &[&str], mut writer: Box<dyn Write + Send>) -> Result<(), String> {
@@ -807,9 +807,74 @@ impl Device for Ps2Controller {
                 writeln!(writer, "PS/2 debug {}", if val { "enabled" } else { "disabled" }).unwrap();
                 return Ok(());
             }
-            return Err("Usage: ps2 debug <on|off>".to_string());
+            if !args.is_empty() && args[0] == "type" {
+                let text = args[1..].join(" ");
+                let mut n = 0usize;
+                for ch in text.chars() {
+                    if let Some((k, shifted)) = ascii_to_keycode(ch) {
+                        if shifted { self.push_kb(KeyCode::ShiftLeft, true); }
+                        self.push_kb(k, true);
+                        self.push_kb(k, false);
+                        if shifted { self.push_kb(KeyCode::ShiftLeft, false); }
+                        n += 1;
+                    }
+                }
+                writeln!(writer, "PS/2: typed {} chars", n).unwrap();
+                return Ok(());
+            }
+            if !args.is_empty() && args[0] == "enter" {
+                self.push_kb(KeyCode::Enter, true);
+                self.push_kb(KeyCode::Enter, false);
+                writeln!(writer, "PS/2: pressed Enter").unwrap();
+                return Ok(());
+            }
+            if !args.is_empty() && args[0] == "status" {
+                let s = self.state.lock();
+                writeln!(writer, "PS/2 state: running={} scanning_enabled={} mouse_enabled={} rx_queue_len={} mouse_queue_bytes={} scancode_set={} config={:02x} last_read={:02x}",
+                    self.running.load(Ordering::Relaxed),
+                    s.scanning_enabled, s.mouse_enabled, s.rx_queue.len(),
+                    s.mouse_queue_bytes, s.scancode_set, s.config, s.last_read).unwrap();
+                return Ok(());
+            }
+            return Err("Usage: ps2 debug <on|off> | ps2 type <ascii> | ps2 enter | ps2 status".to_string());
         }
         Err("Command not found".to_string())
+    }
+}
+
+fn ascii_to_keycode(c: char) -> Option<(KeyCode, bool)> {
+    use KeyCode::*;
+    let unshifted = |k| Some((k, false));
+    let shifted   = |k| Some((k, true));
+    match c {
+        'a' => unshifted(KeyA), 'b' => unshifted(KeyB), 'c' => unshifted(KeyC), 'd' => unshifted(KeyD),
+        'e' => unshifted(KeyE), 'f' => unshifted(KeyF), 'g' => unshifted(KeyG), 'h' => unshifted(KeyH),
+        'i' => unshifted(KeyI), 'j' => unshifted(KeyJ), 'k' => unshifted(KeyK), 'l' => unshifted(KeyL),
+        'm' => unshifted(KeyM), 'n' => unshifted(KeyN), 'o' => unshifted(KeyO), 'p' => unshifted(KeyP),
+        'q' => unshifted(KeyQ), 'r' => unshifted(KeyR), 's' => unshifted(KeyS), 't' => unshifted(KeyT),
+        'u' => unshifted(KeyU), 'v' => unshifted(KeyV), 'w' => unshifted(KeyW), 'x' => unshifted(KeyX),
+        'y' => unshifted(KeyY), 'z' => unshifted(KeyZ),
+        'A' => shifted(KeyA), 'B' => shifted(KeyB), 'C' => shifted(KeyC), 'D' => shifted(KeyD),
+        'E' => shifted(KeyE), 'F' => shifted(KeyF), 'G' => shifted(KeyG), 'H' => shifted(KeyH),
+        'I' => shifted(KeyI), 'J' => shifted(KeyJ), 'K' => shifted(KeyK), 'L' => shifted(KeyL),
+        'M' => shifted(KeyM), 'N' => shifted(KeyN), 'O' => shifted(KeyO), 'P' => shifted(KeyP),
+        'Q' => shifted(KeyQ), 'R' => shifted(KeyR), 'S' => shifted(KeyS), 'T' => shifted(KeyT),
+        'U' => shifted(KeyU), 'V' => shifted(KeyV), 'W' => shifted(KeyW), 'X' => shifted(KeyX),
+        'Y' => shifted(KeyY), 'Z' => shifted(KeyZ),
+        '0' => unshifted(Digit0), '1' => unshifted(Digit1), '2' => unshifted(Digit2), '3' => unshifted(Digit3),
+        '4' => unshifted(Digit4), '5' => unshifted(Digit5), '6' => unshifted(Digit6), '7' => unshifted(Digit7),
+        '8' => unshifted(Digit8), '9' => unshifted(Digit9),
+        ' ' => unshifted(Space), '-' => unshifted(Minus), '=' => unshifted(Equal),
+        '/' => unshifted(Slash), '.' => unshifted(Period), ',' => unshifted(Comma),
+        ';' => unshifted(Semicolon),
+        '"' => shifted(Quote), '\'' => unshifted(Quote),
+        ':' => shifted(Semicolon),
+        '<' => shifted(Comma), '>' => shifted(Period), '?' => shifted(Slash),
+        '!' => shifted(Digit1), '@' => shifted(Digit2), '#' => shifted(Digit3),
+        '$' => shifted(Digit4), '%' => shifted(Digit5), '^' => shifted(Digit6),
+        '&' => shifted(Digit7), '*' => shifted(Digit8), '(' => shifted(Digit9),
+        ')' => shifted(Digit0), '_' => shifted(Minus), '+' => shifted(Equal),
+        _ => None,
     }
 }
 
