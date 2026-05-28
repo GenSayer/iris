@@ -751,8 +751,12 @@ impl Vino {
     /// Walk the clipped rectangle in source coordinates with the configured
     /// decimation, sample UYVY from the field, convert to `format`, pack
     /// bytes MSB-first into 64-bit dwords, and stream them through DMA.
-    /// Each output line is zero-padded to a dword boundary so the channel's
-    /// interleave-mode line accounting stays in step with `line_size`.
+    /// In interleave mode each emitted output row is zero-padded out to
+    /// `line_size + 8` (the kernel-allocated row stride in bytes), so
+    /// `dma_emit_dword`'s row-skip trigger fires at the boundary the kernel
+    /// expects — not at our shorter rendered line. Without this the source
+    /// (e.g. 640 px NTSC) writing into a buffer the kernel sized for 768 px
+    /// stride packs rows back-to-back and shears the captured image.
     fn render_and_pump(&self, ch: usize, field: &Field, format: PixelFormat,
                        dec_x: usize, dec_y: usize,
                        x_start: u32, x_end: u32, y_start: u32, y_end: u32,
@@ -767,12 +771,24 @@ impl Vino {
         let y1 = (y_end   as usize).min(src_h);
         if x1 <= x0 || y1 <= y0 { return; }
 
+        let (interleave, line_size) = {
+            let st = self.state.lock();
+            let bit = if ch == 0 { ctrl::CHA_INTERLEAVE_EN } else { ctrl::CHB_INTERLEAVE_EN };
+            (st.control & bit != 0, st.channels[ch].line_size)
+        };
+        // In interleave mode pad each row out to the kernel-allocated stride;
+        // outside interleave the descriptor chain handles linear layout itself
+        // and any padding would just bloat the DMA stream.
+        let target_line_bytes: u32 = if interleave { line_size + 8 } else { 0 };
+
         let mut accum: u64 = 0;
         let mut bytes_in: u32 = 0;
         let mut stopped = false;
+        let mut line_bytes: u32 = 0;
 
         let mut y = y0;
         while y < y1 && !stopped {
+            line_bytes = 0;
             let mut x = x0;
             while x < x1 && !stopped {
                 let pair_x = x & !1;
@@ -785,7 +801,7 @@ impl Vino {
 
                 match format {
                     PixelFormat::Y8 => {
-                        emit_byte(self, ch, mem, &mut accum, &mut bytes_in, &mut stopped, y_s);
+                        emit_byte(self, ch, mem, &mut accum, &mut bytes_in, &mut stopped, &mut line_bytes, y_s);
                     }
                     PixelFormat::Yuv422 => {
                         // Emit a UYVY pair: U Y0 V Y1.  Pair with the next
@@ -798,19 +814,19 @@ impl Vino {
                         } else {
                             y_s
                         };
-                        emit_byte(self, ch, mem, &mut accum, &mut bytes_in, &mut stopped, u);
-                        emit_byte(self, ch, mem, &mut accum, &mut bytes_in, &mut stopped, y_s);
-                        emit_byte(self, ch, mem, &mut accum, &mut bytes_in, &mut stopped, v);
-                        emit_byte(self, ch, mem, &mut accum, &mut bytes_in, &mut stopped, y_n);
+                        emit_byte(self, ch, mem, &mut accum, &mut bytes_in, &mut stopped, &mut line_bytes, u);
+                        emit_byte(self, ch, mem, &mut accum, &mut bytes_in, &mut stopped, &mut line_bytes, y_s);
+                        emit_byte(self, ch, mem, &mut accum, &mut bytes_in, &mut stopped, &mut line_bytes, v);
+                        emit_byte(self, ch, mem, &mut accum, &mut bytes_in, &mut stopped, &mut line_bytes, y_n);
                         x += dec_x;
                     }
                     PixelFormat::Rgba32 => {
                         let (r, g, b) = yuv_to_rgb(y_s, u, v);
                         // SGI RGBA in memory: A R G B (alpha in the high byte).
-                        emit_byte(self, ch, mem, &mut accum, &mut bytes_in, &mut stopped, 0xFF);
-                        emit_byte(self, ch, mem, &mut accum, &mut bytes_in, &mut stopped, r);
-                        emit_byte(self, ch, mem, &mut accum, &mut bytes_in, &mut stopped, g);
-                        emit_byte(self, ch, mem, &mut accum, &mut bytes_in, &mut stopped, b);
+                        emit_byte(self, ch, mem, &mut accum, &mut bytes_in, &mut stopped, &mut line_bytes, 0xFF);
+                        emit_byte(self, ch, mem, &mut accum, &mut bytes_in, &mut stopped, &mut line_bytes, r);
+                        emit_byte(self, ch, mem, &mut accum, &mut bytes_in, &mut stopped, &mut line_bytes, g);
+                        emit_byte(self, ch, mem, &mut accum, &mut bytes_in, &mut stopped, &mut line_bytes, b);
                     }
                     PixelFormat::Rgba8 => {
                         let (r, g, b) = yuv_to_rgb(y_s, u, v);
@@ -818,15 +834,23 @@ impl Vino {
                         let pix = ((b & 0xC0))            // B in bits [7:6]
                                 | ((g & 0xE0) >> 2)       // G in bits [5:3]
                                 | ((r & 0xE0) >> 5);      // R in bits [2:0]
-                        emit_byte(self, ch, mem, &mut accum, &mut bytes_in, &mut stopped, pix);
+                        emit_byte(self, ch, mem, &mut accum, &mut bytes_in, &mut stopped, &mut line_bytes, pix);
                     }
                 }
 
                 x += dec_x;
             }
-            // Pad to dword boundary so interleave line accounting stays aligned.
-            while bytes_in != 0 && !stopped {
-                emit_byte(self, ch, mem, &mut accum, &mut bytes_in, &mut stopped, 0);
+            // Pad to row stride (interleave) or to dword boundary (otherwise).
+            // The stride-pad path subsumes the dword pad whenever target is a
+            // multiple of 8 (always true: line_size is masked to 0x0FF8).
+            if target_line_bytes > 0 {
+                while line_bytes < target_line_bytes && !stopped {
+                    emit_byte(self, ch, mem, &mut accum, &mut bytes_in, &mut stopped, &mut line_bytes, 0);
+                }
+            } else {
+                while bytes_in != 0 && !stopped {
+                    emit_byte(self, ch, mem, &mut accum, &mut bytes_in, &mut stopped, &mut line_bytes, 0);
+                }
             }
             y += dec_y;
         }
@@ -1180,10 +1204,12 @@ impl BusDevice for Vino {
 
 #[inline]
 fn emit_byte(vino: &Vino, ch: usize, mem: &Arc<dyn BusDevice>,
-             accum: &mut u64, bytes_in: &mut u32, stopped: &mut bool, b: u8) {
+             accum: &mut u64, bytes_in: &mut u32, stopped: &mut bool,
+             line_bytes: &mut u32, b: u8) {
     if *stopped { return; }
     *accum = (*accum << 8) | (b as u64);
     *bytes_in += 1;
+    *line_bytes += 1;
     if *bytes_in == 8 {
         if !vino.dma_emit_dword(ch, *accum, mem) {
             *stopped = true;
