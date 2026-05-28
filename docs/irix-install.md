@@ -89,6 +89,8 @@ in cycle order:
 headless    = false
 no_audio    = false
 banks       = [128, 128, 0, 0]
+# Per-config NVRAM so the 5.3 and 6.5 PROM env don't collide.
+nvram       = "nvram-irix65.bin"
 serial_log  = "irix-install-console.log"
 
 [scsi.1]
@@ -124,6 +126,8 @@ after install:
 headless    = false
 no_audio    = false
 banks       = [128, 128, 0, 0]
+# Per-config NVRAM so the 5.3 and 6.5 PROM env don't collide.
+nvram       = "nvram-irix53.bin"
 serial_log  = "irix-install-console.log"
 
 [scsi.1]
@@ -220,7 +224,10 @@ prompt above, `Are you sure? [y/n] (n):`, `Block size of filesystem
 
 ### 1. PROM env (one-time, with a small chicken-and-egg)
 
-A fresh iris launch reads `nvram.bin`. If the file is missing or its
+A fresh iris launch reads the NVRAM file named by `nvram` in your
+config (defaults to `nvram.bin`; the templates above use a
+per-version filename to keep the two installs from sharing PROM
+env). If the file is missing or its
 checksum is bad iris prints `NVRAM checksum is incorrect:
 reinitializing.` on the serial console and resets the PROM env to
 defaults — including `ConsoleIn=serial(0)`, but the PROM at that
@@ -594,11 +601,13 @@ remaining switchover steps are:
 ic run "chkconfig windowsystem on"
 ic run "nvram console g"
 
-# 2) Persist the emulated NVRAM to nvram.bin on the host. Without this
-#    the console=g change lives only in iris's in-memory NVRAM and
-#    evaporates when iris exits — the next launch reads stale nvram.bin
-#    and you're back to console=d. This applies to any PROM env change
-#    made from inside IRIX (nvram(1)) or from the PROM monitor (setenv).
+# 2) Persist the emulated NVRAM to the host file named by `nvram` in
+#    your toml (default nvram.bin). Without this the console=g change
+#    lives only in iris's in-memory NVRAM and evaporates when iris
+#    exits — the next launch reads the stale on-disk NVRAM and you're
+#    back to console=d. This applies to any PROM env change made from
+#    inside IRIX (nvram(1)) or from the PROM monitor (setenv). With no
+#    `path` arg, `rtc-save` writes to the configured file.
 ic rtc-save
 
 # 3) Cleanly halt so the filesystem (XFS on 6.5.22, EFS on 5.3) is
