@@ -181,12 +181,16 @@ from ~100 % to **~2–4 %**, the shell stayed responsive (commands run, wake-on-
 works), the clock stayed correct, and boot completes normally (the `DELAY()` loop
 is not frozen).
 
-**Known gap:** the login *getty* prompt is not parked as cleanly (measured higher)
-— its idle apparently isn't a pure state-repeating loop (getty may do periodic
-work, or its loop mutates more than k0/k1). The steady-state idle that matters
-(logged-in shell, blocked daemons, X) parks fine. If the login prompt matters, the
-fallback is a PC-signature idle-skip for the known idle-loop PCs
-(`0x88011704`/`0x88020d90` on this 5.3 kernel).
+**Serial getty login prompt — DOES park (~4–6 %).** Initial testing showed the
+"login prompt" at ~90 %, but that was NOT a getty idle-detection failure: `ps`
+revealed **`xdm`** (the graphical login) spinning on the absent framebuffer in
+headless mode (87,700 distinct PCs over 3 s = genuinely-busy code, correctly not
+parked). Killing `xdm` dropped CPU to ~3–6 %, and after logging out the serial
+getty `login:` prompt itself idles at **~4–6 %**. So: a serial-console box (xdm
+disabled, or with a framebuffer where X runs normally instead of spinning) parks
+correctly at the getty prompt. The lesson: high idle CPU may be a busy *guest*
+process (here xdm-on-headless), distinct from the kernel idle loop the detector
+targets.
 
 **Other TODO:** the JIT path (`--features jit`) bypasses this run loop entirely
 (`jit/dispatch.rs`); idle park there is not yet implemented.
