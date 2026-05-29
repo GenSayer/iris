@@ -488,7 +488,7 @@ mod tests {
             host_arch: "aarch64".into(),
             created_at_unix: 1_700_000_000,
             parent: Some("base/desktop".into()),
-            description: Some("post mogrix install".into()),
+            description: Some("post install".into()),
             installed_bundles: vec!["grep-2.5.4".into(), "sed-4.2.2".into()],
         };
         let v = m.to_toml();
