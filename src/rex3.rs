@@ -1041,6 +1041,13 @@ pub struct Rex3 {
     pub gfxbusy: Arc<AtomicBool>,
     pub processor_thread: Mutex<Option<thread::JoinHandle<()>>>,
     pub refresh_thread: Mutex<Option<thread::JoinHandle<()>>>,
+    /// True while the REX3-Processor thread is parked on an empty gfifo. The
+    /// producer (`gfifo_push`) checks this and unparks the consumer so a fresh
+    /// command is picked up immediately instead of after the park timeout.
+    processor_parked: AtomicBool,
+    /// Handle to the REX3-Processor thread, set once when it starts, used by
+    /// `gfifo_push` to unpark it. OnceLock gives lock-free reads on the hot path.
+    processor_unparker: std::sync::OnceLock<thread::Thread>,
     pub screen: Arc<Mutex<Rex3Screen>>,
     pub vblank_cb: Mutex<Option<Arc<dyn Fn(bool) + Send + Sync>>>,
     /// Incremented each time an XMAP mode table entry is written (buf_sel flip signal).
@@ -1193,6 +1200,8 @@ impl Rex3 {
             gfxbusy: Arc::new(AtomicBool::new(false)),
             processor_thread: Mutex::new(None),
             refresh_thread: Mutex::new(None),
+            processor_parked: AtomicBool::new(false),
+            processor_unparker: std::sync::OnceLock::new(),
             screen,
             vblank_cb: Mutex::new(None),
             xmap_fence: AtomicU32::new(0),
@@ -2899,6 +2908,14 @@ impl Rex3 {
             });
         }
         self.gfifo.push(addr, val);
+        // Wake the consumer if it parked on an empty fifo (idle desktop). Cheap
+        // on the hot path: a relaxed-ish load that is false whenever the
+        // processor is actively draining.
+        if self.processor_parked.load(Ordering::Acquire) {
+            if let Some(t) = self.processor_unparker.get() {
+                t.unpark();
+            }
+        }
     }
 
     fn wait_idle(&self) {
@@ -2999,6 +3016,8 @@ impl Rex3 {
     }
 
     fn register_processor(&self) {
+        // Publish our thread handle so gfifo_push can unpark us when we park.
+        let _ = self.processor_unparker.set(thread::current());
         let backoff = crossbeam_utils::Backoff::new();
         let mut is_busy = false;
         loop {
@@ -3057,9 +3076,28 @@ impl Rex3 {
                     is_busy = false;
                 }
                 self.gfifo.flush_head();
-                // Nothing in the ring — back off. Starts with spin_loop() hints,
-                // graduates to thread::yield_now() after sustained emptiness.
-                backoff.snooze();
+                // Nothing in the ring — back off. Spin-hint/yield while a burst
+                // might still be in flight; once emptiness is *sustained*
+                // (crossbeam's backoff completes), stop burning a host core on
+                // yield_now() and actually park. An idle IRIX desktop leaves this
+                // fifo empty indefinitely, so without parking this thread pins a
+                // CPU at ~100%.
+                if backoff.is_completed() {
+                    // Set parked BEFORE the final emptiness re-check so a racing
+                    // gfifo_push either (a) is seen by the peek below, or (b) sees
+                    // parked=true and unparks us — the unpark token makes
+                    // park_timeout return immediately, so no wakeup is lost. The
+                    // 2ms timeout is only a backstop; a missed unpark costs latency,
+                    // never correctness.
+                    self.processor_parked.store(true, Ordering::Release);
+                    if self.gfifo.peek().is_none() && self.running.load(Ordering::Relaxed) {
+                        thread::park_timeout(std::time::Duration::from_millis(2));
+                    }
+                    self.processor_parked.store(false, Ordering::Release);
+                    backoff.reset();
+                } else {
+                    backoff.snooze();
+                }
             }
         }
     }
