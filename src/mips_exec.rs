@@ -270,13 +270,66 @@ impl TracebackBuffer {
     fn get_last(&self, n: usize) -> Vec<TracebackEntry> {
         let mut result = Vec::new();
         let count = n.min(self.count);
-        
+
         for i in 0..count {
             let idx = (self.head + TRACEBACK_SIZE - 1 - i) % TRACEBACK_SIZE;
             result.push(self.entries[idx]);
         }
         result.reverse();
         result
+    }
+}
+
+/// Per-PC sampling counters: total times this PC was the about-to-execute PC,
+/// and how many of those had CPU interrupts enabled (IE=1, EXL=ERL=0).
+#[derive(Clone, Copy, Default)]
+struct IdleSample {
+    count: u64,
+    ie_count: u64,
+}
+
+/// Lightweight PC-sampling histogram used to locate hot spin loops — primarily
+/// the IRIX kernel idle loop, which is a tight backward branch that runs with
+/// interrupts enabled and only exits via an interrupt. Disabled by default;
+/// when `on` is false `step()` pays a single predictable-not-taken branch.
+///
+/// Workflow (the executor lock is held for the whole run, so toggling and
+/// reporting require the CPU to be stopped first):
+///   cpu stop; idleprof on; cont    # let the guest sit at an idle prompt
+///   cpu stop; idleprof report      # dump the hottest PCs + IE%
+///
+/// The idle loop shows up as a small cluster of contiguous PCs that together
+/// dominate the samples with ie% == 100.
+#[derive(Default)]
+struct IdleProfiler {
+    /// Sample one in every `stride` executed instructions. 0/1 = every instr.
+    /// Subsampling bounds hot-path cost; the idle loop still dominates because
+    /// it is by far the most frequently executed code while the system idles.
+    stride: u64,
+    counter: u64,
+    total: u64,
+    hist: std::collections::HashMap<u64, IdleSample>,
+}
+
+impl IdleProfiler {
+    #[inline(always)]
+    fn sample(&mut self, pc: u64, ie: bool) {
+        self.counter = self.counter.wrapping_add(1);
+        if self.stride > 1 && self.counter % self.stride != 0 {
+            return;
+        }
+        self.total += 1;
+        let e = self.hist.entry(pc).or_default();
+        e.count += 1;
+        if ie {
+            e.ie_count += 1;
+        }
+    }
+
+    fn reset(&mut self) {
+        self.counter = 0;
+        self.total = 0;
+        self.hist.clear();
     }
 }
 
@@ -536,6 +589,18 @@ pub struct MipsExecutor<T: Tlb, C: MipsCache> {
     #[cfg(feature = "developer")]
     pending_memory_writes: Vec<MemoryWrite>,
     traceback: TracebackBuffer,
+    /// PC-sampling histogram for locating spin/idle loops. Inert unless armed.
+    idle_profiler: IdleProfiler,
+    /// Lock-free arm flag for the idle profiler. Held as an Arc so the CPU
+    /// wrapper can toggle it WITHOUT taking the executor lock (i.e. without
+    /// pausing/resuming the CPU, which corrupts a live IRIX kernel). Read every
+    /// step via `idle_profile_on_ptr` to keep the disabled path branch-only.
+    pub idle_profile_on: Arc<AtomicBool>,
+    /// Lock-free reset request. Set when arming; the CPU thread clears the
+    /// histogram on its next step and unsets this. Avoids needing the lock to
+    /// reset stale samples.
+    pub idle_profile_reset: Arc<AtomicBool>,
+    idle_profile_on_ptr: *const AtomicBool,
     pub symbols: Arc<Mutex<SymbolTable>>,
     pub breakpoints: Vec<Breakpoint>,
     pub next_bp_id: usize,
@@ -700,6 +765,10 @@ For R4000SC/MC CPUs:
             #[cfg(feature = "developer")]
             pending_memory_writes: Vec::new(),
             traceback: TracebackBuffer::new(),
+            idle_profiler: IdleProfiler::default(),
+            idle_profile_on: Arc::new(AtomicBool::new(false)),
+            idle_profile_reset: Arc::new(AtomicBool::new(false)),
+            idle_profile_on_ptr: std::ptr::null(),
             symbols: Arc::new(Mutex::new(SymbolTable::new())),
             breakpoints: vec![Breakpoint {
                 id: 0, addr: 0, kind: BpType::Pc, enabled: false, condition: None
@@ -740,6 +809,7 @@ For R4000SC/MC CPUs:
         self.cycles_ptr     = Arc::as_ptr(&self.core.cycles);
         self.interrupts_ptr = Arc::as_ptr(&self.core.interrupts);
         self.fasttick_ptr   = Arc::as_ptr(&self.core.fasttick_count);
+        self.idle_profile_on_ptr = Arc::as_ptr(&self.idle_profile_on);
     }
 
     /// Install the CP0 Status change callback pointing at this executor.
@@ -878,6 +948,19 @@ For R4000SC/MC CPUs:
         let pending = unsafe { &*self.interrupts_ptr }.load(Ordering::Relaxed);
 
         let pc = self.core.pc;
+
+        // Spin/idle-loop PC sampler. Armed lock-free via the shared atomic, so
+        // the CPU is never paused/resumed to enable it (resuming corrupts a
+        // live kernel). Inert (one relaxed load + branch) when disarmed.
+        if unsafe { &*self.idle_profile_on_ptr }.load(Ordering::Relaxed) {
+            if self.idle_profile_reset.load(Ordering::Relaxed) {
+                self.idle_profiler.reset();
+                self.idle_profile_reset.store(false, Ordering::Relaxed);
+            }
+            let ie = self.core.interrupts_enabled();
+            self.idle_profiler.sample(pc, ie);
+        }
+
         #[cfg(not(feature = "lightning"))]
         if self.bp_enabled() && self.check_breakpoint::<{ BpType::Pc as u8 }>(pc) {
             return EXEC_BREAKPOINT;
@@ -4630,6 +4713,11 @@ pub struct MipsCpu<T: Tlb, C: MipsCache> {
     pub fasttick_count: Arc<AtomicU64>,
     debug: Arc<AtomicBool>,
     exception_mask: Arc<AtomicU32>,
+    /// Shared with the executor: lock-free idle-profiler arm + reset flags.
+    /// Toggling these does NOT require the executor lock, so the CPU is never
+    /// paused/resumed to arm the profiler (resuming corrupts a live kernel).
+    idle_profile_on: Arc<AtomicBool>,
+    idle_profile_reset: Arc<AtomicBool>,
 }
 
 impl<T: Tlb + Send + 'static, C: MipsCache + Send + 'static> MipsCpu<T, C> {
@@ -4637,6 +4725,8 @@ impl<T: Tlb + Send + 'static, C: MipsCache + Send + 'static> MipsCpu<T, C> {
         let cycles = executor.core.cycles.clone();
         let interrupts = executor.core.interrupts.clone();
         let fasttick_count = executor.core.fasttick_count.clone();
+        let idle_profile_on = executor.idle_profile_on.clone();
+        let idle_profile_reset = executor.idle_profile_reset.clone();
 
         let executor_arc = Arc::new(Mutex::new(executor));
         executor_arc.lock().install_status_cb();
@@ -4650,7 +4740,22 @@ impl<T: Tlb + Send + 'static, C: MipsCache + Send + 'static> MipsCpu<T, C> {
             fasttick_count,
             debug: Arc::new(AtomicBool::new(false)),
             exception_mask: Arc::new(AtomicU32::new(0)),
+            idle_profile_on,
+            idle_profile_reset,
         }
+    }
+
+    /// Arm the idle-loop PC sampler without taking the executor lock (so the
+    /// running CPU is never paused/resumed). Requests a histogram reset which
+    /// the CPU thread performs on its next step.
+    pub fn idle_profile_arm(&self) {
+        self.idle_profile_reset.store(true, Ordering::SeqCst);
+        self.idle_profile_on.store(true, Ordering::SeqCst);
+    }
+
+    /// Disarm the sampler (lock-free).
+    pub fn idle_profile_disarm(&self) {
+        self.idle_profile_on.store(false, Ordering::SeqCst);
     }
 
 
@@ -5000,6 +5105,27 @@ impl<T: Tlb + Send + 'static, C: MipsCache + Send + 'static> Device for MipsCpu<
             //let mut last_cycles: u64 = guard.core.cycles.load(Ordering::Relaxed);
             //let mut last_time = std::time::Instant::now();
             // --- end perf sampling ---
+
+            // Idle detection + park state (see docs/idle-pause-work.md). Set
+            // IRIS_NO_IDLE to keep spinning the host CPU (for benchmarking/debug).
+            //
+            // We only park when the architectural state (PC + all GPRs) REPEATS
+            // across batches. A polling/idle loop (e.g. the kernel idle loop
+            // waiting on the run queue) cycles through the same states and exits
+            // only on an interrupt — safe to park. A busy-delay loop (e.g. IRIX
+            // DELAY(): `bgezl v1,-1; subu v1,v1,v0`) changes a counter every
+            // iteration, so its state never repeats — we must NOT park it or
+            // boot stalls. The state-repeat test distinguishes the two.
+            let idle_enabled = std::env::var_os("IRIS_NO_IDLE").is_none();
+            // Ring of recent architectural-state hashes (PC folded with all GPRs),
+            // one per idle-suspected batch. A polling/idle loop cycles through a
+            // small set of states, so a hash repeats within ~the loop period; a
+            // delay loop's counter makes every state unique, so it never repeats.
+            const IDLE_RING: usize = 32;
+            let mut idle_ring = [0u64; IDLE_RING];
+            let mut idle_ring_len = 0usize;
+            let mut idle_ring_pos = 0usize;
+
             #[allow(unreachable_code)]
             while running.load(Ordering::Relaxed) {
                 #[cfg(feature = "lightning")]
@@ -5027,6 +5153,100 @@ impl<T: Tlb + Send + 'static, C: MipsCache + Send + 'static> Device for MipsCpu<
                 }
                 // Flush local cycle counter to shared atomic once per batch
                 guard.flush_cycles();
+
+                // --- idle detection + in-place park (stop spinning host CPU) ---
+                // The kernel idle loop is a tight loop with interrupts enabled and
+                // nothing pending; it exits only on an interrupt. When we detect it,
+                // park the CPU thread until the next CP0 Compare tick or a device
+                // interrupt, advancing cp0_count + local_cycles by the REAL elapsed
+                // time so the wallclock timer and its Compare-write calibration stay
+                // consistent (advancing only count would spike count_step — see
+                // docs/idle-pause-work.md §4). We never stop/restart the thread or
+                // peripherals; we just sleep in place, so the kernel is undisturbed.
+                if idle_enabled {
+                    let ie = guard.core.interrupts_enabled();
+                    let pending = guard.core.interrupts.load(Ordering::Relaxed) as u32;
+                    let ip = (guard.core.cp0_cause | pending) & crate::mips_core::CAUSE_IP_MASK;
+                    let im = guard.core.cp0_status & crate::mips_core::STATUS_IM_MASK;
+                    let interrupt_ready = (ip & im) != 0; // would be delivered next step
+
+                    // `state_repeated` is true only if the current PC+GPR hash
+                    // matches one seen recently — i.e. the loop revisited a state
+                    // (polling), as opposed to a delay loop whose counter makes
+                    // every state unique.
+                    let mut state_repeated = false;
+                    if ie && !interrupt_ready {
+                        let mut h = guard.core.pc;
+                        for &g in guard.core.gpr.iter() {
+                            h = h.rotate_left(7) ^ g;
+                        }
+                        if idle_ring[..idle_ring_len].contains(&h) {
+                            state_repeated = true;
+                            idle_ring_len = 0; // re-detect freshly after waking
+                            idle_ring_pos = 0;
+                        } else {
+                            idle_ring[idle_ring_pos] = h;
+                            idle_ring_pos = (idle_ring_pos + 1) % IDLE_RING;
+                            if idle_ring_len < IDLE_RING {
+                                idle_ring_len += 1;
+                            }
+                        }
+                    } else {
+                        idle_ring_len = 0;
+                        idle_ring_pos = 0;
+                    }
+
+                    if state_repeated {
+                        // counts/10ms tick: the CP0 Count hardware rate (independent of
+                        // whether the current tick is the 100 Hz or 1 kHz interval).
+                        let slow_hw = guard.core.compare_delta_slow >> 32;
+                        let cs = guard.core.count_step; // 32.32 counts/instruction
+                        if slow_hw != 0 && cs != 0 {
+                            const SLICE_NS: u64 = 1_000_000;  // 1 ms slices → ≤1 ms IRQ latency
+                            const MIN_SLICE_NS: u64 = 50_000; // <50 µs to tick: just fire it
+                            loop {
+                                if !running.load(Ordering::Relaxed) { break; }
+                                let cnt = guard.core.cp0_count;
+                                let cmp = guard.core.cp0_compare;
+                                let diff = cmp.wrapping_sub(cnt);
+                                // high bit set => count already past compare => tick due now
+                                if (diff >> 63) != 0 || (diff >> 32) == 0 {
+                                    guard.core.cp0_count = cmp;
+                                    guard.core.cp0_cause |= crate::mips_core::CAUSE_IP7;
+                                    break;
+                                }
+                                // a device interrupt became ready while we were idle
+                                let pending = guard.core.interrupts.load(Ordering::Relaxed) as u32;
+                                let ip = (guard.core.cp0_cause | pending) & crate::mips_core::CAUSE_IP_MASK;
+                                let im = guard.core.cp0_status & crate::mips_core::STATUS_IM_MASK;
+                                if (ip & im) != 0 { break; }
+
+                                let rem_hw = diff >> 32;
+                                let ns_to_tick = (rem_hw as u128 * 10_000_000u128 / slow_hw as u128) as u64;
+                                let slice_ns = ns_to_tick.min(SLICE_NS);
+                                if slice_ns < MIN_SLICE_NS {
+                                    guard.core.cp0_count = cmp;
+                                    guard.core.cp0_cause |= crate::mips_core::CAUSE_IP7;
+                                    break;
+                                }
+                                // Drop the executor lock so the monitor stays responsive
+                                // while we sleep; re-acquire after.
+                                guard.flush_cycles();
+                                drop(guard);
+                                let t0 = std::time::Instant::now();
+                                std::thread::sleep(std::time::Duration::from_nanos(slice_ns));
+                                let elapsed_ns = t0.elapsed().as_nanos() as u64;
+                                guard = executor.lock();
+                                // Advance guest time by the real elapsed time.
+                                let adv_hw = (elapsed_ns as u128 * slow_hw as u128 / 10_000_000u128) as u64;
+                                guard.core.cp0_count = guard.core.cp0_count.wrapping_add(adv_hw << 32);
+                                let adv_instrs = (((adv_hw as u128) << 32) / cs as u128) as u64;
+                                guard.core.local_cycles = guard.core.local_cycles.wrapping_add(adv_instrs);
+                            }
+                        }
+                    }
+                }
+                // --- end idle park ---
                 // --- perf sampling (comment out to disable) ---
                 //let cycles = guard.core.cycles.load(Ordering::Relaxed);
                 //if cycles.wrapping_sub(last_cycles) >= 100_000_000 {
@@ -5110,6 +5330,7 @@ impl<T: Tlb + Send + 'static, C: MipsCache + Send + 'static> Device for MipsCpu<
             ("ex".to_string(), "Alias for exception".to_string()),
             ("undo".to_string(), "Undo N instructions or control undo buffer: undo [count] | undo <on|off|clear> [DEV]".to_string()),
             ("dt".to_string(), "Disassemble traceback: dt [count]".to_string()),
+            ("idleprof".to_string(), "Locate idle/spin loops via PC sampling: idleprof <on|off|report [count]>".to_string()),
             ("u".to_string(), "Alias for undo [DEV]".to_string()),
             ("sym".to_string(), "Lookup symbol: sym <addr>".to_string()),
             ("loadsym".to_string(), "Load symbols from file: loadsym <file>".to_string()),
@@ -5962,6 +6183,29 @@ impl<T: Tlb + Send + 'static, C: MipsCache + Send + 'static> Device for MipsCpu<
                 }
                 Ok(())
             }
+            "idleprof" => {
+                let sub = actual_args.first().copied().unwrap_or("report");
+                match sub {
+                    "on" => {
+                        // Lock-free: arms without pausing the CPU. Let the guest
+                        // idle, then `cpu stop` and `idleprof report`. No resume
+                        // needed (resuming a live kernel corrupts it).
+                        self.idle_profile_arm();
+                        writeln!(writer, "idleprof: armed (lock-free, histogram reset). Let the guest idle, then `stop; idleprof report`.").unwrap();
+                    }
+                    "off" => {
+                        self.idle_profile_disarm();
+                        writeln!(writer, "idleprof: disarmed.").unwrap();
+                    }
+                    "report" => {
+                        let count = actual_args.get(1).and_then(|s| s.parse().ok()).unwrap_or(32);
+                        let mut exec = self.try_lock_executor()?;
+                        exec.idle_profile_report(count, &mut writer);
+                    }
+                    _ => return Err("Usage: idleprof <on | off | report [count]>".to_string()),
+                }
+                Ok(())
+            }
             _ => Err(format!("Unknown CPU command: {}", actual_cmd)),
         }
     }
@@ -5969,6 +6213,94 @@ impl<T: Tlb + Send + 'static, C: MipsCache + Send + 'static> Device for MipsCpu<
 }
 
 impl<T: Tlb, C: MipsCache> MipsExecutor<T, C> {
+    /// Dump the hottest sampled PCs and flag a likely idle-loop region: the
+    /// smallest contiguous PC window (<=256 bytes) of always-interrupts-enabled
+    /// samples that together account for the bulk of execution.
+    pub fn idle_profile_report(&mut self, top: usize, writer: &mut dyn Write) {
+        let total = self.idle_profiler.total;
+        if total == 0 {
+            let _ = writeln!(writer, "idleprof: no samples (run `idleprof on`, let the guest idle, then `cpu stop`)");
+            return;
+        }
+
+        let mut rows: Vec<(u64, IdleSample)> =
+            self.idle_profiler.hist.iter().map(|(&pc, &s)| (pc, s)).collect();
+        rows.sort_by(|a, b| b.1.count.cmp(&a.1.count));
+
+        // Pre-fetch instruction words for the displayed PCs while we still hold
+        // `&mut self`; disassembly below borrows `self.symbols`, which would
+        // otherwise conflict with debug_fetch_instr's `&mut self`.
+        let instrs: std::collections::HashMap<u64, Option<u32>> = rows
+            .iter()
+            .take(top)
+            .map(|(pc, _)| (*pc, self.debug_fetch_instr(*pc).ok()))
+            .collect();
+
+        let symbols = self.symbols.lock();
+        let _ = writeln!(
+            writer,
+            "idleprof: {} samples (stride {}), {} distinct PCs — top {}:",
+            total, self.idle_profiler.stride, rows.len(), top.min(rows.len())
+        );
+        let _ = writeln!(writer, "  {:>16}  {:>7}  {:>5}  {:>4}  symbol / disasm", "pc", "count", "pct", "ie%");
+        for (pc, s) in rows.iter().take(top) {
+            let pct = s.count as f64 * 100.0 / total as f64;
+            let iepct = s.ie_count as f64 * 100.0 / s.count as f64;
+            let sym = format_pc_symbol(*pc, &symbols);
+            let dis = match instrs.get(pc).copied().flatten() {
+                Some(instr) => mips_dis::disassemble(instr, *pc, Some(&symbols)),
+                None => "<fetch failed>".to_string(),
+            };
+            let _ = writeln!(
+                writer,
+                "  {:016x}  {:>7}  {:4.1}%  {:3.0}%  {}{}",
+                pc, s.count, pct, iepct, sym, format!("  {}", dis)
+            );
+        }
+
+        // Idle-loop heuristic: among the hottest PCs that are interrupt-enabled
+        // ~always, find the tightest contiguous window covering >=50% of samples.
+        let mut hot: Vec<(u64, IdleSample)> = rows
+            .iter()
+            .filter(|(_, s)| s.ie_count * 100 >= s.count * 99) // IE >= 99%
+            .cloned()
+            .collect();
+        hot.sort_by_key(|(pc, _)| *pc);
+        let mut best: Option<(u64, u64, u64)> = None; // (lo, hi, covered)
+        for i in 0..hot.len() {
+            let lo = hot[i].0;
+            let mut covered = 0u64;
+            let mut hi = lo;
+            for &(pc, s) in &hot[i..] {
+                if pc.wrapping_sub(lo) > 256 {
+                    break;
+                }
+                hi = pc;
+                covered += s.count;
+            }
+            if covered * 2 >= total && best.map_or(true, |(_, _, c)| covered > c) {
+                best = Some((lo, hi, covered));
+            }
+        }
+        match best {
+            Some((lo, hi, covered)) => {
+                let pct = covered as f64 * 100.0 / total as f64;
+                let sym = format_pc_symbol(lo, &symbols);
+                let _ = writeln!(
+                    writer,
+                    "\nidle-loop candidate: {:016x}..={:016x} ({} bytes){}  — {:.1}% of samples, interrupts enabled",
+                    lo, hi, hi - lo + 4, sym, pct
+                );
+            }
+            None => {
+                let _ = writeln!(
+                    writer,
+                    "\nno clear idle-loop candidate (no interrupts-enabled PC window covers >=50% of samples)"
+                );
+            }
+        }
+    }
+
     /// Analyze function prologue to determine frame size and RA save location
     fn analyze_prologue(&mut self, start_pc: u64, current_pc: u64) -> (u64, Option<(i64, usize)>) {
         let mut frame_size = 0u64;
