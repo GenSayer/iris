@@ -203,6 +203,7 @@ fn dispatch(server: &CiServer, req: &Request) -> Response {
         "push"          => cmd_push(&req.args),
         "rtc-save"      => cmd_rtc_save(server, &req.args),
         "cdrom-eject"   => cmd_cdrom_eject(server, &req.args),
+        "cdrom-load"    => cmd_cdrom_load(server, &req.args),
         other => Response::err(format!("unknown command: {}", other)),
     }
 }
@@ -231,6 +232,24 @@ fn cmd_cdrom_eject(server: &CiServer, args: &Value) -> Response {
     match result {
         Ok(path) => Response::data(serde_json::json!({ "id": id, "new_disc": path })),
         Err(e) => Response::err(format!("cdrom-eject: {}", e)),
+    }
+}
+
+fn cmd_cdrom_load(server: &CiServer, args: &Value) -> Response {
+    let id = match args.get("id").and_then(|v| v.as_u64()) {
+        Some(n) => n as usize,
+        None => return Response::err("cdrom-load: missing 'id' arg"),
+    };
+    let path = match args.get("path").and_then(|v| v.as_str()) {
+        Some(p) => p.to_string(),
+        None => return Response::err("cdrom-load: missing 'path' arg"),
+    };
+    let result = server.with_machine(|m| {
+        m.hpc3().scsi().load_disc(id, path.clone())
+    });
+    match result {
+        Ok(loaded) => Response::data(serde_json::json!({ "id": id, "disc": loaded })),
+        Err(e) => Response::err(format!("cdrom-load: {}", e)),
     }
 }
 

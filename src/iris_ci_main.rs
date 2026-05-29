@@ -177,6 +177,9 @@ enum Cmd {
 
     /// Cycle the CD changer on a SCSI ID to the next disc.
     CdromEject { id: u64 },
+
+    /// Load an arbitrary CD image into a SCSI ID and make it the active disc.
+    CdromLoad { id: u64, path: String },
 }
 
 #[derive(Subcommand, Debug)]
@@ -285,6 +288,7 @@ fn dispatch(opts: &Opts, cmd: Cmd) -> Result<()> {
             simple(opts, "rtc-save", args, "nvram saved")
         }
         Cmd::CdromEject { id } => simple(opts, "cdrom-eject", json!({"id": id}), "ejected"),
+        Cmd::CdromLoad { id, path } => simple(opts, "cdrom-load", json!({"id": id, "path": path}), "loaded"),
     }
 }
 

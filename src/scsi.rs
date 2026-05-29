@@ -274,6 +274,30 @@ impl ScsiDevice {
         &self.discs
     }
 
+    /// Load an explicit image path and make it the active disc immediately,
+    /// as if a hand swapped the disc in the drive. The path is inserted at the
+    /// front of the changer list (becomes index 0) and a medium-change is
+    /// signalled (unit attention) so the guest re-reads the TOC on its next
+    /// command. The image is opened as a raw ISO (`Direct` backend), matching
+    /// the changer's eject path. Err if this is not a CD-ROM or the file can't
+    /// be opened.
+    pub fn load_disc(&mut self, path: String) -> Result<String, String> {
+        if !self.is_cdrom {
+            return Err("Not a CD-ROM device".to_string());
+        }
+        let f = OpenOptions::new().read(true).open(&path)
+            .map_err(|e| format!("could not open {}: {}", path, e))?;
+        let size = f.metadata().map(|m| m.len()).unwrap_or(0);
+        self.backend = DiskBackend::Direct(f);
+        self.size = size;
+        // phys/logical block sizes persist across disc changes (controller
+        // settings), exactly as in eject_next.
+        self.filename = path.clone();
+        self.unit_attention = true; // signal medium change on next command
+        self.discs.insert(0, path.clone());
+        Ok(path)
+    }
+
     /// Insert a new disc path at position 1 (next after current).
     /// Returns Err if this is not a CD-ROM or the path doesn't exist.
     pub fn add_disc(&mut self, path: String) -> Result<(), String> {
