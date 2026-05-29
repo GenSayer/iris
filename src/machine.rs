@@ -273,7 +273,13 @@ impl Machine {
                 hpc3.add_scsi_device(id as usize, &path, dev.cdrom, discs, dev.overlay)
             };
             if let Err(e) = result {
-                println!("Note: Could not attach {} to SCSI ID {}: {}", path, id, e);
+                // A configured disk that won't attach is fatal: continuing would
+                // boot with a silently-missing device, and the only symptom is a
+                // confusing PROM "no such device" much later (e.g. a CHD path
+                // when the binary was built without --features chd). Fail loudly
+                // at startup instead.
+                eprintln!("iris: fatal: could not attach {} to SCSI ID {}: {}", path, id, e);
+                std::process::exit(1);
             }
         }
 
