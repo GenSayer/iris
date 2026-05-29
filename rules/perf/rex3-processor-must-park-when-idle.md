@@ -37,9 +37,21 @@ concurrent `gfifo_push` either (a) lands before the peek and is seen, or (b) see
 on `gfxbusy && gfifo.is_empty()`, so a queued-but-not-yet-processed command never
 looks "done" even if the consumer is briefly parked.
 
-**Related:** the REX3-Refresh thread separately does a full-framebuffer GL upload
-every frame at ~60 Hz (~25-30% of a core) regardless of whether anything changed.
-That is display work, not an idle busy-spin, and is *not* addressed here — a
-dirty-tracking skip would be a separate optimisation. Also note a *live* VINO
-camera source genuinely keeps the guest busy (continuous video DMA + driver), so
-"idle" with `[vino] source = "camera"` is not truly idle.
+**Related — REX3-Refresh idle skip:** the REX3-Refresh thread separately did a
+full-framebuffer `copy_from_slice` (~16 MB) + RGBA conversion + GL upload *every*
+frame at 60 Hz regardless of whether anything changed (~25-30% of a core at idle).
+It now renders only when something visible changed: a new `fb_dirty` atomic (set
+by the gfifo consumer on any processed entry) covers all REX3 drawing, and the
+palette/cursor/mode mutexes' existing `dirty` flags are peeked (not cleared —
+`refresh()` clears them when it actually runs). A ~10 Hz heartbeat keeps the live
+status bar moving and bounds any missed-dirty staleness. Crucially the **VBLANK
+tick (STATUS_VRINT + cursor-Y latch + vblank_cb) still runs every frame** even
+when the render is skipped — the guest's vsync timing must not depend on host
+rendering. Skipped frames don't swap, so the front buffer just stands.
+
+Combined with the parking fix, idle graphical host CPU dropped ~130% → ~9%.
+
+Note a *live* VINO camera source genuinely keeps the guest busy (continuous video
+DMA → the guest blits each frame via REX3 → `fb_dirty` every frame), so "idle"
+with `[vino] source = "camera"` is not truly idle and will render at full rate —
+that is correct.
