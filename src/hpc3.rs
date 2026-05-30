@@ -996,14 +996,18 @@ pub struct Hpc3 {
 
 impl Hpc3 {
     pub fn new(eeprom: Arc<Mutex<Eeprom93c56>>, ioc: Ioc, guinness: bool, heartbeat: Arc<AtomicU64>) -> Self {
-        Self::with_net(eeprom, ioc, guinness, heartbeat, NetworkConfig::default(), false)
+        Self::with_net(eeprom, ioc, guinness, heartbeat, NetworkConfig::default(), false, "nvram.bin".to_string())
     }
 
-    pub fn with_net(eeprom: Arc<Mutex<Eeprom93c56>>, ioc: Ioc, guinness: bool, heartbeat: Arc<AtomicU64>, net: NetworkConfig, headless: bool) -> Self {
+    /// `no_audio` skips HAL2 audio init (used by `--noaudio` and also by full
+    /// `--headless`, which can't run audio in CI).
+    /// `nvram_path` is the on-disk NVRAM file (loaded at startup, default save
+    /// target for `iris-ci rtc-save`).
+    pub fn with_net(eeprom: Arc<Mutex<Eeprom93c56>>, ioc: Ioc, guinness: bool, heartbeat: Arc<AtomicU64>, net: NetworkConfig, no_audio: bool, nvram_path: String) -> Self {
         let nfs = net.nfs;
         let port_forwards = net.port_forward;
         let subnet = net.nat_subnet.unwrap_or_default();
-        let rtc = Arc::new(Ds1x86::new(8192));
+        let rtc = Arc::new(Ds1x86::new(8192, nvram_path));
         let pdma_dump = Arc::new(AtomicU32::new(0));
         
         let state = Arc::new(Mutex::new(Hpc3State {
@@ -1083,7 +1087,7 @@ impl Hpc3 {
 
         let scsi_dev = Arc::new(Wd33c93a::new(Some(scsi0_dma), Some(scsi0_irq), heartbeat.clone()));
         
-        let hal2 = if headless { None } else { Some(Arc::new(Hal2::new(dma_clients[0..8].to_vec()))) };
+        let hal2 = if no_audio { None } else { Some(Arc::new(Hal2::new(dma_clients[0..8].to_vec()))) };
 
         Self {
             state,

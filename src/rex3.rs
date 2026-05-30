@@ -1041,6 +1041,19 @@ pub struct Rex3 {
     pub gfxbusy: Arc<AtomicBool>,
     pub processor_thread: Mutex<Option<thread::JoinHandle<()>>>,
     pub refresh_thread: Mutex<Option<thread::JoinHandle<()>>>,
+    /// True while the REX3-Processor thread is parked on an empty gfifo. The
+    /// producer (`gfifo_push`) checks this and unparks the consumer so a fresh
+    /// command is picked up immediately instead of after the park timeout.
+    processor_parked: AtomicBool,
+    /// Handle to the REX3-Processor thread, set once when it starts, used by
+    /// `gfifo_push` to unpark it. OnceLock gives lock-free reads on the hot path.
+    processor_unparker: std::sync::OnceLock<thread::Thread>,
+    /// Set by the gfifo consumer whenever it processes activity that may have
+    /// changed the framebuffer. The refresh thread renders only when this (or a
+    /// palette/cursor/mode change) is seen, rather than re-converting and
+    /// re-uploading the whole framebuffer at 60 Hz on a static screen. Starts
+    /// true so the first frame always renders.
+    fb_dirty: AtomicBool,
     pub screen: Arc<Mutex<Rex3Screen>>,
     pub vblank_cb: Mutex<Option<Arc<dyn Fn(bool) + Send + Sync>>>,
     /// Incremented each time an XMAP mode table entry is written (buf_sel flip signal).
@@ -1193,6 +1206,9 @@ impl Rex3 {
             gfxbusy: Arc::new(AtomicBool::new(false)),
             processor_thread: Mutex::new(None),
             refresh_thread: Mutex::new(None),
+            processor_parked: AtomicBool::new(false),
+            processor_unparker: std::sync::OnceLock::new(),
+            fb_dirty: AtomicBool::new(true),
             screen,
             vblank_cb: Mutex::new(None),
             xmap_fence: AtomicU32::new(0),
@@ -2899,6 +2915,14 @@ impl Rex3 {
             });
         }
         self.gfifo.push(addr, val);
+        // Wake the consumer if it parked on an empty fifo (idle desktop). Cheap
+        // on the hot path: a relaxed-ish load that is false whenever the
+        // processor is actively draining.
+        if self.processor_parked.load(Ordering::Acquire) {
+            if let Some(t) = self.processor_unparker.get() {
+                t.unpark();
+            }
+        }
     }
 
     fn wait_idle(&self) {
@@ -2999,11 +3023,18 @@ impl Rex3 {
     }
 
     fn register_processor(&self) {
+        // Publish our thread handle so gfifo_push can unpark us when we park.
+        let _ = self.processor_unparker.set(thread::current());
         let backoff = crossbeam_utils::Backoff::new();
         let mut is_busy = false;
         loop {
             if let Some((addr, val)) = self.gfifo.peek() {
                 backoff.reset();
+                // Any consumed entry may have touched the framebuffer or display
+                // state; flag it so the refresh thread re-renders this frame. An
+                // idle screen leaves the fifo empty, so this stays clear and the
+                // refresh thread skips its expensive full-frame work.
+                self.fb_dirty.store(true, Ordering::Relaxed);
 
                 if !is_busy {
                     self.gfxbusy.store(true, Ordering::Relaxed);
@@ -3057,9 +3088,28 @@ impl Rex3 {
                     is_busy = false;
                 }
                 self.gfifo.flush_head();
-                // Nothing in the ring — back off. Starts with spin_loop() hints,
-                // graduates to thread::yield_now() after sustained emptiness.
-                backoff.snooze();
+                // Nothing in the ring — back off. Spin-hint/yield while a burst
+                // might still be in flight; once emptiness is *sustained*
+                // (crossbeam's backoff completes), stop burning a host core on
+                // yield_now() and actually park. An idle IRIX desktop leaves this
+                // fifo empty indefinitely, so without parking this thread pins a
+                // CPU at ~100%.
+                if backoff.is_completed() {
+                    // Set parked BEFORE the final emptiness re-check so a racing
+                    // gfifo_push either (a) is seen by the peek below, or (b) sees
+                    // parked=true and unparks us — the unpark token makes
+                    // park_timeout return immediately, so no wakeup is lost. The
+                    // 2ms timeout is only a backstop; a missed unpark costs latency,
+                    // never correctness.
+                    self.processor_parked.store(true, Ordering::Release);
+                    if self.gfifo.peek().is_none() && self.running.load(Ordering::Relaxed) {
+                        thread::park_timeout(std::time::Duration::from_millis(2));
+                    }
+                    self.processor_parked.store(false, Ordering::Release);
+                    backoff.reset();
+                } else {
+                    backoff.snooze();
+                }
             }
         }
     }
@@ -3366,6 +3416,9 @@ impl Rex3 {
     fn refresh_loop(&self) {
         let frame_duration = std::time::Duration::from_micros(16667); // ~60Hz
         let mut status_bar = crate::disp::StatusBar::new();
+        // Idle-skip bookkeeping (see the should_render gate below).
+        let mut last_topscan: usize = usize::MAX;
+        let mut frames_since_render: u32 = u32::MAX;
 
         while self.running.load(Ordering::Relaxed) {
             let start = std::time::Instant::now();
@@ -3423,7 +3476,38 @@ impl Rex3 {
             let fb_aux = unsafe { &*self.fb_aux.get() };
             let topscan = unsafe { (*self.context.get()).topscan as usize };
 
-            {
+            // Idle skip: only run the (expensive) full-frame refresh + GL upload
+            // when something visible changed. `fb_dirty` covers all REX3 drawing
+            // (set by the gfifo consumer); the palette/cursor/mode mutexes carry
+            // their own dirty flags (peeked here, not cleared — refresh() clears
+            // them when it runs). A periodic heartbeat keeps the live status bar
+            // moving and bounds any missed-dirty staleness. VBLANK is still ticked
+            // every frame (see the else branch), independent of host rendering.
+            //
+            // The dirty mutexes are locked one at a time (separate `let`s) so we
+            // never hold two of them at once — avoids any lock-ordering hazard
+            // against the consumer/CPU threads.
+            const IDLE_HEARTBEAT_FRAMES: u32 = 6; // ≥10 Hz refresh floor when idle
+            let palette_dirty = {
+                let v = self.vc2.lock().dirty;
+                let c = self.cmap0.lock().dirty;
+                let b = self.bt445.lock().dirty;
+                let x = self.xmap0.lock().dirty;
+                v || c || b || x
+            };
+            let dbg_overlay = self.draw_debug.load(Ordering::Relaxed)
+                || self.show_cmap.load(Ordering::Relaxed)
+                || self.show_disp_debug.load(Ordering::Relaxed);
+            let should_render = self.fb_dirty.swap(false, Ordering::Acquire)
+                || palette_dirty
+                || dbg_overlay
+                || topscan != last_topscan
+                || self.screenshot_pending.load(Ordering::Relaxed)
+                || frames_since_render >= IDLE_HEARTBEAT_FRAMES;
+
+            if should_render {
+                frames_since_render = 0;
+                last_topscan = topscan;
                 self.diag.fetch_or(Self::DIAG_LOCK_SCREEN, Ordering::Relaxed);
                 let mut screen = self.screen.lock();
                 screen.topscan = topscan;
@@ -3508,6 +3592,26 @@ impl Rex3 {
                     self.diag.fetch_and(!Self::DIAG_LOOP_GL_RENDER, Ordering::Relaxed);
                 }
                 self.diag.fetch_and(!(Self::DIAG_LOCK_SCREEN | Self::DIAG_LOCK_RENDERER), Ordering::Relaxed);
+            } else {
+                // Nothing visible changed — skip the full refresh + GL upload and
+                // leave the already-presented front buffer on screen. Still tick
+                // the hardware VBLANK and latch cursor-Y every frame: the guest's
+                // vsync timing must not depend on whether the host re-rendered.
+                frames_since_render = frames_since_render.saturating_add(1);
+                self.config.status.fetch_or(STATUS_VRINT, Ordering::Relaxed);
+                {
+                    self.diag.fetch_or(Self::DIAG_LOCK_VC2, Ordering::Relaxed);
+                    let mut vc2 = self.vc2.lock();
+                    vc2.regs[crate::vc2::VC2_REG_WORKING_CURSOR_Y as usize] = vc2.regs[crate::vc2::VC2_REG_CURSOR_Y_LOC as usize];
+                    drop(vc2);
+                    self.diag.fetch_and(!Self::DIAG_LOCK_VC2, Ordering::Relaxed);
+                }
+                {
+                    self.diag.fetch_or(Self::DIAG_LOCK_VBLANK_CB, Ordering::Relaxed);
+                    let cb = self.vblank_cb.lock().clone();
+                    self.diag.fetch_and(!Self::DIAG_LOCK_VBLANK_CB, Ordering::Relaxed);
+                    if let Some(cb) = cb { cb(true); }
+                }
             }
 
             // Timing & VBLANK

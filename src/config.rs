@@ -171,6 +171,14 @@ pub struct MachineConfig {
     #[serde(default = "default_prom")]
     pub prom: String,
 
+    /// Path to the NVRAM file. The emulated DS1386 NVRAM is loaded from
+    /// here at startup (if the file exists) and `iris-ci rtc-save` writes
+    /// back to it by default. Per-config NVRAM files avoid the footgun
+    /// where two configs (e.g. iris-irix53.toml and iris-irix65.toml)
+    /// otherwise share `nvram.bin` and overwrite each other's PROM env.
+    #[serde(default = "default_nvram")]
+    pub nvram: String,
+
     /// RAM bank sizes in MB. Valid values: 0 (absent), 8, 16, 32, 64, 128.
     #[serde(default = "default_banks")]
     pub banks: [u32; 4],
@@ -241,6 +249,10 @@ fn default_prom() -> String {
     "prom.bin".to_string()
 }
 
+fn default_nvram() -> String {
+    "nvram.bin".to_string()
+}
+
 fn default_banks() -> [u32; 4] {
     [128, 128, 0, 0]
 }
@@ -272,6 +284,7 @@ impl Default for MachineConfig {
     fn default() -> Self {
         Self {
             prom: default_prom(),
+            nvram: default_nvram(),
             banks: default_banks(),
             scsi: default_scsi(),
             scale: default_scale(),
@@ -371,6 +384,10 @@ pub struct Cli {
     /// Path to PROM image
     #[arg(long)]
     pub prom: Option<String>,
+
+    /// Path to NVRAM file (default: nvram.bin in cwd)
+    #[arg(long)]
+    pub nvram: Option<String>,
 
     /// RAM bank 0 size in MB (0/8/16/32/64/128)
     #[arg(long)]
@@ -490,6 +507,7 @@ impl Cli {
     /// Merge CLI overrides into a base `MachineConfig`.
     pub fn apply(&self, mut cfg: MachineConfig) -> MachineConfig {
         if let Some(p) = &self.prom    { cfg.prom = p.clone(); }
+        if let Some(p) = &self.nvram   { cfg.nvram = p.clone(); }
         if let Some(v) = self.bank0    { cfg.banks[0] = v; }
         if let Some(v) = self.bank1    { cfg.banks[1] = v; }
         if let Some(v) = self.bank2    { cfg.banks[2] = v; }

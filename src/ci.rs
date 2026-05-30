@@ -208,12 +208,14 @@ fn dispatch(server: &CiServer, req: &Request) -> Response {
 }
 
 fn cmd_rtc_save(server: &CiServer, args: &Value) -> Response {
-    let path = args.get("path").and_then(|v| v.as_str()).unwrap_or("nvram.bin").to_string();
+    let explicit_path = args.get("path").and_then(|v| v.as_str()).map(|s| s.to_string());
     let result = server.with_machine(|m| {
-        m.hpc3().rtc().save_nvram(&path)
+        let rtc = m.hpc3().rtc();
+        let path = explicit_path.clone().unwrap_or_else(|| rtc.nvram_path().to_string());
+        rtc.save_nvram(&path).map(|_| path)
     });
     match result {
-        Ok(()) => Response::data(serde_json::json!({ "path": path })),
+        Ok(path) => Response::data(serde_json::json!({ "path": path })),
         Err(e) => Response::err(format!("rtc-save: {}", e)),
     }
 }
