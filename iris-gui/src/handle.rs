@@ -114,14 +114,26 @@ impl EmulatorHandle {
     }
 
     pub fn is_running(&self) -> bool { self.status.running }
-}
 
-impl Drop for EmulatorHandle {
-    fn drop(&mut self) {
+    /// Stop the machine (if running) and join the worker thread. Idempotent.
+    /// Call this from the GUI's `on_exit` so a running machine is cleaned up
+    /// even when the user closes the window without pressing Stop — and so the
+    /// cleanup completes synchronously rather than racing process teardown.
+    /// The worker's Quit handler bounds the stop with a timeout, so this can't
+    /// hang on a wedged guest.
+    pub fn shutdown(&mut self) {
         let _ = self.cmd_tx.send(Cmd::Quit);
         if let Some(t) = self.thread.take() {
             let _ = t.join();
         }
+    }
+}
+
+impl Drop for EmulatorHandle {
+    // Backstop in case `shutdown()` wasn't called explicitly (e.g. a panic
+    // path). No-op once the worker has already been joined.
+    fn drop(&mut self) {
+        self.shutdown();
     }
 }
 

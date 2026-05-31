@@ -8,6 +8,7 @@ mod input;
 mod safe_stop;
 mod scsi_menu;
 mod settings;
+mod single_instance;
 
 use config_ui::{cfg_to_toml, show_tab, JitEnv, Tab};
 use dialogs::create_disk::CreateDiskDialog;
@@ -26,6 +27,10 @@ fn main() -> eframe::Result<()> {
     // or CI `quit`. iris-gui never wants the embedder to die from a guest event.
     // Set this once, before any worker thread can read it.
     std::env::set_var("IRIS_NO_EXIT_ON_POWEROFF", "1");
+    // Terminate a still-alive previous instance (a crash/hang or forgotten
+    // copy that would otherwise keep the monitor/serial ports bound) and claim
+    // the single-instance lock for ourselves.
+    single_instance::acquire();
     let prefs = GuiSettings::load();
     let mut viewport = egui::ViewportBuilder::default()
         .with_title("iris — SGI Indy emulator")
@@ -923,7 +928,14 @@ impl eframe::App for App {
         self.prefs.fullscreen = self.fullscreen;
         // Make sure the latest cfg lands in `machines` before save().
         if self.cfg_dirty { self.flush_machine(); } else { let _ = self.prefs.save(); }
-        self.emu.send(Cmd::Quit);
+        // Synchronously stop the machine and join the worker, so a running
+        // guest is cleaned up even if the user closed the window without
+        // pressing Stop (rather than relying on Drop ordering / racing
+        // process teardown). Bounded by the worker's stop timeout.
+        self.emu.shutdown();
+        // Release the single-instance lock so the next launch sees a clean
+        // start (a crash that skips this just leaves a stale, harmless pidfile).
+        single_instance::release();
     }
 }
 

@@ -22,7 +22,18 @@ impl Monitor {
 
     pub fn start_server(self: Arc<Self>, addr: String) {
         thread::spawn(move || {
-            let listener = TcpListener::bind(&addr).expect("Failed to bind monitor port");
+            // Fail soft (rather than panic-aborting the whole process) if the
+            // port can't be bound — most commonly because a previous machine
+            // instance's monitor thread from the same GUI session is still
+            // holding it (Machine::stop does not tear the monitor down). The
+            // machine still boots; the monitor console is just unavailable.
+            let listener = match TcpListener::bind(&addr) {
+                Ok(l) => l,
+                Err(e) => {
+                    log::warn!("monitor disabled: failed to bind {addr}: {e}");
+                    return;
+                }
+            };
             println!("Monitor listening on {}", addr);
             for stream in listener.incoming() {
                 match stream {
