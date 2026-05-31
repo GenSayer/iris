@@ -292,6 +292,18 @@ impl Wd33c93a {
         use crate::cow_disk::CowDisk;
         use crate::scsi::DiskBackend;
 
+        // Empty CD-ROM (drive present, tray empty). Stored backend=None so
+        // TEST UNIT READY / READ CAPACITY / READ return MEDIUM NOT PRESENT,
+        // while INQUIRY still advertises the drive. Use insert_disc() to
+        // mount media later.
+        if is_cdrom && path.is_empty() {
+            let mut state = self.state.lock();
+            if id < 8 {
+                state.devices[id] = Some(crate::scsi::ScsiDevice::new_empty_cdrom());
+            }
+            return Ok(());
+        }
+
         #[cfg(feature = "chd")]
         let is_chd_path = crate::chd_disk::is_chd(path);
         #[cfg(not(feature = "chd"))]
@@ -347,6 +359,29 @@ impl Wd33c93a {
             state.devices[id] = Some(ScsiDevice::new(backend, size, is_cdrom, path.to_string(), disc_list));
         }
         Ok(())
+    }
+
+    /// Mount media on a CD-ROM device (newly inserts or swaps existing).
+    /// Errors if the slot is empty, is not a CD-ROM, or the file can't open.
+    pub fn insert_disc(&self, id: usize, path: &str) -> Result<(), String> {
+        let mut state = self.state.lock();
+        match state.devices.get_mut(id).and_then(|d| d.as_mut()) {
+            None => Err(format!("No device at SCSI ID {}", id)),
+            Some(dev) if !dev.is_cdrom() => Err(format!("SCSI ID {} is not a CD-ROM", id)),
+            Some(dev) => dev.insert_media(path).map_err(|e| format!("insert_disc: {}", e)),
+        }
+    }
+
+    /// Unload media from a CD-ROM (leave the drive present but empty).
+    /// Use this when you want "drive present, no disc" rather than the
+    /// changer-cycle behaviour of `eject_disc`.
+    pub fn eject_to_empty(&self, id: usize) -> Result<(), String> {
+        let mut state = self.state.lock();
+        match state.devices.get_mut(id).and_then(|d| d.as_mut()) {
+            None => Err(format!("No device at SCSI ID {}", id)),
+            Some(dev) if !dev.is_cdrom() => Err(format!("SCSI ID {} is not a CD-ROM", id)),
+            Some(dev) => { dev.unload_media(); Ok(()) }
+        }
     }
 
     /// Eject the current disc on a CD-ROM device and advance to the next in

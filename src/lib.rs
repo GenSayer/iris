@@ -1,4 +1,19 @@
 #![allow(dead_code, unused_variables, unused_imports)]
+
+/// Compile-time feature flags exposed for tooling (e.g. iris-gui) so it can
+/// surface "CHD support required" / "camera support required" hints without
+/// duplicating the cargo feature set.
+pub mod build_features {
+    pub const CHD:       bool = cfg!(feature = "chd");
+    pub const CAMERA:    bool = cfg!(feature = "camera");
+    pub const JIT:       bool = cfg!(feature = "jit");
+    pub const REX_JIT:   bool = cfg!(feature = "rex-jit");
+    /// Lightning build strips breakpoint checks and the traceback buffer
+    /// from the MIPS executor hot path. Interactive debugging (GDB stub,
+    /// monitor breakpoints) is non-functional in this build.
+    pub const LIGHTNING: bool = cfg!(feature = "lightning");
+}
+
 pub mod config;
 pub mod traits;
 #[macro_use]

@@ -581,8 +581,13 @@ impl Machine {
                             MachineEvent::PowerOff => {
                                 println!("Machine: soft power-off");
                                 machine.stop();
+                                // Hosts that embed iris as a library (e.g. iris-gui)
+                                // set IRIS_NO_EXIT_ON_POWEROFF=1 so a guest halt
+                                // does not kill the host process.
                                 #[cfg(not(feature = "developer"))]
-                                std::process::exit(0);
+                                if std::env::var_os("IRIS_NO_EXIT_ON_POWEROFF").is_none() {
+                                    std::process::exit(0);
+                                }
                             }
                         }
                         Ok(())

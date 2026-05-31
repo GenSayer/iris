@@ -341,9 +341,10 @@ impl MachineConfig {
             if *id == 0 || *id > 7 {
                 return Err(format!("SCSI ID {} is out of range (1–7)", id));
             }
-            if dev.cdrom && dev.path.is_empty() && dev.discs.is_empty() {
-                return Err(format!("SCSI ID {} is a CD-ROM but has no disc", id));
-            }
+            // CD-ROM with empty path + no changer entries = drive present, no
+            // media loaded. This is a valid runtime state (see
+            // Wd33c93a::add_device empty-CD-ROM path / insert_disc).
+            let _ = dev; // explicitly keep the binding for future checks
         }
         Ok(())
     }
