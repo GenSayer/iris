@@ -365,6 +365,16 @@ impl Wd33c93a {
         }
     }
 
+    /// Load an arbitrary image path into a CD-ROM device and make it the active
+    /// disc immediately (medium change). Returns the loaded path.
+    pub fn load_disc(&self, id: usize, path: String) -> Result<String, String> {
+        let mut state = self.state.lock();
+        match state.devices.get_mut(id).and_then(|d| d.as_mut()) {
+            None => Err(format!("No device at SCSI ID {}", id)),
+            Some(dev) => dev.load_disc(path),
+        }
+    }
+
     /// Add a disc path at position 1 (next-after-eject) for a CD-ROM device.
     pub fn add_disc(&self, id: usize, path: String) -> Result<(), String> {
         let mut state = self.state.lock();
