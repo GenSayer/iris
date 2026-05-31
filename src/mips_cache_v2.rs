@@ -948,12 +948,13 @@ pub struct R4000Cache {
     #[cfg(all(feature = "r5k", feature = "gdc"))]
     ic_instrs: CacheVec<*const DecodedInstr>,
 
-    // R5K only: LRU bit per set for L1I and L1D.
-    // false = way0 is LRU (fill way0 next); true = way1 is LRU.
+    // R5K only: LRU bit per set for L1I and L1D, packed as a bitmap.
+    // Bit N = 0: way0 is LRU (fill way0 next); bit N = 1: way1 is LRU.
+    // 512 sets → 8 × u64, fits in one cache line.
     #[cfg(feature = "r5k")]
-    ic_lru: UnsafeCell<Box<[bool]>>,
+    ic_lru: UnsafeCell<Box<[u64]>>,
     #[cfg(feature = "r5k")]
-    dc_lru: UnsafeCell<Box<[bool]>>,
+    dc_lru: UnsafeCell<Box<[u64]>>,
 
     // Debug tracking - cache line boundaries and indices for tracked address
     #[cfg(feature = "debug_cache")]
@@ -1054,9 +1055,9 @@ impl R4000Cache {
                 vec![std::ptr::null::<DecodedInstr>(); IC_WAYS * IC_NUM_SETS * (IC_LINE / 4)]
             ),
             #[cfg(feature = "r5k")]
-            ic_lru: UnsafeCell::new(vec![false; IC_NUM_SETS].into_boxed_slice()),
+            ic_lru: UnsafeCell::new(vec![0u64; IC_NUM_SETS.div_ceil(64)].into_boxed_slice()),
             #[cfg(feature = "r5k")]
-            dc_lru: UnsafeCell::new(vec![false; DC_NUM_SETS].into_boxed_slice()),
+            dc_lru: UnsafeCell::new(vec![0u64; DC_NUM_SETS.div_ceil(64)].into_boxed_slice()),
             #[cfg(feature = "debug_cache")]
             debug_l1d_line,
             #[cfg(feature = "debug_cache")]
@@ -1194,6 +1195,24 @@ impl R4000Cache {
 
     /// Extract virtual index bits [14:12] for L2 PIdx field
     #[inline]
+    /// Read LRU bit for `set` from a packed u64 bitmap.
+    #[cfg(feature = "r5k")]
+    #[inline(always)]
+    unsafe fn lru_get(bm: *const Box<[u64]>, set: usize) -> bool {
+        let slice: &[u64] = &*bm;
+        (*slice.get_unchecked(set >> 6) >> (set & 63)) & 1 != 0
+    }
+
+    /// Set or clear LRU bit for `set` in a packed u64 bitmap.
+    #[cfg(feature = "r5k")]
+    #[inline(always)]
+    unsafe fn lru_set(bm: *mut Box<[u64]>, set: usize, val: usize) {
+        let slice: &mut [u64] = &mut *bm;
+        let word = slice.get_unchecked_mut(set >> 6);
+        let mask = 1u64 << (set & 63);
+        *word = (*word & !mask) | ((val as u64) << (set & 63));
+    }
+
     fn pidx(&self, virt_addr: u64) -> u32 {
         ((virt_addr >> L2_PIDX_VADDR_SHIFT) & L2_PIDX_VADDR_MASK as u64) as u32
     }
@@ -1682,7 +1701,7 @@ impl R4000Cache {
         #[cfg(not(feature = "r5k"))]
         let ic_eidx = set;
         #[cfg(feature = "r5k")]
-        let ic_eidx = set | (unsafe { (*self.ic_lru.get())[set] } as usize) << ICache::NUM_LINES_SHIFT;
+        let ic_eidx = set | (unsafe { Self::lru_get(self.ic_lru.get(), set) } as usize) << ICache::NUM_LINES_SHIFT;
 
         // Invalidate victim slot unconditionally — clears tag before any early return.
         self.invalidate_l1i_line(ic_eidx, false);
@@ -1795,7 +1814,7 @@ impl R4000Cache {
             }
             // Flip LRU: just-filled way becomes MRU.
             let way = ic_eidx >> ICache::NUM_LINES_SHIFT;
-            unsafe { (*self.ic_lru.get())[set] = way == 0; }
+            unsafe { Self::lru_set(self.ic_lru.get(), set, way ^ 1); }
         }
 
         self.ic.set_tag(ic_eidx, L1ITag::valid(phys_addr));
@@ -1843,7 +1862,7 @@ impl R4000Cache {
         #[cfg(feature = "r5k")]
         let (victim_way, dc_idx) = {
             let set = self.dc.get_index(virt_addr);
-            let way = unsafe { (*self.dc_lru.get())[set] } as usize;
+            let way = unsafe { Self::lru_get(self.dc_lru.get(), set) } as usize;
             (way, set | (way << DCache::NUM_LINES_SHIFT))
         };
 
@@ -1904,7 +1923,7 @@ impl R4000Cache {
 
         // R5K: flip LRU — filled way is MRU, other way is now victim
         #[cfg(feature = "r5k")]
-        unsafe { (*self.dc_lru.get())[dc_idx & DCache::NUM_LINES_MASK] = victim_way == 0; }
+        unsafe { Self::lru_set(self.dc_lru.get(), dc_idx & DCache::NUM_LINES_MASK, victim_way ^ 1); }
 
         #[cfg(feature = "debug_cache")]
         {
@@ -1948,12 +1967,12 @@ impl R4000Cache {
             let set = self.dc.get_index(virt_addr);
             if self.dc.get_tag(set).matches_phys(phys_addr) {
                 // way0 hit → way0 is MRU, way1 is LRU next
-                unsafe { (*self.dc_lru.get())[set] = true; }
+                unsafe { Self::lru_set(self.dc_lru.get(), set, 1); }
                 return 0;
             }
             if self.dc.get_tag(set | (1 << DCache::NUM_LINES_SHIFT)).matches_phys(phys_addr) {
                 // way1 hit → way1 is MRU, way0 is LRU next
-                unsafe { (*self.dc_lru.get())[set] = false; }
+                unsafe { Self::lru_set(self.dc_lru.get(), set, 0); }
                 return 1;
             }
             self.fill_l1d_line(virt_addr, phys_addr)
@@ -2094,7 +2113,7 @@ impl MipsCache for R4000Cache {
             if devlog_is_active(LogModule::L1i) && devlog_mask(LogModule::L1i) & CACHE_LOG_HIT != 0 {
                 crate::dlog!(LogModule::L1i, "hit virt={:#x} phys={:#x} set={} way=0", virt_addr, phys_addr, set);
             }
-            unsafe { (*self.ic_lru.get())[set] = true; } // way0 MRU
+            unsafe { Self::lru_set(self.ic_lru.get(), set, 1); } // way0 MRU → way1 is LRU
             set
         } else if self.ic.get_tag(set | way1_base).matches_phys(phys_addr) {
             #[cfg(feature = "developer")]
@@ -2103,7 +2122,7 @@ impl MipsCache for R4000Cache {
             if devlog_is_active(LogModule::L1i) && devlog_mask(LogModule::L1i) & CACHE_LOG_HIT != 0 {
                 crate::dlog!(LogModule::L1i, "hit virt={:#x} phys={:#x} set={} way=1", virt_addr, phys_addr, set);
             }
-            unsafe { (*self.ic_lru.get())[set] = false; } // way1 MRU
+            unsafe { Self::lru_set(self.ic_lru.get(), set, 0); } // way1 MRU → way0 is LRU
             set | way1_base
         } else {
             let way = self.fill_l1i_line(virt_addr, phys_addr);
@@ -2810,8 +2829,8 @@ impl MipsCache for R4000Cache {
         }
         #[cfg(feature = "r5k")]
         unsafe {
-            (*self.ic_lru.get()).fill(false);
-            (*self.dc_lru.get()).fill(false);
+            (*self.ic_lru.get()).fill(0u64);
+            (*self.dc_lru.get()).fill(0u64);
         }
         unsafe {
             *self.llbit.get() = false;
@@ -2902,8 +2921,8 @@ impl Resettable for R4000Cache {
         }
         #[cfg(feature = "r5k")]
         unsafe {
-            (*self.ic_lru.get()).fill(false);
-            (*self.dc_lru.get()).fill(false);
+            (*self.ic_lru.get()).fill(0u64);
+            (*self.dc_lru.get()).fill(0u64);
         }
         unsafe {
             *self.llbit.get() = false;
@@ -2941,19 +2960,24 @@ impl R4000Cache {
         t.insert("l2_data".into(),  u64_slice_to_toml(&l2_data));
         t.insert("llbit".into(),    toml::Value::Boolean(llbit));
         t.insert("lladdr".into(),   hex_u32(lladdr));
-        // R5K: save LRU state as packed u32 words (1 bit per set).
+        // R5K: save LRU state as packed u32 words (1 bit per set, same on-disk format as before).
         // ic_instrs not saved — rebuilt from l2.data on first fetch miss after restore.
         #[cfg(feature = "r5k")]
         {
-            let ic_lru = unsafe { &*self.ic_lru.get() };
-            let dc_lru = unsafe { &*self.dc_lru.get() };
-            let pack = |lru: &[bool]| -> Vec<u32> {
-                lru.chunks(32).map(|chunk| {
-                    chunk.iter().enumerate().fold(0u32, |acc, (i, &b)| acc | ((b as u32) << i))
+            let pack = |lru: &[u64], num_sets: usize| -> Vec<u32> {
+                (0..num_sets.div_ceil(32)).map(|i| {
+                    let base = i * 32;
+                    (0..32usize).filter(|&b| base + b < num_sets)
+                        .fold(0u32, |acc, b| {
+                            let set = base + b;
+                            acc | (((lru[set >> 6] >> (set & 63)) & 1) as u32) << b
+                        })
                 }).collect()
             };
-            t.insert("ic_lru".into(), u32_slice_to_toml(&pack(ic_lru)));
-            t.insert("dc_lru".into(), u32_slice_to_toml(&pack(dc_lru)));
+            let ic_lru = unsafe { &*self.ic_lru.get() };
+            let dc_lru = unsafe { &*self.dc_lru.get() };
+            t.insert("ic_lru".into(), u32_slice_to_toml(&pack(ic_lru, IC_NUM_SETS)));
+            t.insert("dc_lru".into(), u32_slice_to_toml(&pack(dc_lru, DC_NUM_SETS)));
         }
         toml::Value::Table(t)
     }
@@ -3006,17 +3030,20 @@ impl R4000Cache {
         // R5K: restore LRU bits; ic_instrs will be repopulated on first fetch miss.
         #[cfg(feature = "r5k")]
         {
-            let unpack = |packed: &[u32], dst: &mut [bool]| {
-                for (i, b) in dst.iter_mut().enumerate() {
-                    *b = (packed[i / 32] >> (i % 32)) & 1 != 0;
+            let unpack = |packed: &[u32], dst: &mut [u64], num_sets: usize| {
+                dst.fill(0);
+                for set in 0..num_sets {
+                    if (packed[set / 32] >> (set % 32)) & 1 != 0 {
+                        dst[set >> 6] |= 1u64 << (set & 63);
+                    }
                 }
             };
             let mut ic_lru_packed = vec![0u32; IC_NUM_SETS.div_ceil(32)];
             let mut dc_lru_packed = vec![0u32; DC_NUM_SETS.div_ceil(32)];
             if let Some(f) = get_field(v, "ic_lru") { load_u32_slice(f, &mut ic_lru_packed); }
             if let Some(f) = get_field(v, "dc_lru") { load_u32_slice(f, &mut dc_lru_packed); }
-            unpack(&ic_lru_packed, unsafe { &mut *self.ic_lru.get() });
-            unpack(&dc_lru_packed, unsafe { &mut *self.dc_lru.get() });
+            unpack(&ic_lru_packed, unsafe { &mut *self.ic_lru.get() }, IC_NUM_SETS);
+            unpack(&dc_lru_packed, unsafe { &mut *self.dc_lru.get() }, DC_NUM_SETS);
         }
 
         if let Some(f) = get_field(v, "llbit") {
