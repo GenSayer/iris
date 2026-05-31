@@ -5210,8 +5210,10 @@ impl<T: Tlb + Send + 'static, C: MipsCache + Send + 'static> Device for MipsCpu<
             //let mut last_time = std::time::Instant::now();
             // --- end perf sampling ---
 
-            // Idle detection + park state (see docs/idle-pause-work.md). Set
-            // IRIS_NO_IDLE to keep spinning the host CPU (for benchmarking/debug).
+            // Idle detection + park state (see docs/idle-pause-work.md). Compiled
+            // in only with the `idle-pause` feature (off by default; opt in with
+            // --features idle-pause). When compiled in, set IRIS_NO_IDLE to keep
+            // spinning the host CPU at runtime (for benchmarking/debug).
             //
             // We only park when the architectural state (PC + all GPRs) REPEATS
             // across batches. A polling/idle loop (e.g. the kernel idle loop
@@ -5220,14 +5222,19 @@ impl<T: Tlb + Send + 'static, C: MipsCache + Send + 'static> Device for MipsCpu<
             // DELAY(): `bgezl v1,-1; subu v1,v1,v0`) changes a counter every
             // iteration, so its state never repeats — we must NOT park it or
             // boot stalls. The state-repeat test distinguishes the two.
+            #[cfg(feature = "idle-pause")]
             let idle_enabled = std::env::var_os("IRIS_NO_IDLE").is_none();
             // Ring of recent architectural-state hashes (PC folded with all GPRs),
             // one per idle-suspected batch. A polling/idle loop cycles through a
             // small set of states, so a hash repeats within ~the loop period; a
             // delay loop's counter makes every state unique, so it never repeats.
+            #[cfg(feature = "idle-pause")]
             const IDLE_RING: usize = 32;
+            #[cfg(feature = "idle-pause")]
             let mut idle_ring = [0u64; IDLE_RING];
+            #[cfg(feature = "idle-pause")]
             let mut idle_ring_len = 0usize;
+            #[cfg(feature = "idle-pause")]
             let mut idle_ring_pos = 0usize;
 
             #[allow(unreachable_code)]
@@ -5267,6 +5274,7 @@ impl<T: Tlb + Send + 'static, C: MipsCache + Send + 'static> Device for MipsCpu<
                 // consistent (advancing only count would spike count_step — see
                 // docs/idle-pause-work.md §4). We never stop/restart the thread or
                 // peripherals; we just sleep in place, so the kernel is undisturbed.
+                #[cfg(feature = "idle-pause")]
                 if idle_enabled {
                     let ie = guard.core.interrupts_enabled();
                     let pending = guard.core.interrupts.load(Ordering::Relaxed) as u32;
