@@ -36,8 +36,12 @@ saves a correct frame on the 5.3 guest. (c) commit. (d) any residual sub-pixel a
 not chased — the bars/ramp look clean.
 
 **Committed/shipped (safe, keep):**
-- `src/physical.rs` uncached-`0x4000_0000`-alias fix — commit `8426efd` on branch
-  `vino-6.5-capture-engage`. Makes 6.5 capture engage + DESC fire. 5.3-neutral.
+- VINO bit-30 descriptor-pointer strip (`desc::PTR_MASK = 0x3FFF_FFF0` in
+  `src/vino.rs`). Makes 6.5 capture engage + DESC fire. 5.3-neutral. This
+  REPLACES the earlier `src/physical.rs` `alias_phys()` (commit `8426efd`):
+  the `0x4000_0000` accesses were VINO DMA, not the CPU, and there is no RAM
+  alias there on real hardware — the bit-30 JUMP control flag must be stripped
+  in VINO, not aliased across the whole physical bus. See "Fix #1" below.
 - Boot speed 292s→89s on the klindert guest (nsswitch files-first + FQDN + service
   disables) — see [[project_klindert_boot_speed]]. `src/vino.rs` is at HEAD.
 
@@ -275,20 +279,33 @@ not match it. Do not present the current reconstruction as a faithful grab.
 - **But `vlGetNextValid` times out**: the driver enables DMA, doesn't get the
   completion it waits for, tears down and retries in a tight loop forever.
 
-## Fix #1 (DONE): 0x40000000 uncached memory alias — `src/physical.rs`
+## Fix #1 (DONE): strip the descriptor bit-30 control flag in VINO — `src/vino.rs`
 
-The 6.5 driver polls the VINO descriptor/status ring through an **uncached
-alias** of low physical memory at `0x40000000`: it reads `0x48621400` to see
-the `0x80000001` STOP markers it wrote at RAM `0x08621400`
-(`0x48621cf0 − 0x40000000 = 0x08621cf0`). iris didn't map `0x40000000-`, so
-those reads hit `CpuBusErrorDevice`, returned `0xFFFFFFFF`, and flooded the log
-with `MC: CPU Error at 48621cf0` (~160k lines). 5.3's driver polled the cached
-addresses directly so this never surfaced.
+The `MC: CPU Error at 48621cf0` flood (~160k lines) was **not** a CPU access and
+there is **no 0x40000000 RAM alias** on the Indy. The accesses are VINO **DMA**:
+`descriptor_fetch` and the DMA buffer writes go *through* the `Physical` bus
+(`Vino::set_phys`), and any unmapped address VINO drives is routed to
+`CpuBusErrorDevice` — which is why it printed as a "CPU" error.
 
-Fix: `alias_phys()` in physical.rs strips bit 30 for addresses in
-`0x40000000-0x7FFFFFFF` before the device-map dispatch, so they resolve to the
-real RAM/device. Result: the MC error flood is **gone** (0 errors). This is a
-correct, standalone fix worth keeping regardless of the capture work.
+The addresses carried bit 30 because the 6.5 driver encodes descriptor/table
+pointers as `JUMP_BIT | kvtophys(addr)` (`vinoBuildJumpBugDAPS`): bit 31 is STOP,
+bit 30 is JUMP, and the address field is only bits `[29:4]`. The real lomem
+address is in the low bits (`0x4861e000 → 0x0861e000`, in RAM at
+0x08000000..0x18000000). VINO's `PTR_MASK` was `0xFFFF_FFF0`, wrongly keeping
+bits 31/30, so `start_desc_ptr`/`next_desc_ptr` retained bit 30 and VINO fetched
+at `0x4861e000` — off into unmapped space.
+
+Fix (at the source): `desc::PTR_MASK = 0x3FFF_FFF0`, so the descriptor-pointer
+register writes (`CH_NEXT_4_DESC`, `CH_DESC_TABLE_PTR`), the data-buffer write
+address, and the JUMP target all strip the control bits and resolve to real RAM.
+The JUMP target already masked `0x3FFF_FFF0`; this just makes the register path
+consistent. Result: the MC error flood is **gone** (0 errors), capture engages,
+and no physical-bus alias is needed.
+
+(Superseded the earlier `alias_phys()` approach in physical.rs, which papered
+over this by aliasing the *entire* 0x40000000-0x7FFFFFFF window for every device
+on the bus — masking the real bug and silently redirecting any other access in
+that range.)
 
 ## Client delivery is blocked at the videod level (ruled out client API)
 

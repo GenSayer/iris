@@ -604,23 +604,9 @@ impl Device for Physical {
     }
 }
 
-/// Physical 0x40000000-0x7FFFFFFF is an uncached alias of low physical memory
-/// 0x00000000-0x3FFFFFFF. IRIX 6.5 accesses the VINO DMA descriptor/status ring
-/// through this window (e.g. polls 0x48621400 for the 0x80000001 STOP markers it
-/// wrote at RAM 0x08621400). Without the alias those reads hit ErrorBus, return
-/// 0xFFFFFFFF, and the driver never sees capture completion. Strip bit 30 so the
-/// access resolves to the real address through the normal device map.
-/// (IRIX 5.3's vino driver polled the cached addresses directly, so this only
-/// surfaced on 6.5.)
-#[inline(always)]
-fn alias_phys(addr: u32) -> u32 {
-    if addr & 0xC000_0000 == 0x4000_0000 { addr & !0x4000_0000 } else { addr }
-}
-
 impl BusDevice for Physical {
     #[inline(always)]
     fn read8(&self, addr: u32) -> BusRead8 {
-        let addr = alias_phys(addr);
         let device_ptr = self.device_map[(addr >> 16) as usize];
         let r = unsafe { (*device_ptr).read8(addr) };
         #[cfg(not(feature = "lightning"))]
@@ -633,7 +619,6 @@ impl BusDevice for Physical {
 
     #[inline(always)]
     fn write8(&self, addr: u32, val: u8) -> u32 {
-        let addr = alias_phys(addr);
         let device_ptr = self.device_map[(addr >> 16) as usize];
         let ws = unsafe { (*device_ptr).write8(addr, val) };
         #[cfg(not(feature = "lightning"))]
@@ -643,7 +628,6 @@ impl BusDevice for Physical {
 
     #[inline(always)]
     fn read16(&self, addr: u32) -> BusRead16 {
-        let addr = alias_phys(addr);
         let device_ptr = self.device_map[(addr >> 16) as usize];
         let r = unsafe { (*device_ptr).read16(addr) };
         #[cfg(not(feature = "lightning"))]
@@ -656,7 +640,6 @@ impl BusDevice for Physical {
 
     #[inline(always)]
     fn write16(&self, addr: u32, val: u16) -> u32 {
-        let addr = alias_phys(addr);
         let device_ptr = self.device_map[(addr >> 16) as usize];
         let ws = unsafe { (*device_ptr).write16(addr, val) };
         #[cfg(not(feature = "lightning"))]
@@ -666,7 +649,6 @@ impl BusDevice for Physical {
 
     #[inline(always)]
     fn read32(&self, addr: u32) -> BusRead32 {
-        let addr = alias_phys(addr);
         let device_ptr = self.device_map[(addr >> 16) as usize];
         let r = unsafe { (*device_ptr).read32(addr) };
         #[cfg(not(feature = "lightning"))]
@@ -679,7 +661,6 @@ impl BusDevice for Physical {
 
     #[inline(always)]
     fn write32(&self, addr: u32, val: u32) -> u32 {
-        let addr = alias_phys(addr);
         let device_ptr = self.device_map[(addr >> 16) as usize];
         let ws = unsafe { (*device_ptr).write32(addr, val) };
         #[cfg(not(feature = "lightning"))]
@@ -689,7 +670,6 @@ impl BusDevice for Physical {
 
     #[inline(always)]
     fn read64(&self, addr: u32) -> BusRead64 {
-        let addr = alias_phys(addr);
         let device_ptr = self.device_map[(addr >> 16) as usize];
         let r = unsafe { (*device_ptr).read64(addr) };
         #[cfg(not(feature = "lightning"))]
@@ -702,7 +682,6 @@ impl BusDevice for Physical {
 
     #[inline(always)]
     fn write64(&self, addr: u32, val: u64) -> u32 {
-        let addr = alias_phys(addr);
         let device_ptr = self.device_map[(addr >> 16) as usize];
         let ws = unsafe { (*device_ptr).write64(addr, val) };
         #[cfg(not(feature = "lightning"))]
@@ -712,7 +691,6 @@ impl BusDevice for Physical {
 
     #[inline(always)]
     fn write64_masked(&self, addr: u32, val: u64, mask: u64) -> u32 {
-        let addr = alias_phys(addr);
         let device_ptr = self.device_map[(addr >> 16) as usize];
         unsafe { (*device_ptr).write64_masked(addr, val, mask) }
     }

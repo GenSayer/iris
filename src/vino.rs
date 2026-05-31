@@ -211,8 +211,15 @@ pub mod frame_rate {
 // descriptors per channel as u64 with validity/control flags in the upper half.
 
 pub mod desc {
-    /// Physical page address mask (bits [31:4], 16-byte aligned).
-    pub const PTR_MASK: u32     = 0xFFFF_FFF0;
+    /// Physical address mask (bits [29:4], 16-byte aligned). The address field of
+    /// a descriptor / descriptor-table pointer is only 30 bits wide: bits 31 and
+    /// 30 are the STOP and JUMP control bits, NOT part of the address. The 6.5
+    /// kernel encodes pointers as `JUMP_BIT | kvtophys(addr)` (see
+    /// `vinoBuildJumpBugDAPS`), so masking with this — stripping bits 31/30 — is
+    /// what recovers the real lomem address (e.g. 0x4861e000 → 0x0861e000). Indy
+    /// RAM lives at 0x08000000..0x18000000, so a legitimate address never sets
+    /// bits 31/30; there is no 0x40000000 RAM alias on the hardware.
+    pub const PTR_MASK: u32     = 0x3FFF_FFF0;
     /// Control bit: STOP — terminate DMA after this descriptor; raise DESC interrupt.
     pub const STOP_BIT: u64     = 1 << 31;
     /// Control bit: JUMP — bits [29:0] are a pointer to the next descriptor block.
@@ -557,15 +564,17 @@ impl Vino {
             chan.next_desc_ptr = chan.next_desc_ptr.wrapping_add(16);
         } else if chan.descriptors[0] & desc::JUMP_BIT != 0 {
             // The 6.5 jump-bug descriptor chain (vinoBuildJumpBugDAPS) ends most
-            // 4-descriptor groups with a JUMP whose encoded target carries a +4
-            // (sometimes +8) low-bit offset — a workaround for the hardware's
-            // 4-at-a-time descriptor-cache prefetch. The real fetch is always
-            // 16-byte-group-aligned, so that offset must be masked off; following
-            // it unaligned reads each next group 4 bytes high, dropping the first
-            // data page of every group (~181 of 300 pages reached) and scrambling
-            // the captured frame. Mask to 16 bytes so the walk stays in step and
-            // all 300 data pages land in order.
-            let target = (chan.descriptors[0] as u32) & 0x3FFF_FFF0;
+            // 4-descriptor groups with a JUMP whose encoded word is
+            // `JUMP_BIT | kvtophys(next)` and whose target carries a +4 (sometimes
+            // +8) low-bit offset — a workaround for the hardware's 4-at-a-time
+            // descriptor-cache prefetch. PTR_MASK both strips the JUMP control bit
+            // (bit 30) to recover the real lomem address and 16-byte-aligns it: the
+            // real fetch is always 16-byte-group-aligned, so the +4/+8 offset must
+            // be masked off; following it unaligned reads each next group 4 bytes
+            // high, dropping the first data page of every group (~181 of 300 pages
+            // reached) and scrambling the captured frame. Masking keeps the walk in
+            // step so all 300 data pages land in order.
+            let target = (chan.descriptors[0] as u32) & desc::PTR_MASK;
             Self::descriptor_fetch(chan, target, mem);
         }
     }
@@ -1697,6 +1706,25 @@ mod tests {
         vino.state.lock().channels[0].field_counter = 2; // second field's interrupt
         assert_eq!(vino.read_reg(reg::CHA_BASE + reg::CH_DESC_TABLE_PTR), 0x0861_e780,
             "second interlaced field reads base + field-boundary span (0x780)");
+    }
+
+    /// Descriptor-pointer registers carry the kernel's bit-30 control flag: the
+    /// 6.5 driver programs them as `JUMP_BIT | kvtophys(table)` (e.g. 0x4861e000).
+    /// The address field is only bits [29:4], so PTR_MASK must strip bits 31/30 to
+    /// recover the real lomem address (0x0861e000). This is what lets VINO DMA hit
+    /// real RAM directly — there is no 0x40000000 RAM alias on the hardware, so
+    /// the strip has to happen here at the source, not in the physical bus map.
+    #[test]
+    fn desc_pointer_registers_strip_bit30_control_flag() {
+        let vino = Vino::new();
+        let encoded = desc::JUMP_BIT as u32 | 0x0861_e000; // 0x4861e000
+        vino.write_reg(reg::CHA_BASE + reg::CH_DESC_TABLE_PTR, encoded);
+        vino.write_reg(reg::CHA_BASE + reg::CH_NEXT_4_DESC, encoded);
+        let st = vino.state.lock();
+        assert_eq!(st.channels[0].start_desc_ptr, 0x0861_e000,
+            "DESC_TABLE_PTR must mask off bit 30 → real lomem address");
+        assert_eq!(st.channels[0].next_desc_ptr, 0x0861_e000,
+            "NEXT_4_DESC must mask off bit 30 → real lomem address");
     }
 
     // ─── I2C bus tests: SAA7191 + CDMC coexist on a shared bus ───────────
