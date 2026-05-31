@@ -181,16 +181,14 @@ fn worker_loop(
                 }
             }
             Ok(Cmd::Stop) => {
-                if let Some(mut m) = machine.take() {
+                if let Some(m) = machine.take() {
                     *ps2_slot.lock() = None;
-                    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                        m.stop();
-                    }));
-                    if let Err(panic) = result {
-                        let _ = evt_tx.send(Evt::Error(format!("stop failed: {}", panic_msg(&panic))));
-                    } else {
-                        let _ = evt_tx.send(Evt::Stopped);
+                    // Always report the machine as stopped so the user regains
+                    // control, even if the stop failed or had to be abandoned.
+                    if let Err(msg) = stop_machine_timed(m) {
+                        let _ = evt_tx.send(Evt::Error(msg));
                     }
+                    let _ = evt_tx.send(Evt::Stopped);
                 } else {
                     let _ = evt_tx.send(Evt::Error("not running".into()));
                 }
@@ -244,12 +242,41 @@ fn worker_loop(
             }
             Ok(Cmd::Quit) | Err(_) => {
                 *ps2_slot.lock() = None;
-                if let Some(mut m) = machine.take() {
-                    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| m.stop()));
+                if let Some(m) = machine.take() {
+                    // Bounded so a wedged guest can't hang app exit (Drop joins
+                    // this thread). If the stop is abandoned, the process is
+                    // exiting anyway and the OS reclaims everything.
+                    let _ = stop_machine_timed(m);
                 }
                 return;
             }
         }
+    }
+}
+
+/// Stop a machine, but never block longer than `STOP_TIMEOUT`. `Machine::stop()`
+/// starts with `cpu.stop()`, which waits for the CPU thread to acknowledge the
+/// halt; a wedged guest can make that never return. We run it on a detached
+/// helper thread and give up after the timeout — the helper thread and that
+/// `Machine` then leak, but the caller (and the whole GUI) stays responsive.
+fn stop_machine_timed(m: Box<Machine>) -> Result<(), String> {
+    const STOP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+    let (done_tx, done_rx) = std::sync::mpsc::channel::<Result<(), String>>();
+    if std::thread::Builder::new()
+        .name("iris-gui-stop".into())
+        .spawn(move || {
+            let mut m = m;
+            let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| m.stop()));
+            let _ = done_tx.send(r.map_err(|p| panic_msg(&p)));
+        })
+        .is_err()
+    {
+        return Err("stop: failed to spawn worker thread".into());
+    }
+    match done_rx.recv_timeout(STOP_TIMEOUT) {
+        Ok(Ok(())) => Ok(()),
+        Ok(Err(msg)) => Err(format!("stop failed: {msg}")),
+        Err(_) => Err("stop timed out after 5s — the machine appears wedged; abandoning it".into()),
     }
 }
 

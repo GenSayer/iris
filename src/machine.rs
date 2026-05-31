@@ -379,32 +379,36 @@ impl Machine {
             crate::config::VinoStandard::Ntsc => crate::video_source::VideoStandard::Ntsc,
             crate::config::VinoStandard::Pal  => crate::video_source::VideoStandard::Pal,
         };
-        let source: Arc<dyn crate::video_source::VideoSource> = match cfg.vino.source {
+        let source: Option<Arc<dyn crate::video_source::VideoSource>> = match cfg.vino.source {
             crate::config::VinoSource::Camera => {
                 #[cfg(feature = "camera")]
                 {
                     let idx = cfg.vino.camera_index;
                     match crate::camera::CameraSource::new_with_index(standard, idx) {
-                        Ok(c)  => Arc::new(c),
+                        Ok(c)  => Some(Arc::new(c)),
                         Err(e) => {
                             eprintln!("VINO: camera {} unavailable ({}); using black source", idx, e);
-                            Arc::new(crate::video_source::BlackSource::new(standard))
+                            Some(Arc::new(crate::video_source::BlackSource::new(standard)))
                         }
                     }
                 }
                 #[cfg(not(feature = "camera"))]
                 {
                     eprintln!("VINO: source=\"camera\" set but iris was built without --features camera; using test pattern");
-                    Arc::new(crate::video_source::TestPatternSource::new(standard))
+                    Some(Arc::new(crate::video_source::TestPatternSource::new(standard)))
                 }
             }
             crate::config::VinoSource::TestPattern =>
-                Arc::new(crate::video_source::TestPatternSource::new(standard)),
+                Some(Arc::new(crate::video_source::TestPatternSource::new(standard))),
             crate::config::VinoSource::Black =>
-                Arc::new(crate::video_source::BlackSource::new(standard)),
+                Some(Arc::new(crate::video_source::BlackSource::new(standard))),
+            // Video-In disabled: no source, no DMA thread. VINO stays mapped.
+            crate::config::VinoSource::Off => None,
         };
-        phys.vino.set_source(source);
-        phys.vino.start();
+        if let Some(source) = source {
+            phys.vino.set_source(source);
+            phys.vino.start();
+        }
 
         // 5. CPU config + TLB + Executor
         let cfg = MipsCpuConfig::indy();

@@ -129,10 +129,17 @@ pub enum VinoSource {
     /// Solid black field.  Useful when you want IRIX video drivers to attach
     /// but don't want any host camera permission prompt or test pattern.
     Black,
+    /// Video-In disabled: VINO stays memory-mapped (IRIX can still probe it)
+    /// but no video source is installed and the DMA pump thread is never
+    /// started.  Use this to skip Video-In entirely.
+    Off,
 }
 
 impl Default for VinoSource {
-    fn default() -> Self { VinoSource::TestPattern }
+    // Off by default: most users don't need IndyCam, and this avoids a host
+    // camera permission prompt, the test-pattern source, and VINO's DMA pump
+    // thread. Set a source explicitly (`[vino] source = "..."`) to enable it.
+    fn default() -> Self { VinoSource::Off }
 }
 
 /// Broadcast video standard the source emits.

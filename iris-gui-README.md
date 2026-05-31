@@ -132,6 +132,16 @@ resizable — drag its left edge to trade width with the screen — and is
 dismissed with either the toolbar toggle or the **✕** in its header. It
 starts collapsed on each launch (open/closed state isn't persisted).
 
+The **Video-In** tab's source selector offers:
+
+- **off (disabled)** — the default. VINO stays memory-mapped (IRIX can
+  still probe it) but no video source is installed and the DMA pump thread
+  never starts. Use this unless you specifically need IndyCam.
+- **test_pattern** — SMPTE-style colour bars + animated luma ramp.
+- **camera** — live host camera (needs a `--features camera` build; first
+  use on macOS triggers the camera permission prompt).
+- **black** — solid black field; drivers attach but no capture.
+
 ### Keyboard shortcuts
 
 - **F11** — toggle fullscreen
@@ -242,24 +252,41 @@ pkill -f iris-gui                    # or: kill <pid> from the line above
 
 ### Safe-stop dialog
 
-Clicking **Stop** invokes `safe_stop::evaluate`. Stopping is considered
-safe iff any of:
+Clicking **Stop** invokes `safe_stop::evaluate`. The core does not expose
+live dirty-sector state, so the decision is made **from config**: an abrupt
+power-off only risks the on-disk image when some attached device writes
+through to its **base image** — i.e. a plain read-write hard disk. If one is
+attached, a modal lists the affected `scsi` IDs with **Cancel / Send IRIX
+halt / Force stop**.
 
-1. `PowerOff` event has been observed (IRIX `halt` completed).
-2. The CPU is sitting at the PROM monitor.
-3. Dirty COW overlay sector count is zero.
+If *nothing* persists guest writes to a base image, stopping won't damage the
+hard disk, so the dialog is skipped and the machine powers off immediately.
+These cases are all treated as safe:
 
-Otherwise a modal lists the failing conditions with **Cancel / Send
-IRIX halt / Force stop**. Per-CHD warnings appear when a SCSI device
-uses a `.chd` image without `overlay = true` (writes are discarded).
+- **CD-ROM** — read-only.
+- **COW overlay** (`overlay = true`) — writes go to a `{path}.overlay`
+  sidecar; the base image is never modified.
+- **Scratch volume** (`scratch = true`) — a transient host-side file.
+- **CHD** (`*.chd`) — writes go to a `.diff.chd` sidecar; the base CHD is
+  never modified.
 
 > The "Send IRIX halt" button is wired (TCP `127.0.0.1:8881` → `halt\n`).
-> The PROM / dirty-COW / PowerOff *detection signals* the modal reads
-> still default to zero — iris doesn't yet expose
-> `Machine::is_in_prom()` / `dirty_cow_sectors()` / event subscription,
-> so the dialog currently treats every running guest as "safe to stop".
-> Adding those accessors makes the dialog accurate; see the Phase C
-> notes at the bottom of this doc.
+> Note the heuristic is intentionally config-based, not runtime: it can't see
+> *whether* the guest has actually written to a read-write disk, only that one
+> is attached. Exposing `Machine::is_in_prom()` / `dirty_cow_sectors()` /
+> event subscription would let the dialog also clear a read-write disk that's
+> idle or already halted; see the Phase C notes at the bottom of this doc.
+
+### Stopping a wedged machine
+
+`Machine::stop()` begins with `cpu.stop()`, which blocks until the CPU thread
+acknowledges the halt — a thoroughly wedged guest can make that never return.
+To keep the GUI alive, the worker runs the stop on a detached helper thread
+(`handle.rs::stop_machine_timed`) and waits at most **5 s**. On timeout it
+emits an error toast and reports the machine as stopped so you regain control;
+the wedged `Machine` and helper thread are abandoned (they leak, but the OS
+reclaims them at exit). The same bound is applied on **Quit**, so closing the
+app on a hung guest can't hang exit either.
 
 ---
 
@@ -396,8 +423,10 @@ mouse routed through to the guest.
   inserts / ejects take effect on a live guest.
 - **Live status accessors**: `Machine::is_in_prom()`,
   `dirty_cow_sectors()`, and `subscribe_events() -> Receiver<…>` would
-  turn the safe-stop dialog from "any condition zero is safe" into
-  accurate corruption-risk reporting.
+  let the safe-stop dialog refine its current config-based heuristic
+  (warn whenever a read-write base-image disk is attached) into accurate
+  runtime corruption-risk reporting — e.g. clearing a read-write disk
+  that is idle or already halted.
 - **`rfd` pickers everywhere**: a few remaining text-field path entries
   in the Edit-config tabs don't have browse buttons yet.
 

@@ -4,53 +4,60 @@ use iris::config::MachineConfig;
 /// Reasons it is risky to force-stop right now.
 #[derive(Debug, Clone, Default)]
 pub struct UnsafeReasons {
-    pub irix_running: bool,
-    pub dirty_cow: usize,
-    /// SCSI IDs whose backing image is a .chd (writes lost unless overlay).
-    pub chd_no_overlay: Vec<u8>,
+    /// SCSI IDs of attached disks whose guest writes land directly in their
+    /// base image (a plain read-write HDD). Force-stopping mid-write can leave
+    /// the filesystem on these inconsistent.
+    pub writable_disks: Vec<u8>,
 }
 
 impl UnsafeReasons {
     pub fn is_empty(&self) -> bool {
-        !self.irix_running && self.dirty_cow == 0 && self.chd_no_overlay.is_empty()
+        self.writable_disks.is_empty()
     }
 }
 
 /// Evaluate whether stopping the emulator right now is safe.
-/// Safe iff: PowerOff seen, OR sitting at PROM, OR no dirty COW sectors.
-pub fn evaluate(status: &Status, cfg: &MachineConfig) -> UnsafeReasons {
+///
+/// The core does not expose live dirty-sector state, so we decide purely from
+/// config: an abrupt power-off only risks the on-disk image when some attached
+/// device persists guest writes straight into its **base image** — i.e. a
+/// plain read-write hard disk. Everything else leaves the base image untouched
+/// and is safe to power off without warning:
+///
+/// - **CD-ROM** — read-only.
+/// - **COW overlay** (`overlay = true`) — writes go to a `{path}.overlay`
+///   sidecar; the base image is never modified (delete the overlay to reset).
+/// - **Scratch volume** (`scratch = true`) — a transient host-side file, not a
+///   guest filesystem we need to protect.
+/// - **CHD** (`*.chd`) — writes go to a `.diff.chd` sidecar; the base CHD is
+///   never modified.
+///
+/// So when no attached device writes through to its base image, powering off
+/// will NOT damage the hard disk and we skip the confirmation dialog entirely.
+pub fn evaluate(_status: &Status, cfg: &MachineConfig) -> UnsafeReasons {
     let mut r = UnsafeReasons::default();
-    let safe = status.power_off_seen || status.in_prom || status.dirty_cow == 0;
-    if safe {
-        return r;
-    }
-    r.irix_running = !status.in_prom && !status.power_off_seen;
-    r.dirty_cow = status.dirty_cow;
     for (id, dev) in &cfg.scsi {
-        if dev.path.ends_with(".chd") && !dev.overlay {
-            r.chd_no_overlay.push(*id);
+        let persists_to_base = !dev.cdrom
+            && !dev.overlay
+            && !dev.scratch
+            && !dev.path.ends_with(".chd");
+        if persists_to_base {
+            r.writable_disks.push(*id);
         }
     }
-    r.chd_no_overlay.sort();
+    r.writable_disks.sort();
     r
 }
 
 /// Human-readable lines for the confirmation dialog.
 pub fn reason_lines(r: &UnsafeReasons) -> Vec<String> {
-    let mut out = Vec::new();
-    if r.irix_running {
-        out.push("IRIX is running — force-stop may corrupt the filesystem.".into());
-    }
-    if r.dirty_cow > 0 {
-        out.push(format!(
-            "{} dirty COW overlay sector(s) have not been flushed to disk.",
-            r.dirty_cow
-        ));
-    }
-    for id in &r.chd_no_overlay {
-        out.push(format!(
-            "scsi{id} is a CHD image without overlay=true — writes will be discarded."
-        ));
-    }
-    out
+    r.writable_disks
+        .iter()
+        .map(|id| {
+            format!(
+                "scsi{id} is a read-write disk image — force-stopping while IRIX \
+                 is running can corrupt its filesystem."
+            )
+        })
+        .collect()
 }

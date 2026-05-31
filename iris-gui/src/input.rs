@@ -10,7 +10,9 @@
 //! and lock it in place (`CursorGrab::Locked`); raw motion then arrives as
 //! `egui::Event::MouseMoved` deltas (eframe forwards `DeviceEvent::MouseMotion`
 //! regardless of grab), which we feed straight to the guest. Only the guest's
-//! own pointer is visible, so there is nothing to misalign. **Esc releases.**
+//! own pointer is visible, so there is nothing to misalign. **Ctrl+Alt+Esc
+//! releases** (Alt is the Option key on macOS); a chord rather than bare Esc
+//! so plain Esc still reaches the guest.
 //!
 //! While captured we also forward keyboard input to the guest; while *not*
 //! captured we forward nothing, so menu clicks and typing into the config
@@ -61,8 +63,10 @@ pub fn pump(ctx: &egui::Context, fb_rect: Rect, ps2: &Ps2Controller, state: &mut
             return;
         }
 
-        // Captured. Esc — or losing window focus (alt-tab) — releases.
-        if i.key_pressed(Key::Escape) || !i.focused {
+        // Captured. Ctrl+Alt+Esc (Alt == Option on macOS) — or losing window
+        // focus (alt-tab) — releases. Using a chord rather than bare Esc lets
+        // plain Esc reach the guest.
+        if (i.key_pressed(Key::Escape) && i.modifiers.ctrl && i.modifiers.alt) || !i.focused {
             want_release = true;
             return;
         }

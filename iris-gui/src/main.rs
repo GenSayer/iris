@@ -618,8 +618,8 @@ impl App {
         }
 
         // Pump egui input → PS/2 controller. Mouse/keyboard only reach the
-        // guest while captured (click the framebuffer to capture, Esc to
-        // release), so menu clicks and config typing don't leak in.
+        // guest while captured (click the framebuffer to capture, Ctrl+Alt+Esc
+        // to release), so menu clicks and config typing don't leak in.
         let ps2 = self.emu.ps2.lock().clone();
         if let Some(ps2) = ps2 {
             input::pump(ui.ctx(), fb_rect, &ps2, &mut self.input_state);
@@ -628,7 +628,7 @@ impl App {
         // Capture hint, drawn over the framebuffer.
         if fb_rect.is_positive() {
             let hint = if self.input_state.captured {
-                "Esc to release mouse"
+                "Ctrl+Alt+Esc to release mouse"
             } else {
                 "Click to capture mouse / keyboard"
             };

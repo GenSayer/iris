@@ -317,8 +317,10 @@ fn show_vino(ui: &mut Ui, cfg: &mut MachineConfig) {
                 VinoSource::Camera      => "camera",
                 VinoSource::TestPattern => "test_pattern",
                 VinoSource::Black       => "black",
+                VinoSource::Off         => "off (disabled)",
             })
             .show_ui(ui, |ui| {
+                ui.selectable_value(&mut cfg.vino.source, VinoSource::Off, "off (disabled)");
                 ui.selectable_value(&mut cfg.vino.source, VinoSource::TestPattern, "test_pattern");
                 let camera_label = if build_features::CAMERA {
                     "camera"
