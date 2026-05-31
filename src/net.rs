@@ -30,7 +30,13 @@ const UDP_PORT_BOOTP_SERVER: u16 = 67;
 const UDP_PORT_BOOTP_CLIENT: u16 = 68;
 const UDP_PORT_DNS:          u16 = 53;
 const UDP_PORT_PORTMAP:      u16 = 111;
+const UDP_PORT_TIME:         u16 = 37;
+const UDP_PORT_NTP:          u16 = 123;
+const TCP_PORT_TIME:         u16 = 37;
 const BOOTP_OP_REQUEST: u8      = 1;
+
+// Seconds between 1900-01-01 (NTP/RFC868 epoch) and 1970-01-01 (Unix epoch).
+const NTP_EPOCH_OFFSET: u64 = 2_208_988_800;
 
 // NFS-visible ports (what IRIX thinks the server is on)
 const NFS_VM_PORT:    u16 = 2049;
@@ -976,6 +982,10 @@ impl NatEngine {
             UDP_PORT_DNS          => self.forward_dns(src_mac, src_ip, sport, payload),
             UDP_PORT_PORTMAP if self.config.nfs.is_some()
                               => self.handle_portmap_udp(src_mac, src_ip, sport, payload),
+            UDP_PORT_TIME if dst_ip == self.config.gateway_ip
+                              => self.handle_time_udp(src_mac, src_ip, sport),
+            UDP_PORT_NTP  if dst_ip == self.config.gateway_ip
+                              => self.handle_ntp_udp(src_mac, src_ip, sport, payload),
             _ => {
                 // NFS/mountd: rewrite destination to localhost high port before NAT.
                 let real_dst = self.nfs_remap_dst(dst_ip, dport);
@@ -1057,6 +1067,92 @@ impl NatEngine {
                                  self.config.gateway_ip, client_ip, IP_PROTO_UDP, &udp);
             self.enqueue_rx(frame);
         }
+    }
+
+    // ── Time services (RFC 868 + NTP) ─────────────────────────────────────────
+
+    /// RFC 868: 32-bit big-endian seconds since 1900-01-01 00:00:00 UTC.
+    fn rfc868_time() -> [u8; 4] {
+        let unix = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        ((unix + NTP_EPOCH_OFFSET) as u32).to_be_bytes()
+    }
+
+    /// 64-bit NTP timestamp: seconds.fraction since 1900-01-01 UTC.
+    fn ntp_timestamp() -> u64 {
+        let d = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default();
+        let secs = d.as_secs() + NTP_EPOCH_OFFSET;
+        let frac = ((d.subsec_nanos() as u64) << 32) / 1_000_000_000;
+        (secs << 32) | frac
+    }
+
+    fn handle_time_udp(&mut self, client_mac: &[u8; 6], client_ip: Ipv4Addr, client_port: u16) {
+        let payload = Self::rfc868_time();
+        dlog_dev!(LogModule::Net, "NAT TIME(udp) → {}:{}", client_ip, client_port);
+        let udp = udp_packet(self.config.gateway_ip, client_ip,
+                             UDP_PORT_TIME, client_port, &payload);
+        let frame = ip_frame(client_mac, &self.config.gateway_mac,
+                             self.config.gateway_ip, client_ip, IP_PROTO_UDP, &udp);
+        self.enqueue_rx(frame);
+    }
+
+    fn handle_ntp_udp(&mut self, client_mac: &[u8; 6], client_ip: Ipv4Addr,
+                     client_port: u16, query: &[u8]) {
+        if query.len() < 48 { return; }
+        // Echo client's transmit timestamp (offset 40..48) into originate (offset 24..32).
+        let client_tx: [u8; 8] = query[40..48].try_into().unwrap();
+        dlog_dev!(LogModule::Net, "NAT NTP → {}:{}", client_ip, client_port);
+
+        let mut pkt = [0u8; 48];
+        // LI=0, VN=4, Mode=4 (server).
+        pkt[0]  = (0 << 6) | (4 << 3) | 4;
+        pkt[1]  = 1;                                // stratum=1 (primary)
+        pkt[2]  = 4;                                // poll interval (log2 16s)
+        pkt[3]  = 0xEC;                             // precision ~ 2^-20s
+        // root delay / dispersion = 0 (already)
+        pkt[12..16].copy_from_slice(b"LOCL");       // reference identifier
+        let recv = Self::ntp_timestamp();
+        pkt[16..24].copy_from_slice(&recv.to_be_bytes()); // reference timestamp
+        pkt[24..32].copy_from_slice(&client_tx);          // originate (echoed)
+        pkt[32..40].copy_from_slice(&recv.to_be_bytes()); // receive timestamp
+        let tx = Self::ntp_timestamp();
+        pkt[40..48].copy_from_slice(&tx.to_be_bytes());   // transmit timestamp
+
+        let udp = udp_packet(self.config.gateway_ip, client_ip,
+                             UDP_PORT_NTP, client_port, &pkt);
+        let frame = ip_frame(client_mac, &self.config.gateway_mac,
+                             self.config.gateway_ip, client_ip, IP_PROTO_UDP, &udp);
+        self.enqueue_rx(frame);
+    }
+
+    /// RFC 868 over TCP: full SYN-ACK / data / FIN sequence in one shot.
+    fn handle_time_tcp(&mut self, client_mac: &[u8; 6], client_ip: Ipv4Addr,
+                       client_port: u16, client_seq: u32) {
+        let gw   = self.config.gateway_ip;
+        let gmac = self.config.gateway_mac;
+        let server_isn = 0x6000_0000u32;
+        let payload = Self::rfc868_time();
+        dlog_dev!(LogModule::Net, "NAT TIME(tcp) → {}:{}", client_ip, client_port);
+        // SYN-ACK
+        let seg = tcp_segment(gw, client_ip, TCP_PORT_TIME, client_port,
+                              server_isn, client_seq, 0x12, &[]);
+        let frame = ip_frame(client_mac, &gmac, gw, client_ip, IP_PROTO_TCP, &seg);
+        self.enqueue_rx(frame);
+        // Data + PSH+ACK
+        let seg = tcp_segment(gw, client_ip, TCP_PORT_TIME, client_port,
+                              server_isn.wrapping_add(1), client_seq, 0x18, &payload);
+        let frame = ip_frame(client_mac, &gmac, gw, client_ip, IP_PROTO_TCP, &seg);
+        self.enqueue_rx(frame);
+        // FIN+ACK
+        let seg = tcp_segment(gw, client_ip, TCP_PORT_TIME, client_port,
+                              server_isn.wrapping_add(1 + payload.len() as u32),
+                              client_seq, 0x11, &[]);
+        let frame = ip_frame(client_mac, &gmac, gw, client_ip, IP_PROTO_TCP, &seg);
+        self.enqueue_rx(frame);
     }
 
     // ── NFS destination remapping ─────────────────────────────────────────────
@@ -1285,6 +1381,16 @@ impl NatEngine {
                 });
                 return;
             }
+        }
+
+        // Intercept RFC 868 time TCP (port 37) — handle inline, no NAT entry.
+        // On SYN we send SYN-ACK + the 4-byte timestamp + FIN in one burst.
+        // Subsequent ACK/FIN from guest are absorbed silently.
+        if dport == TCP_PORT_TIME && dst_ip == self.config.gateway_ip {
+            if syn && !ack {
+                self.handle_time_tcp(client_mac, src_ip, sport, seq.wrapping_add(1));
+            }
+            return;
         }
 
         // Intercept portmap TCP (port 111) — handle inline, never hits the NAT table.
