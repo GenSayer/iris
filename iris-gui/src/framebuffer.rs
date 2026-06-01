@@ -61,6 +61,15 @@ impl Renderer for CaptureRenderer {
         // `UNSIGNED_BYTE`. egui's `ColorImage::from_rgba_unmultiplied`
         // expects the same byte order, so the copy is a straight
         // reinterpret per row.
+        //
+        // BUT: REX3 does not store opacity in the high byte — it packs
+        // dither/overlay bits there (e.g. the Bayer index in rex3.rs's
+        // `bayer_pack`), so per-pixel "alpha" is effectively random. iris's
+        // own glow renderer gets away with this because its main pass draws
+        // with blending disabled; egui always composites textures with alpha
+        // blending, so a non-0xFF high byte would make the framebuffer render
+        // (near-)transparent — i.e. a black screen. Force alpha to 0xFF so the
+        // image is opaque; the high byte is meaningless for display anyway.
         for y in 0..height {
             let src_row_start = y * STRIDE;
             let src_row_end   = src_row_start + width;
@@ -78,6 +87,9 @@ impl Renderer for CaptureRenderer {
                 std::slice::from_raw_parts(src_row.as_ptr() as *const u8, src_row.len() * 4)
             };
             dst_row.copy_from_slice(src_bytes);
+            for px in dst_row.chunks_exact_mut(4) {
+                px[3] = 0xFF;
+            }
         }
 
         self.seq = self.seq.wrapping_add(1);

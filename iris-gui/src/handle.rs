@@ -18,9 +18,9 @@ pub enum Cmd {
     Quit,
 }
 
-// PowerOff and Status are emitted when iris exposes
-// `Machine::subscribe_events` / status accessors (still pending). The rest
-// are emitted by the worker on the relevant Cmd success path.
+// PowerOff is emitted when iris exposes `Machine::subscribe_events` (still
+// pending). The rest are emitted by the worker on the relevant Cmd success
+// path; Status is emitted on a periodic tick while a machine is running.
 #[allow(dead_code)]
 #[derive(Debug, Clone)]
 pub enum Evt {
@@ -100,7 +100,11 @@ impl EmulatorHandle {
         let mut out = Vec::new();
         while let Ok(evt) = self.evt_rx.try_recv() {
             if let Evt::Status(s) = &evt {
-                self.status = s.clone();
+                // The worker only knows the perf-derived fields; `running`,
+                // `power_off_seen` and `in_prom` are driven by lifecycle
+                // events, so merge rather than replace to avoid clobbering them.
+                self.status.mips = s.mips;
+                self.status.dirty_cow = s.dirty_cow;
             }
             match &evt {
                 Evt::Started => self.status.running = true,
@@ -148,8 +152,33 @@ fn worker_loop(
     ps2_slot: Arc<Mutex<Option<Arc<Ps2Controller>>>>,
 ) {
     let mut machine: Option<Box<Machine>> = None;
+    // Live MIPS estimate: read REX3's free-running cycle counter and divide
+    // the delta by wall-clock between ticks. Mirrors the status-bar math in
+    // src/disp.rs, but driven here since the GUI never runs REX3's own
+    // refresh/status-bar loop. `None` until a machine is up.
+    let mut cycles: Option<std::sync::Arc<std::sync::atomic::AtomicU64>> = None;
+    let mut prev_cycles: u64 = 0;
+    let mut prev_tick = std::time::Instant::now();
+    // Tick cadence for the status poll while idle on the command channel.
+    const STATUS_TICK: std::time::Duration = std::time::Duration::from_millis(500);
     loop {
-        match cmd_rx.recv() {
+        match cmd_rx.recv_timeout(STATUS_TICK) {
+            // Periodic tick (no command pending): refresh the MIPS estimate.
+            Err(crossbeam_channel::RecvTimeoutError::Timeout) => {
+                if let Some(c) = &cycles {
+                    let now = std::time::Instant::now();
+                    let dt = now.duration_since(prev_tick).as_secs_f64();
+                    if dt >= 0.1 {
+                        let cur = c.load(std::sync::atomic::Ordering::Relaxed);
+                        let dc = cur.wrapping_sub(prev_cycles);
+                        let mips = (dc as f64 / dt / 1_000_000.0 * 10.0).round() as f32 / 10.0;
+                        prev_cycles = cur;
+                        prev_tick = now;
+                        let _ = evt_tx.send(Evt::Status(Status { mips, ..Status::default() }));
+                    }
+                }
+                continue;
+            }
             Ok(Cmd::Start(cfg)) => {
                 if machine.is_some() {
                     let _ = evt_tx.send(Evt::Error("emulator already running".into()));
@@ -183,6 +212,13 @@ fn worker_loop(
                 match result {
                     Ok(m) => {
                         *ps2_slot.lock() = Some(m.get_ps2());
+                        // Latch REX3's cycle counter for the live MIPS estimate.
+                        cycles = m.get_rex3().map(|r| r.cycles.clone());
+                        prev_cycles = cycles
+                            .as_ref()
+                            .map(|c| c.load(std::sync::atomic::Ordering::Relaxed))
+                            .unwrap_or(0);
+                        prev_tick = std::time::Instant::now();
                         machine = Some(m);
                         let _ = evt_tx.send(Evt::Started);
                     }
@@ -195,6 +231,7 @@ fn worker_loop(
             Ok(Cmd::Stop) => {
                 if let Some(m) = machine.take() {
                     *ps2_slot.lock() = None;
+                    cycles = None;
                     // Always report the machine as stopped so the user regains
                     // control, even if the stop failed or had to be abandoned.
                     if let Err(msg) = stop_machine_timed(m) {
