@@ -2,7 +2,8 @@
 //! for egui to upload as a texture each frame.
 
 use iris::rex3::Renderer;
-use parking_lot::Mutex;
+use parking_lot::{Mutex, MutexGuard};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 /// One captured frame: tightly-packed RGBA bytes plus pixel dimensions.
@@ -18,17 +19,32 @@ pub struct Frame {
 }
 
 /// Shared latest-frame slot. The renderer writes; the GUI reads.
+///
+/// `seq` is mirrored into a lock-free atomic so the GUI can ask "is there a
+/// new frame?" on every repaint without taking the mutex or cloning the
+/// multi-MB buffer. It only locks + clones when the sequence actually moved.
 #[derive(Default, Clone)]
-pub struct FrameSink(pub Arc<Mutex<Frame>>);
+pub struct FrameSink {
+    frame: Arc<Mutex<Frame>>,
+    seq: Arc<AtomicU64>,
+}
 
 impl FrameSink {
     pub fn new() -> Self { Self::default() }
-    pub fn snapshot(&self) -> Frame { self.0.lock().clone() }
+
+    /// Lock-free latest sequence number (0 = no frame produced yet).
+    pub fn seq(&self) -> u64 { self.seq.load(Ordering::Acquire) }
+
+    /// Clone the latest frame out. Callers should gate this on `seq()` having
+    /// changed so they don't copy the whole buffer when nothing is new.
+    pub fn snapshot(&self) -> Frame { self.frame.lock().clone() }
+
+    fn lock(&self) -> MutexGuard<'_, Frame> { self.frame.lock() }
 }
 
 /// `iris::rex3::Renderer` implementation that copies each `render` call
 /// into a `FrameSink`. The REX3 refresh thread invokes us at video rate;
-/// we keep the work minimal (one stride-aware copy) so we don't stall it.
+/// we keep the work minimal (one pass) so we don't stall it.
 pub struct CaptureRenderer {
     sink: FrameSink,
     seq:  u64,
@@ -49,27 +65,20 @@ impl Renderer for CaptureRenderer {
         let needed = width.checked_mul(height).and_then(|n| n.checked_mul(4)).unwrap_or(0);
         if needed == 0 { return; }
 
-        let mut frame = self.sink.0.lock();
+        let mut frame = self.sink.lock();
         if frame.rgba.len() != needed {
             frame.rgba = vec![0u8; needed];
         }
         frame.width = width;
         frame.height = height;
 
-        // REX3 pixel layout is RGBA in u32 little-endian: R is the low
-        // byte, matching what glow uploads as `glow::RGBA` /
-        // `UNSIGNED_BYTE`. egui's `ColorImage::from_rgba_unmultiplied`
-        // expects the same byte order, so the copy is a straight
-        // reinterpret per row.
-        //
-        // BUT: REX3 does not store opacity in the high byte — it packs
-        // dither/overlay bits there (e.g. the Bayer index in rex3.rs's
-        // `bayer_pack`), so per-pixel "alpha" is effectively random. iris's
-        // own glow renderer gets away with this because its main pass draws
-        // with blending disabled; egui always composites textures with alpha
-        // blending, so a non-0xFF high byte would make the framebuffer render
-        // (near-)transparent — i.e. a black screen. Force alpha to 0xFF so the
-        // image is opaque; the high byte is meaningless for display anyway.
+        // REX3 pixel layout is RGBA in u32 little-endian: R is the low byte,
+        // matching what egui's `ColorImage::from_rgba_unmultiplied` expects.
+        // The high byte is NOT opacity — REX3 packs dither/overlay bits there
+        // (e.g. the Bayer index) — but egui composites textures with alpha
+        // blending, so we must force alpha to 0xFF or the frame renders
+        // (near-)transparent (black). Do the pack-and-opaque in a single pass
+        // per row: `word | 0xFF00_0000` writes R,G,B verbatim and A = 0xFF.
         for y in 0..height {
             let src_row_start = y * STRIDE;
             let src_row_end   = src_row_start + width;
@@ -79,21 +88,16 @@ impl Renderer for CaptureRenderer {
             let dst_row_end   = dst_row_start + width * 4;
             let dst_row       = &mut frame.rgba[dst_row_start..dst_row_end];
 
-            // Safety: u32 → 4×u8 reinterpret. We rely on little-endian
-            // host byte order to put `R, G, B, A` at consecutive
-            // addresses — iris already assumes this in `ui.rs`'s glow
-            // upload path (line 226–227), so we inherit that assumption.
-            let src_bytes = unsafe {
-                std::slice::from_raw_parts(src_row.as_ptr() as *const u8, src_row.len() * 4)
-            };
-            dst_row.copy_from_slice(src_bytes);
-            for px in dst_row.chunks_exact_mut(4) {
-                px[3] = 0xFF;
+            for (dst_px, &word) in dst_row.chunks_exact_mut(4).zip(src_row) {
+                dst_px.copy_from_slice(&(word | 0xFF00_0000).to_le_bytes());
             }
         }
 
         self.seq = self.seq.wrapping_add(1);
         frame.seq = self.seq;
+        drop(frame);
+        // Publish the new sequence after the buffer write is visible.
+        self.sink.seq.store(self.seq, Ordering::Release);
     }
 
     fn resize(&mut self, _width: usize, _height: usize) {

@@ -599,8 +599,12 @@ impl App {
     /// Draw the live REX3 framebuffer as an egui image, scaled to fit
     /// the available area while preserving aspect ratio.
     fn framebuffer_panel(&mut self, ui: &mut egui::Ui) {
-        let frame = self.emu.frame_sink.snapshot();
-        if frame.width == 0 || frame.height == 0 {
+        // Lock-free check first: only clone + re-upload the (multi-MB)
+        // framebuffer when REX3 has actually produced a new frame. Cloning on
+        // every 60 fps repaint regardless was ~300 MB/s of pointless copying
+        // and needless lock contention with the REX3 refresh thread.
+        let seq = self.emu.frame_sink.seq();
+        if seq == 0 {
             ui.centered_and_justified(|ui| {
                 ui.label(RichText::new("Emulator running — waiting for first REX3 frame…")
                     .color(Color32::LIGHT_GRAY));
@@ -608,9 +612,9 @@ impl App {
             return;
         }
 
-        // Upload (or re-upload) the texture only when a new frame has
-        // landed since the last one we drew.
-        if self.fb_tex.is_none() || frame.seq != self.last_fb_seq {
+        if self.fb_tex.is_none() || seq != self.last_fb_seq {
+            let frame = self.emu.frame_sink.snapshot();
+            if frame.width == 0 || frame.height == 0 { return; }
             let img = egui::ColorImage::from_rgba_unmultiplied(
                 [frame.width, frame.height], &frame.rgba);
             match &mut self.fb_tex {
@@ -626,7 +630,8 @@ impl App {
         let mut fb_rect = egui::Rect::NOTHING;
         if let Some(tex) = &self.fb_tex {
             let avail = ui.available_size();
-            let fb_aspect = frame.width as f32 / frame.height as f32;
+            let tex_size = tex.size_vec2();
+            let fb_aspect = tex_size.x / tex_size.y;
             let avail_aspect = avail.x / avail.y;
             let size = if avail_aspect > fb_aspect {
                 egui::vec2(avail.y * fb_aspect, avail.y)
