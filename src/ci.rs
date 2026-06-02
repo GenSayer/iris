@@ -260,7 +260,12 @@ fn cmd_quit() -> Response {
         if let Some(p) = SOCKET_PATH.lock().take() {
             let _ = std::fs::remove_file(&p);
         }
-        std::process::exit(0);
+        // Same escape hatch as the PowerOff handler: library hosts set
+        // IRIS_NO_EXIT_ON_POWEROFF=1 so a `quit` over the CI socket does
+        // not kill the embedder.
+        if std::env::var_os("IRIS_NO_EXIT_ON_POWEROFF").is_none() {
+            std::process::exit(0);
+        }
     });
     Response::ok()
 }
