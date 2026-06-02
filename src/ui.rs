@@ -2,7 +2,6 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 use parking_lot::Mutex;
 use winit::{
-    dpi::PhysicalPosition,
     event::{ElementState, Event, KeyEvent, WindowEvent, MouseButton}, event_loop::{ControlFlow, EventLoop}, keyboard::{KeyCode, PhysicalKey}, window::{Window, WindowBuilder}
 };
 use glow::HasContext;
@@ -462,10 +461,6 @@ impl Ui {
 
         let mut mouse_grabbed = false;
         let mut rctrl_held = false;
-        // Warp-to-center mouse handling: on each real CursorMoved, accumulate
-        // delta into shared MouseDelta. A 10ms timer flushes it to PS/2.
-        #[cfg(feature = "mouseabs")]
-        let mut mouse_last: Option<PhysicalPosition<f64>> = None;
         let mouse_delta = Arc::new(Mutex::new(MouseDelta { accum: (0.0, 0.0), buttons: 0 }));
 
         // 10ms recurring timer: flush accumulated mouse delta to PS/2.
@@ -525,33 +520,7 @@ impl Ui {
                                 let _ = window.set_cursor_grab(winit::window::CursorGrabMode::Confined);
                             }
                             window.set_cursor_visible(false);
-                            // Reset warp and delta state on grab.
-                            #[cfg(feature = "mouseabs")]
-                            { mouse_last = None; }
                             mouse_delta.lock().accum = (0.0, 0.0);
-                        }
-                    }
-                    #[cfg(feature = "mouseabs")]
-                    WindowEvent::CursorMoved { position, .. } => {
-                        if mouse_grabbed {
-                            let size = window.inner_size();
-                            let center = PhysicalPosition::new((size.width / 2) as f64, (size.height / 2) as f64);
-
-                            // Skip events at exactly center — those are our own warps.
-                            if position.x == center.x && position.y == center.y {
-                                mouse_last = Some(center);
-                            } else if let Some(last) = mouse_last {
-                                let dx = (position.x - last.x) / scale as f64;
-                                let dy = (position.y - last.y) / scale as f64;
-                                mouse_delta.lock().accum.0 += dx;
-                                mouse_delta.lock().accum.1 += dy;
-                                let _ = window.set_cursor_position(center);
-                                mouse_last = Some(center);
-                            } else {
-                                // First event after grab: warp to center, record it.
-                                let _ = window.set_cursor_position(center);
-                                mouse_last = Some(center);
-                            }
                         }
                     }
                     WindowEvent::Focused(false) => {
@@ -559,8 +528,6 @@ impl Ui {
                             mouse_grabbed = false;
                             let _ = window.set_cursor_grab(winit::window::CursorGrabMode::None);
                             window.set_cursor_visible(true);
-                            #[cfg(feature = "mouseabs")]
-                            { mouse_last = None; }
                         }
                     }
                     WindowEvent::RedrawRequested => {

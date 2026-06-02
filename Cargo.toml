@@ -58,7 +58,6 @@ jit = ["cranelift-codegen", "cranelift-frontend", "cranelift-jit", "cranelift-mo
 rex-jit = ["cranelift-codegen", "cranelift-frontend", "cranelift-jit", "cranelift-module", "cranelift-native"]
 # Use WindowEvent::CursorMoved for mouse motion instead of DeviceEvent::MouseMotion.
 # Useful for testing absolute cursor position tracking. May cause doubled moves on some platforms.
-mouseabs = []
 # CHD disk image support (SCSI HDDs and CD-ROMs) via libchdman-rs.
 # Off by default — enable with `cargo build --features chd`.
 chd = ["dep:libchdman-rs"]

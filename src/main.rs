@@ -128,7 +128,6 @@ fn print_build_features() {
         ("chd", cfg!(feature = "chd")),
         ("camera", cfg!(feature = "camera")),
         ("ci_clock", cfg!(feature = "ci_clock")),
-        ("mouseabs", cfg!(feature = "mouseabs")),
         ("developer", cfg!(feature = "developer")),
         ("developer_ip7", cfg!(feature = "developer_ip7")),
         ("debug_cache", cfg!(feature = "debug_cache")),
