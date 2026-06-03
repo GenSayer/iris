@@ -1318,10 +1318,8 @@ impl R4000Cache {
             let dc_data = self.dc.data();
             let l1_start_chunk = l1_idx << DCache::CHUNKS_PER_LINE_SHIFT;
             let line_base = phys_addr & !(DCache::LINE_MASK as u64);
-            for i in 0..DCache::CHUNKS_PER_LINE {
-                let addr = (line_base + ((i as u64) << 3)) as u32;
-                self.downstream.write64(addr, dc_data[l1_start_chunk + i]);
-            }
+            let src = &dc_data[l1_start_chunk..l1_start_chunk + DCache::CHUNKS_PER_LINE];
+            self.downstream.write_block(line_base as u32, src);
             let mut dc_tag: L1DTag = self.dc.get_tag(l1_idx);
             dc_tag.dirty = false;
             if dc_tag.cs == L1D_CS_DIRTY_EXCLUSIVE as u8 { dc_tag.cs = L1D_CS_CLEAN_EXCLUSIVE as u8; }
@@ -1459,14 +1457,9 @@ impl R4000Cache {
         // Now write L2 data to memory
         let l2_data = self.l2.data();
         let start_chunk = idx << L2Cache::CHUNKS_PER_LINE_SHIFT;
-
-        for i in 0..L2Cache::CHUNKS_PER_LINE {
-            let chunk_addr = phys_addr + ((i as u64) << 3);
-            let val = l2_data[start_chunk + i];
-
-            if self.downstream.write64(chunk_addr as u32, val) != BUS_OK {
-                return false; // Writeback failed
-            }
+        let src = &l2_data[start_chunk..start_chunk + L2Cache::CHUNKS_PER_LINE];
+        if self.downstream.write_block(phys_addr as u32, src) != BUS_OK {
+            return false;
         }
 
         // Change state to clean after successful writeback
@@ -1500,23 +1493,43 @@ impl R4000Cache {
         // Do not add data_as_words() accessors on L2 or fetch indexing will silently break.
         #[cfg(not(feature = "r5k"))]
         let instrs_start = l2_idx << L2Cache::INSTR_SHIFT;
-        for i in 0..L2Cache::CHUNKS_PER_LINE {
-            let fetch_addr = line_base + ((i as u64) << 3);
-            let r = self.downstream.read64(fetch_addr as u32);
-            if !r.is_ok() { return false; }
-            let val = r.data;
-            l2_data[start_chunk + i] = val;
+        if let Some(src) = self.downstream.mem_ptr(line_base as u32) {
+            // Fast path: single pass over source — rotate into l2.data and fill l2.instrs.
+            #[cfg(not(feature = "r5k"))]
+            let l2_instrs = self.l2.instrs.get_mut();
+            for i in 0..L2Cache::CHUNKS_PER_LINE {
+                let val = unsafe { (*src.add(i)).rotate_left(32) };
+                l2_data[start_chunk + i] = val;
+                #[cfg(not(feature = "r5k"))]
+                {
+                    let r0 = (val >> 32) as u32;
+                    let r1 = val as u32;
+                    let s0 = &mut l2_instrs[instrs_start + i * 2];
+                    if s0.raw != r0 { s0.decoded = false; }
+                    s0.raw = r0;
+                    let s1 = &mut l2_instrs[instrs_start + i * 2 + 1];
+                    if s1.raw != r1 { s1.decoded = false; }
+                    s1.raw = r1;
+                }
+            }
+        } else {
+            let dest = &mut l2_data[start_chunk..start_chunk + L2Cache::CHUNKS_PER_LINE];
+            let s = self.downstream.read_block(line_base as u32, dest);
+            if s != crate::traits::BUS_OK { return false; }
             #[cfg(not(feature = "r5k"))]
             {
                 let l2_instrs = self.l2.instrs.get_mut();
-                let r0 = (val >> 32) as u32;
-                let r1 = val as u32;
-                let s0 = &mut l2_instrs[instrs_start + i * 2];
-                if s0.raw != r0 { s0.decoded = false; }
-                s0.raw = r0;
-                let s1 = &mut l2_instrs[instrs_start + i * 2 + 1];
-                if s1.raw != r1 { s1.decoded = false; }
-                s1.raw = r1;
+                for i in 0..L2Cache::CHUNKS_PER_LINE {
+                    let val = dest[i];
+                    let r0 = (val >> 32) as u32;
+                    let r1 = val as u32;
+                    let s0 = &mut l2_instrs[instrs_start + i * 2];
+                    if s0.raw != r0 { s0.decoded = false; }
+                    s0.raw = r0;
+                    let s1 = &mut l2_instrs[instrs_start + i * 2 + 1];
+                    if s1.raw != r1 { s1.decoded = false; }
+                    s1.raw = r1;
+                }
             }
         }
 
@@ -1604,8 +1617,9 @@ impl R4000Cache {
                 let l2_chunk_base = (self.l2.get_index(phys_addr) << L2Cache::CHUNKS_PER_LINE_SHIFT)
                     + l2_sub_offset;
                 let l2_data = self.l2.data();
+                let src = unsafe { l2_data.as_ptr().add(l2_chunk_base) };
                 for i in 0..ICache::INSTRS_PER_LINE / 2 {
-                    let chunk = l2_data[l2_chunk_base + i];
+                    let chunk = unsafe { *src.add(i) };
                     let w0 = (chunk >> 32) as u32;
                     let w1 = chunk as u32;
                     let d0 = &mut ic_instrs[ic_slot_base + i * 2];
@@ -1618,13 +1632,29 @@ impl R4000Cache {
             } else {
                 // L2 disabled: read directly from memory.
                 let line_base = phys_addr & !(ICache::LINE_MASK as u64);
-                for i in 0..ICache::INSTRS_PER_LINE {
-                    let word_addr = (line_base + (i as u64) * 4) as u32;
-                    let r = self.downstream.read32(word_addr);
-                    let w = if r.is_ok() { r.data } else { 0 };
-                    let d = &mut ic_instrs[ic_slot_base + i];
-                    if d.raw != w { d.decoded = false; }
-                    d.raw = w;
+                if let Some(src) = self.downstream.mem_ptr(line_base as u32) {
+                    // Fast path: read word pairs directly from backing store.
+                    // mem_ptr points to rotate_left(32) u64s: high word = first instr.
+                    for i in 0..ICache::INSTRS_PER_LINE / 2 {
+                        let chunk = unsafe { *src.add(i) };
+                        let w0 = (chunk >> 32) as u32;
+                        let w1 = chunk as u32;
+                        let d0 = &mut ic_instrs[ic_slot_base + i * 2];
+                        if d0.raw != w0 { d0.decoded = false; }
+                        d0.raw = w0;
+                        let d1 = &mut ic_instrs[ic_slot_base + i * 2 + 1];
+                        if d1.raw != w1 { d1.decoded = false; }
+                        d1.raw = w1;
+                    }
+                } else {
+                    for i in 0..ICache::INSTRS_PER_LINE {
+                        let word_addr = (line_base + (i as u64) * 4) as u32;
+                        let r = self.downstream.read32(word_addr);
+                        let w = if r.is_ok() { r.data } else { 0 };
+                        let d = &mut ic_instrs[ic_slot_base + i];
+                        if d.raw != w { d.decoded = false; }
+                        d.raw = w;
+                    }
                 }
             }
             // Flip LRU: just-filled way becomes MRU.
@@ -1720,11 +1750,8 @@ impl R4000Cache {
         } else {
             // L2 disabled: copy directly from memory
             let line_base = phys_addr & !(DCache::LINE_MASK as u64);
-            for i in 0..DCache::CHUNKS_PER_LINE {
-                let addr = (line_base + (i as u64) * 8) as u32;
-                let r = self.downstream.read64(addr);
-                dc_data[dc_start_chunk + i] = if r.is_ok() { r.data } else { 0 };
-            }
+            let dest = &mut dc_data[dc_start_chunk..dc_start_chunk + DCache::CHUNKS_PER_LINE];
+            self.downstream.read_block(line_base as u32, dest);
         }
 
         self.dc.set_tag(dc_idx, L1DTag::valid(phys_addr, L1D_CS_CLEAN_EXCLUSIVE as u8, false));
