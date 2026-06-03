@@ -22,13 +22,13 @@
 //! image occupies in screen space (used only to decide where a capturing
 //! click counts).
 
-use egui::{CursorGrab, Event, Key, Modifiers, PointerButton, Rect, ViewportCommand};
+use egui::{CursorGrab, Event, Key, Modifiers, MouseWheelUnit, PointerButton, Rect, ViewportCommand};
 use iris::ps2::Ps2Controller;
 use winit::keyboard::KeyCode;
 
 pub struct InputState {
     last_mods: Modifiers,
-    last_buttons: u8,         // bit0=L, bit1=R, bit2=M
+    last_buttons: u8,         // bit0=L, bit1=R, bit2=M, bit3=B4, bit4=B5
     /// True while the host cursor is grabbed and input is routed to the guest.
     pub captured: bool,
 }
@@ -39,13 +39,14 @@ impl Default for InputState {
     }
 }
 
-pub fn pump(ctx: &egui::Context, fb_rect: Rect, ps2: &Ps2Controller, state: &mut InputState) {
+pub fn pump(ctx: &egui::Context, fb_rect: Rect, ps2: &Ps2Controller, state: &mut InputState, scroll_pixels_per_line: f64) {
     // Collect everything we need inside the input borrow, then act afterwards
     // (sending viewport commands / PS2 writes outside the `input()` closure).
     let mut want_enter = false;
     let mut want_release = false;
     let mut dx = 0.0f32;
     let mut dy = 0.0f32;
+    let mut dz = 0.0f32;
     let mut buttons = state.last_buttons;
     let mut mods = state.last_mods;
     let mut keys: Vec<(KeyCode, bool)> = Vec::new();
@@ -80,6 +81,14 @@ pub fn pump(ctx: &egui::Context, fb_rect: Rect, ps2: &Ps2Controller, state: &mut
                 Event::Key { key, pressed, .. } => {
                     if let Some(kc) = map_key(*key) { keys.push((kc, *pressed)); }
                 }
+                Event::MouseWheel { unit, delta, .. } => {
+                    let lines = match unit {
+                        MouseWheelUnit::Line => delta.y,
+                        MouseWheelUnit::Point => delta.y / scroll_pixels_per_line as f32,
+                        MouseWheelUnit::Page => delta.y * 15.0,
+                    };
+                    dz += lines;
+                }
                 _ => {}
             }
         }
@@ -88,6 +97,8 @@ pub fn pump(ctx: &egui::Context, fb_rect: Rect, ps2: &Ps2Controller, state: &mut
         if i.pointer.button_down(PointerButton::Primary)   { b |= 0x01; }
         if i.pointer.button_down(PointerButton::Secondary) { b |= 0x02; }
         if i.pointer.button_down(PointerButton::Middle)    { b |= 0x04; }
+        if i.pointer.button_down(PointerButton::Extra1)    { b |= 0x08; }
+        if i.pointer.button_down(PointerButton::Extra2)    { b |= 0x10; }
         buttons = b;
     });
 
@@ -122,10 +133,10 @@ pub fn pump(ctx: &egui::Context, fb_rect: Rect, ps2: &Ps2Controller, state: &mut
     // ---- key events ----
     for (kc, pressed) in keys { ps2.push_kb(kc, pressed); }
 
-    // ---- mouse: raw per-frame delta + button diff. ----
-    let (mdx, mdy) = (dx as i32, dy as i32);
-    if buttons != state.last_buttons || mdx != 0 || mdy != 0 {
-        send_mouse_packet(ps2, buttons, mdx, -mdy); // PS/2 Y axis is up-positive
+    // ---- mouse: raw per-frame delta + button diff + scroll. ----
+    let (mdx, mdy, mdz) = (dx as i32, dy as i32, dz as i32);
+    if buttons != state.last_buttons || mdx != 0 || mdy != 0 || mdz != 0 {
+        ps2.push_mouse_input(buttons, mdx, mdy, mdz);
         state.last_buttons = buttons;
     }
 }
@@ -187,22 +198,6 @@ pub fn force_release(ctx: &egui::Context, state: &mut InputState) {
     ctx.send_viewport_cmd(ViewportCommand::CursorGrab(CursorGrab::None));
 }
 
-/// Build and dispatch one PS/2 mouse packet. Mirrors `src/ui.rs:646–658`:
-/// byte 0 bit3 always 1, bits 2..0 are buttons (M/R/L), bit 4 = X sign,
-/// bit 5 = Y sign, bits 6/7 = X/Y overflow.
-fn send_mouse_packet(ps2: &Ps2Controller, buttons: u8, dx: i32, dy: i32) {
-    // Clamp to the 9-bit signed range expected by the protocol. Real
-    // drivers split large moves; that's fine to skip here because egui
-    // delivers small per-frame deltas.
-    let sx = dx.clamp(-256, 255);
-    let sy = dy.clamp(-256, 255);
-    let mut b0 = 0x08 | (buttons & 0x07);
-    if sx < 0 { b0 |= 0x10; }
-    if sy < 0 { b0 |= 0x20; }
-    if sx < -256 || sx > 255 { b0 |= 0x40; }
-    if sy < -256 || sy > 255 { b0 |= 0x80; }
-    ps2.push_mouse_packet(b0, sx as u8, sy as u8);
-}
 
 /// egui::Key → winit::keyboard::KeyCode. Returns None for keys iris's
 /// scancode mapper doesn't recognise (we just drop them rather than

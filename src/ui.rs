@@ -394,6 +394,7 @@ impl Renderer for GlRenderer {
 
 struct MouseDelta {
     accum: (f64, f64),
+    wheel: f64,
     buttons: u8,
 }
 
@@ -405,10 +406,11 @@ pub struct Ui {
     window_size: Arc<Mutex<Option<(u32, u32)>>>,
     timer_manager: Arc<TimerManager>,
     scale: u32,
+    scroll_pixels_per_line: f64,
 }
 
 impl Ui {
-    pub fn new(ps2: Arc<Ps2Controller>, rex3: Arc<Rex3>, timer_manager: Arc<TimerManager>, event_loop: &EventLoop<()>, scale: u32) -> Self {
+    pub fn new(ps2: Arc<Ps2Controller>, rex3: Arc<Rex3>, timer_manager: Arc<TimerManager>, event_loop: &EventLoop<()>, scale: u32, scroll_pixels_per_line: f64) -> Self {
         let w = 1024 * scale;
         let h = (768 + STATUS_BAR_HEIGHT as u32) * scale;
         let window_builder = WindowBuilder::new()
@@ -452,16 +454,16 @@ impl Ui {
 
         *rex3.renderer.lock() = Some(Box::new(renderer));
 
-        Self { ps2, rex3, window, window_size, timer_manager, scale }
+        Self { ps2, rex3, window, window_size, timer_manager, scale, scroll_pixels_per_line }
     }
 
     /// Run the UI event loop (blocks the current thread)
     pub fn run(self, event_loop: EventLoop<()>) {
-        let Ui { ps2, rex3, window, window_size, timer_manager, scale } = self;
+        let Ui { ps2, rex3, window, window_size, timer_manager, scale, scroll_pixels_per_line } = self;
 
         let mut mouse_grabbed = false;
         let mut rctrl_held = false;
-        let mouse_delta = Arc::new(Mutex::new(MouseDelta { accum: (0.0, 0.0), buttons: 0 }));
+        let mouse_delta = Arc::new(Mutex::new(MouseDelta { accum: (0.0, 0.0), wheel: 0.0, buttons: 0 }));
 
         // 10ms recurring timer: flush accumulated mouse delta to PS/2.
         {
@@ -523,6 +525,15 @@ impl Ui {
                             mouse_delta.lock().accum = (0.0, 0.0);
                         }
                     }
+                    WindowEvent::MouseWheel { delta, .. } => {
+                        if mouse_grabbed {
+                            let lines = match delta {
+                                winit::event::MouseScrollDelta::LineDelta(_, y) => y as f64,
+                                winit::event::MouseScrollDelta::PixelDelta(p) => p.y / scroll_pixels_per_line,
+                            };
+                            mouse_delta.lock().wheel += lines;
+                        }
+                    }
                     WindowEvent::Focused(false) => {
                         if mouse_grabbed {
                             mouse_grabbed = false;
@@ -556,14 +567,16 @@ impl Ui {
         let mut md = mouse_delta.lock();
         let dx = md.accum.0 as i32;
         let dy = md.accum.1 as i32;
-        if require_motion && dx == 0 && dy == 0 {
+        let dz = md.wheel as i32;
+        if require_motion && dx == 0 && dy == 0 && dz == 0 {
             return;
         }
         md.accum.0 -= dx as f64;
         md.accum.1 -= dy as f64;
+        md.wheel -= dz as f64;
         let buttons = md.buttons;
         drop(md);
-        Self::send_mouse_packet(ps2, (dx as f64, dy as f64), buttons);
+        ps2.push_mouse_input(buttons, dx, dy, dz);
     }
 
     fn handle_keyboard(ps2: &Ps2Controller, rex3: &Rex3, input: KeyEvent, grabbed: &mut bool, rctrl_held: &mut bool, window: &Window) {
@@ -593,38 +606,4 @@ impl Ui {
         }
     }
 
-    fn send_mouse_packet(ps2: &Ps2Controller, delta: (f64, f64), buttons: u8) {
-        // PS/2 mouse packet (3 bytes):
-        //   Byte 0: Yovfl Xovfl Ysign Xsign 1 M R L
-        //   Byte 1: X movement (low 8 bits of 9-bit signed value)
-        //   Byte 2: Y movement (low 8 bits of 9-bit signed value)
-        // The sign bit in byte 0 is the 9th bit, giving range -256..=255.
-        // Overflow bits are set when the value exceeds that range.
-
-        let dx = delta.0 as i32;
-        let dy = -(delta.1 as i32); // PS/2 Y is bottom-to-top
-
-        // Split movements that exceed the 9-bit signed range (-256..=255).
-        let max_axis = dx.unsigned_abs().max(dy.unsigned_abs()) as i32;
-        let limit = 255i32;
-        let steps = if max_axis > limit { (max_axis + limit - 1) / limit } else { 1 };
-        let step_x = dx / steps;
-        let step_y = dy / steps;
-        let rem_x = dx - step_x * (steps - 1);
-        let rem_y = dy - step_y * (steps - 1);
-
-        let send = |sx: i32, sy: i32| {
-            let mut b0 = 0x08u8 | (buttons & 0x07);
-            if sx < 0 { b0 |= 0x10; }
-            if sy < 0 { b0 |= 0x20; }
-            if sx < -256 || sx > 255 { b0 |= 0x40; }
-            if sy < -256 || sy > 255 { b0 |= 0x80; }
-            ps2.push_mouse_packet(b0, sx as u8, sy as u8);
-        };
-
-        for _ in 0..steps - 1 {
-            send(step_x, step_y);
-        }
-        send(rem_x, rem_y);
-    }
 }

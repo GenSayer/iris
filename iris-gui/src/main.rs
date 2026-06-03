@@ -655,7 +655,7 @@ impl App {
         // to release), so menu clicks and config typing don't leak in.
         let ps2 = self.emu.ps2.lock().clone();
         if let Some(ps2) = ps2 {
-            input::pump(ui.ctx(), fb_rect, &ps2, &mut self.input_state);
+            input::pump(ui.ctx(), fb_rect, &ps2, &mut self.input_state, self.cfg.mouse_scroll_pixels_per_line);
         }
 
         // Capture hint, drawn over the framebuffer.

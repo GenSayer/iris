@@ -5,6 +5,7 @@ fn main() {
     print_build_features();
 
     let (mut cfg, scale) = load_config();
+    let scroll_pixels_per_line = cfg.mouse_scroll_pixels_per_line;
     let headless = cfg.headless;
     let gdb_port = cfg.gdb_port;
     let ci_enabled = cfg.ci;
@@ -103,7 +104,7 @@ fn main() {
         use winit::event_loop::EventLoop;
         let event_loop = EventLoop::new().unwrap();
         let rex3 = machine.get_rex3().expect("rex3 must be present in non-headless mode");
-        let ui = Ui::new(machine.get_ps2(), rex3, machine.get_timer_manager(), &event_loop, scale);
+        let ui = Ui::new(machine.get_ps2(), rex3, machine.get_timer_manager(), &event_loop, scale, scroll_pixels_per_line);
         ui.run(event_loop);
     }
 

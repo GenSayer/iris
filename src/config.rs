@@ -263,6 +263,12 @@ pub struct MachineConfig {
     #[serde(default)]
     pub ci_display: bool,
 
+    /// Pixels of host trackpad/wheel movement that equal one PS/2 scroll
+    /// detent. Lower = faster scroll; higher = slower. Default 40.
+    /// Tune if scroll feels too fast or too slow on your hardware.
+    #[serde(default = "default_scroll_pixels_per_line")]
+    pub mouse_scroll_pixels_per_line: f64,
+
     /// Optional file path that will receive every byte emitted on ttyd1
     /// (the IRIX serial console) in `--ci` mode. Append-only. Useful for
     /// keeping a continuously-updated transcript of the install or test run.
@@ -289,6 +295,7 @@ pub struct MachineConfig {
 }
 
 fn default_ci_socket() -> String { "/tmp/iris.sock".to_string() }
+fn default_scroll_pixels_per_line() -> f64 { 40.0 }
 
 fn default_prom() -> String {
     "prom.bin".to_string()
@@ -344,6 +351,7 @@ impl Default for MachineConfig {
             ci_display: false,
             serial_log: None,
             vino: VinoConfig::default(),
+            mouse_scroll_pixels_per_line: default_scroll_pixels_per_line(),
         }
     }
 }
