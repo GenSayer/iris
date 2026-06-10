@@ -378,7 +378,7 @@ impl App {
                                 self.prefs.machines.insert(n.clone(), cfg);
                                 self.prefs.active_machine = Some(n.clone());
                                 let _ = self.prefs.save();
-                                self.toast(format!("renamed → '{n}'"));
+                                self.toast(format!("renamed -> '{n}'"));
                             }
                             ui.close_menu();
                         }
@@ -530,8 +530,10 @@ impl App {
                 ui.label(RichText::new("Ctrl+= / Ctrl+- / Ctrl+0 to zoom").weak().small());
             });
             ui.menu_button("Help", |ui| {
-                ui.label("iris-gui — SGI Indy emulator launcher");
-                ui.label(format!("iris-gui {}", env!("CARGO_PKG_VERSION")));
+                ui.label(RichText::new("IRIS — SGI Indy (MIPS R4400) Emulator").strong());
+                ui.label(format!("Version {}", env!("APP_VERSION")));
+                ui.separator();
+                ui.hyperlink_to("techomancer/iris on GitHub", "https://github.com/techomancer/iris");
                 ui.separator();
                 ui.label(RichText::new("Build features:").strong());
                 use iris::build_features as bf;
@@ -540,7 +542,6 @@ impl App {
                 ui.label(format!("  jit:       {}", if bf::JIT { "on" } else { "off" }));
                 ui.label(format!("  rex-jit:   {}", if bf::REX_JIT { "on" } else { "off" }));
                 ui.label(format!("  lightning: {}", if bf::LIGHTNING { "on (no debug)" } else { "off" }));
-                ui.hyperlink_to("README", "https://github.com/dsarfati/iris");
             });
         });
     }
@@ -563,7 +564,7 @@ impl App {
             if ui.add_enabled(running, egui::Button::new("💾 Save state")).clicked() {
                 self.emu.send(Cmd::SaveState(self.save_state_name.clone()));
             }
-            if ui.add_enabled(running, egui::Button::new("↶ Restore state")).clicked() {
+            if ui.add_enabled(running, egui::Button::new("Restore state")).clicked() {
                 self.emu.send(Cmd::RestoreState(self.restore_state_name.clone()));
             }
             ui.separator();
@@ -704,7 +705,7 @@ impl App {
             ui.label(if std::path::Path::new(&self.cfg.prom).exists() {
                 self.cfg.prom.clone()
             } else {
-                format!("{} (missing → embedded fallback)", self.cfg.prom)
+                format!("{} (missing -> embedded fallback)", self.cfg.prom)
             });
             ui.end_row();
             ui.label("NVRAM");

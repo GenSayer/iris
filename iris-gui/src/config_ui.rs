@@ -93,7 +93,7 @@ fn show_general(ui: &mut Ui, cfg: &mut MachineConfig) {
         path_row(ui, "nvram", &mut cfg.nvram, Pick::SaveFile, NVRAM_FILTERS);
         ui.end_row();
 
-        ui.label("Serial log (ttyd1 → file)");
+        ui.label("Serial log (ttyd1 -> file)");
         path_row_opt(ui, "serial_log", &mut cfg.serial_log, Pick::SaveFile, ANY_FILTERS);
         ui.end_row();
     });
@@ -212,7 +212,7 @@ fn show_disks(ui: &mut Ui, cfg: &mut MachineConfig) {
                     ui.end_row();
                 }
 
-                ui.label("Overlay (COW writes → .overlay)");
+                ui.label("Overlay (COW writes -> .overlay)");
                 ui.checkbox(&mut dev.overlay, "");
                 ui.end_row();
 
@@ -273,7 +273,7 @@ fn show_network(ui: &mut Ui, cfg: &mut MachineConfig) {
                 });
             ui.label("host");
             ui.add(DragValue::new(&mut pf.host_port).range(1..=65535));
-            ui.label("→ guest");
+            ui.label("-> guest");
             ui.add(DragValue::new(&mut pf.guest_port).range(1..=65535));
             ComboBox::from_id_salt(("bind", i))
                 .selected_text(match pf.bind { ForwardBind::Localhost => "localhost", ForwardBind::Any => "any" })
