@@ -70,7 +70,7 @@ pub fn draw(ui: &mut Ui, cfg: &MachineConfig) -> ScsiAction {
                     let overlay_label = if d.overlay {
                         "Disable COW overlay"
                     } else {
-                        "Enable COW overlay (writes → .overlay)"
+                        "Enable COW overlay (writes -> .overlay)"
                     };
                     if ui.button(overlay_label).clicked() {
                         action = ScsiAction::ToggleOverlay { id };
