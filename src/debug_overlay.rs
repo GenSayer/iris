@@ -20,7 +20,7 @@ pub struct OverlaySource<'a> {
     pub cmap:             &'a [u32; 8192],
     pub fb_rgb:           &'a [u32],
     pub fb_aux:           &'a [u32],
-    pub did:              &'a [u16],
+    pub did:              &'a [u8],
 }
 
 /// Unique DID→mode_entry observations recorded during composition.
@@ -152,7 +152,7 @@ impl DebugOverlay {
             let fb_idx  = fb_cy * 2048 + cx;
 
             let cursor_did5 = if did_idx < src.did.len() {
-                (src.did[did_idx] as u32) & 0x1F
+                src.did[did_idx] as u32
             } else { 0xFF };
             let raw_rgb = if fb_idx < src.fb_rgb.len() { src.fb_rgb[fb_idx] } else { 0 };
             let raw_aux = if fb_idx < src.fb_aux.len() { src.fb_aux[fb_idx] } else { 0 };

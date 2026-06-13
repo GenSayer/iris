@@ -1,13 +1,13 @@
 //! Headless renderer that captures the composited REX3 framebuffer into a
 //! shared buffer for egui to upload as a texture each frame.
 //!
-//! This renderer has no GL context.  It reads the composited pixels from
-//! `screen.rgba` — the CPU writeback buffer that `SwCompositor` fills —
-//! so it requires no GPU resources of its own.
+//! This renderer has no GL context.  It runs `SwCompositor::compose_pixels()`
+//! directly (CPU-only, no GL upload) and reads from the resulting pixel buffer.
 
 use iris::rex3::Renderer;
 use iris::disp::{Rex3Screen, StatusBar, StatusBarTexture, BarStats};
 use iris::debug_overlay::DebugOverlay;
+use iris::compositor::SwCompositor;
 use parking_lot::{Mutex, MutexGuard};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -49,38 +49,40 @@ impl FrameSink {
 
 /// Headless `Renderer` that captures the composited frame into a `FrameSink`.
 ///
-/// No GL context is needed: compositing is done by `SwCompositor` in the
-/// REX3 refresh thread; `screen.rgba` already contains the final pixels when
-/// `present()` is called.  We just pack them into egui-friendly RGBA bytes.
+/// Runs `SwCompositor::compose_pixels()` (CPU-only, no GL context needed) and
+/// packs the result into egui-friendly RGBA bytes.
 pub struct CaptureRenderer {
-    sink: FrameSink,
-    seq:  u64,
+    sink:       FrameSink,
+    seq:        u64,
+    compositor: SwCompositor,
 }
 
 impl CaptureRenderer {
     pub fn new(sink: FrameSink) -> Self {
-        Self { sink, seq: 0 }
+        Self { sink, seq: 0, compositor: SwCompositor::new() }
     }
 }
 
 impl Renderer for CaptureRenderer {
     fn present(
         &mut self,
-        screen:  &mut Rex3Screen,
-        _overlay: &mut DebugOverlay,
-        _status:  &mut StatusBar,
-        _sbtex:   &mut StatusBarTexture,
-        _stats:   &BarStats,
+        screen:        &mut Rex3Screen,
+        _overlay:       &mut DebugOverlay,
+        _status:        &mut StatusBar,
+        _sbtex:         &mut StatusBarTexture,
+        _stats:         &BarStats,
+        _need_readback: bool,
     ) {
-        // `screen.rgba` is the composited output written back by SwCompositor.
-        // Row stride is 2048; only the visible [0..width] columns per row matter.
         let width  = screen.width;
         let height = screen.height;
-        const STRIDE: usize = 2048;
         if width == 0 || height == 0 { return; }
-        let needed = width.checked_mul(height).and_then(|n| n.checked_mul(4)).unwrap_or(0);
-        if needed == 0 { return; }
 
+        // Run SW compositor pixel loop (no GL).
+        let src = screen.compositor_source();
+        self.compositor.compose_pixels(&src);
+        drop(src);
+
+        let needed = width * height * 4;
         let mut frame = self.sink.lock();
         if frame.rgba.len() != needed {
             frame.rgba = vec![0u8; needed];
@@ -88,18 +90,12 @@ impl Renderer for CaptureRenderer {
         frame.width  = width;
         frame.height = height;
 
-        // Pixel layout in screen.rgba: 0xFFBBGGRR (GL-native RGBA, A always 0xFF).
-        // egui's `ColorImage::from_rgba_unmultiplied` expects [R, G, B, A] bytes,
-        // which matches the little-endian byte order of the u32: just write as-is.
-        let buffer = &screen.rgba;
+        // compositor buf is stride-2048, 0xFFBBGGRR.
+        // egui wants tightly-packed [R, G, B, A] — same byte order on LE.
+        let buf = self.compositor.pixels();
         for y in 0..height {
-            let src_start = y * STRIDE;
-            let src_end   = src_start + width;
-            if src_end > buffer.len() { break; }
-            let src_row = &buffer[src_start..src_end];
-            let dst_start = y * width * 4;
-            let dst_end   = dst_start + width * 4;
-            let dst_row   = &mut frame.rgba[dst_start..dst_end];
+            let src_row = &buf[y * 2048..y * 2048 + width];
+            let dst_row = &mut frame.rgba[y * width * 4..(y + 1) * width * 4];
             for (dst_px, &word) in dst_row.chunks_exact_mut(4).zip(src_row) {
                 dst_px.copy_from_slice(&(word | 0xFF00_0000).to_le_bytes());
             }
@@ -111,7 +107,5 @@ impl Renderer for CaptureRenderer {
         self.sink.seq.store(self.seq, Ordering::Release);
     }
 
-    fn resize(&mut self, _width: usize, _height: usize) {
-        // Destination buffer resizes on the next present() based on actual dimensions.
-    }
+    fn resize(&mut self, _width: usize, _height: usize) {}
 }

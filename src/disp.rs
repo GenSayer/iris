@@ -25,7 +25,7 @@ pub struct Rex3Screen {
     pub fb_aux: Vec<u32>,
 
     // Decoded DID buffer in display coordinates (2048×1024, stride 2048)
-    pub did: Vec<u16>,
+    pub did: Vec<u8>,
 
     /// Last composited frame in CPU memory (stride 2048), filled after each present().
     /// Available for screenshots and CI pixel reads.
@@ -63,7 +63,7 @@ impl Rex3Screen {
             height:           0,
             fb_rgb:           vec![0u32; 2048 * 1024],
             fb_aux:           vec![0u32; 2048 * 1024],
-            did:              vec![0u16; 2048 * 1024],
+            did:              vec![0u8; 2048 * 1024],
             rgba:             vec![0u32; 2048 * 1024],
             vc2_ram:          vec![0u16; 32768],
             vc2_regs:         [0u16; 32],
@@ -113,7 +113,7 @@ impl Rex3Screen {
             }
 
             let entry = ram[ptr]; ptr += 1;
-            let mut current_did = (entry & 0x1F) as u16;
+            let mut current_did = (entry & 0x1F) as u8;
             let mut current_x   = 0usize;
 
             loop {
@@ -126,7 +126,7 @@ impl Rex3Screen {
                 }
                 let next_entry  = ram[ptr]; ptr += 1;
                 let next_x_raw  = ((next_entry >> 5) & 0x7FF) as usize;
-                let next_did    = (next_entry & 0x1F) as u16;
+                let next_did    = (next_entry & 0x1F) as u8;
                 let is_eol      = next_x_raw == 0x7FF;
                 let next_x      = if is_eol { effective_len } else { next_x_raw };
                 let run_end     = next_x.max(current_x).min(effective_len);

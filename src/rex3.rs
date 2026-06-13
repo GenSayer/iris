@@ -20,20 +20,24 @@ pub trait Renderer: Send {
     ///
     /// The renderer owns its compositor, debug overlay, and status bar texture.
     /// It drives the full pipeline: compose → overlay → status bar → swap.
+    /// When `need_readback` is true the renderer must populate `screen.rgba`
+    /// with the composited pixels (for screenshots) before returning.
     fn present(
         &mut self,
-        screen:   &mut crate::disp::Rex3Screen,
-        overlay:  &mut crate::debug_overlay::DebugOverlay,
-        status:   &mut crate::disp::StatusBar,
-        sbtex:    &mut crate::disp::StatusBarTexture,
-        stats:    &crate::disp::BarStats,
+        screen:        &mut crate::disp::Rex3Screen,
+        overlay:       &mut crate::debug_overlay::DebugOverlay,
+        status:        &mut crate::disp::StatusBar,
+        sbtex:         &mut crate::disp::StatusBarTexture,
+        stats:         &crate::disp::BarStats,
+        need_readback: bool,
     );
 
     fn resize(&mut self, _width: usize, _height: usize) {}
     fn stop(&mut self) {}
-    /// Return a snapshot of the last composited frame for screenshots.
-    /// Returns None if the compositor doesn't support CPU readback (e.g. pure GL path).
-    fn screenshot_pixels(&self) -> Option<Vec<u32>> { None }
+    /// Switch to GL or SW compositor at runtime. Returns the active compositor name.
+    fn switch_compositor(&mut self, _use_gl: bool) -> &'static str { "sw" }
+    /// Return a short status string: "compositor=gl shader=integer" etc.
+    fn compositor_status(&self) -> String { "compositor=sw shader=n/a".to_string() }
 }
 
 pub const REX3_SIZE: u32 = 0x2000; // 8KB
@@ -3565,7 +3569,7 @@ impl Rex3 {
                 if screen.width > 0 && screen.height > 0 {
                     if let Some(ref mut r) = *renderer {
                         self.diag.fetch_or(Self::DIAG_LOOP_GL_RENDER, Ordering::Relaxed);
-                        r.present(&mut *screen, &mut overlay, &mut status_bar, &mut sbtex, &bar_stats);
+                        r.present(&mut *screen, &mut overlay, &mut status_bar, &mut sbtex, &bar_stats, take_screenshot);
                         self.diag.fetch_and(!Self::DIAG_LOOP_GL_RENDER, Ordering::Relaxed);
                     }
 
@@ -3931,7 +3935,7 @@ impl Device for Rex3 {
             ("xmap".to_string(), "XMAP commands: xmap status | xmap debug <on|off> [DEV]".to_string()),
             ("cmap".to_string(), "CMAP commands: cmap status | cmap debug <on|off> [DEV]".to_string()),
             ("bt445".to_string(), "BT445 RAMDAC: bt445 status | bt445 identity (reset palette to linear ramp) | bt445 debug <on|off> [DEV]".to_string()),
-            ("disp".to_string(), "Display debug: disp status | disp debug <on|off>".to_string()),
+            ("disp".to_string(), "Display debug: disp status | disp debug <on|off> | disp compositor <gl|sw>".to_string()),
         ]
     }
 
@@ -4210,6 +4214,27 @@ impl Device for Rex3 {
             writeln!(writer, "  resolution: {}x{}", screen.width, screen.height).unwrap();
             writeln!(writer, "  topscan: {:03x}  (fb row {} maps to display row 0)", screen.topscan, (screen.topscan + 1) & 0x3FF).unwrap();
             writeln!(writer, "  show_disp_debug: {}", self.show_disp_debug.load(Ordering::Relaxed)).unwrap();
+            let status = if let Some(r) = self.renderer.lock().as_ref() {
+                r.compositor_status()
+            } else {
+                "no renderer".to_string()
+            };
+            writeln!(writer, "  {}", status).unwrap();
+            return Ok(());
+        }
+
+        if cmd == "disp" && args[0] == "compositor" {
+            let use_gl = match args.get(1).map(|s| *s) {
+                Some("gl") => true,
+                Some("sw") => false,
+                _ => return Err("Usage: disp compositor <gl|sw>".to_string()),
+            };
+            let active = if let Some(renderer) = self.renderer.lock().as_mut() {
+                renderer.switch_compositor(use_gl)
+            } else {
+                "no renderer"
+            };
+            writeln!(writer, "Compositor: {}", active).unwrap();
             return Ok(());
         }
 

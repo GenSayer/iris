@@ -12,6 +12,7 @@ use crate::ps2::Ps2Controller;
 use crate::rex3::{Rex3, Renderer};
 use crate::disp::{Rex3Screen, StatusBar, StatusBarTexture, BarStats, STATUS_BAR_HEIGHT};
 use crate::compositor::{Compositor, SwCompositor};
+use crate::gl_compositor::GlCompositor;
 use crate::debug_overlay::DebugOverlay;
 use crate::hptimer::{TimerManager, TimerReturn};
 use glutin::config::ConfigTemplateBuilder;
@@ -35,6 +36,8 @@ struct GlState {
     program: glow::Program,
     viewport_info_loc: Option<glow::UniformLocation>,
     scale_factor_loc:  Option<glow::UniformLocation>,
+    // true = primary texelFetch+integer shader; false = fallback UV sampler
+    integer_shader: bool,
     // Shared VAO + two VBOs: emulator quad and status-bar quad
     vao:        glow::VertexArray,
     main_vbo:   glow::Buffer,
@@ -46,10 +49,12 @@ struct GlRenderer {
     gl_config:   glutin::config::Config,
     window_size: Arc<Mutex<Option<(u32, u32)>>>,
     state:       Option<GlState>,
-    compositor:  SwCompositor,
-    current_w:   usize,
-    current_h:   usize,
-    scale:       u32,
+    compositor:  Box<dyn Compositor>,
+    use_gl_compositor: bool,
+    current_w:     usize,
+    current_h:     usize,
+    current_win_h: usize,
+    scale:         u32,
 }
 
 // Safety: GlRenderer is sent to the refresh thread where it owns and uses the GL context.
@@ -85,14 +90,18 @@ impl GlRenderer {
 
         let _ = gl_surface.set_swap_interval(&gl_context, SwapInterval::Wait(NonZeroU32::new(1).unwrap()));
 
-        let (program, viewport_info_loc, scale_factor_loc, vao, main_vbo, status_vbo) = unsafe {
+        let (program, viewport_info_loc, scale_factor_loc, integer_shader, vao, main_vbo, status_vbo) = unsafe {
+            // Vertex shader: takes pixel coords, converts to NDC via ortho uniform.
+            // ortho = vec2(win_w, win_h); (0,0)=top-left, (win_w,win_h)=bottom-right.
             let vs_src = "
                 #version 150
                 in vec2 position;
                 in vec2 tex_coord;
                 out vec2 v_tex_coord;
+                uniform vec2 ortho;
                 void main() {
-                    gl_Position = vec4(position, 0.0, 1.0);
+                    vec2 ndc = (position / ortho) * 2.0 - 1.0;
+                    gl_Position = vec4(ndc.x, -ndc.y, 0.0, 1.0);
                     v_tex_coord = tex_coord;
                 }
             ";
@@ -106,7 +115,8 @@ impl GlRenderer {
             }
 
             let fs = gl.create_shader(glow::FRAGMENT_SHADER).unwrap();
-            // Try GLSL 1.50 first (texelFetch, Core Profile compatible)
+            // Fragment shader: texelFetch using pixel coord / scale.
+            // tex_y: row 0 of texture = top of image; GL origin is bottom-left so flip.
             gl.shader_source(fs, "
                 #version 150
                 in vec2 v_tex_coord;
@@ -115,11 +125,13 @@ impl GlRenderer {
                 uniform ivec2 viewport_info[2];
                 uniform int scale_factor;
                 void main() {
-                    int tex_h      = viewport_info[0].y;
-                    int win_y_base = viewport_info[1].y;
-                    int scale      = max(scale_factor, 1);
+                    int tex_h  = viewport_info[0].y;
+                    int quad_y = viewport_info[1].y;
+                    int scale  = max(scale_factor, 1);
                     int x = int(gl_FragCoord.x) / scale;
-                    int y = (tex_h - 1) - ((int(gl_FragCoord.y) - win_y_base) / scale);
+                    // gl_FragCoord.y=0 is bottom of window; quad_y is top of this quad in pixels from bottom.
+                    int y = (int(gl_FragCoord.y) - quad_y) / scale;
+                    y = (tex_h - 1) - y;
                     color = texelFetch(tex, ivec2(x, y), 0);
                 }
             ");
@@ -176,7 +188,7 @@ impl GlRenderer {
             gl.buffer_data_size(glow::ARRAY_BUFFER, VBO_SIZE, glow::DYNAMIC_DRAW);
             Self::bind_vbo_attribs(&gl, program, status_vbo);
 
-            (program, viewport_info_loc, scale_factor_loc, vao, main_vbo, status_vbo)
+            (program, viewport_info_loc, scale_factor_loc, linked, vao, main_vbo, status_vbo)
         };
 
         self.state = Some(GlState {
@@ -186,32 +198,34 @@ impl GlRenderer {
             program,
             viewport_info_loc,
             scale_factor_loc,
+            integer_shader,
             vao,
             main_vbo,
             status_vbo,
         });
     }
 
-    // Upload a quad covering NDC [x0..x1] × [y0..y1] with UV [u0..u1] × [v0..v1].
+    // Upload a quad covering pixel rect [x0..x1] × [y0..y1] (top-left origin).
     unsafe fn upload_quad(gl: &glow::Context, vbo: glow::Buffer,
         x0: f32, y0: f32, x1: f32, y1: f32,
         u0: f32, v0: f32, u1: f32, v1: f32)
     {
         let vertices: [f32; 16] = [
-            x0, y0,  u0, v1,
-            x1, y0,  u1, v1,
-            x0, y1,  u0, v0,
-            x1, y1,  u1, v0,
+            x0, y0,  u0, v0,
+            x1, y0,  u1, v0,
+            x0, y1,  u0, v1,
+            x1, y1,  u1, v1,
         ];
         gl.bind_buffer(glow::ARRAY_BUFFER, Some(vbo));
         let u8_slice = std::slice::from_raw_parts(vertices.as_ptr() as *const u8, vertices.len() * 4);
         gl.buffer_sub_data_u8_slice(glow::ARRAY_BUFFER, 0, u8_slice);
     }
 
+    // quad_y_bottom: bottom edge of this quad in GL pixels (from bottom of window).
     unsafe fn set_viewport_info(gl: &glow::Context, loc: Option<&glow::UniformLocation>,
-        tex_w: i32, tex_h: i32, win_y_base: i32)
+        tex_w: i32, tex_h: i32, quad_y_bottom: i32)
     {
-        let info = [tex_w, tex_h, 0, win_y_base];
+        let info = [tex_w, tex_h, 0, quad_y_bottom];
         gl.uniform_2_i32_slice(loc, &info);
     }
 
@@ -232,7 +246,8 @@ impl GlRenderer {
         }
     }
 
-    // Draw a texture onto a quad, setting the appropriate viewport_info uniform.
+    // Draw a texture onto a quad.
+    // quad_y_bottom: bottom of quad in GL pixels from bottom of window.
     unsafe fn draw_tex(
         gl: &glow::Context,
         program: glow::Program,
@@ -242,14 +257,18 @@ impl GlRenderer {
         scale_factor_loc: Option<&glow::UniformLocation>,
         tex: glow::Texture,
         tex_w: i32, tex_h: i32,
-        win_y_base: i32,
+        quad_y_bottom: i32,
         scale: u32,
+        win_w: f32, win_h: f32,
     ) {
         gl.use_program(Some(program));
+        if let Some(loc) = gl.get_uniform_location(program, "ortho") {
+            gl.uniform_2_f32(Some(&loc), win_w, win_h);
+        }
         gl.bind_vertex_array(Some(vao));
         gl.bind_texture(glow::TEXTURE_2D, Some(tex));
         Self::bind_vbo_attribs(gl, program, vbo);
-        Self::set_viewport_info(gl, viewport_info_loc, tex_w, tex_h, win_y_base);
+        Self::set_viewport_info(gl, viewport_info_loc, tex_w, tex_h, quad_y_bottom);
         Self::set_scale_factor(gl, scale_factor_loc, scale);
         gl.draw_arrays(glow::TRIANGLE_STRIP, 0, 4);
     }
@@ -258,11 +277,12 @@ impl GlRenderer {
 impl Renderer for GlRenderer {
     fn present(
         &mut self,
-        screen:  &mut Rex3Screen,
-        overlay: &mut DebugOverlay,
-        status:  &mut StatusBar,
-        sbtex:   &mut StatusBarTexture,
-        stats:   &BarStats,
+        screen:        &mut Rex3Screen,
+        overlay:       &mut DebugOverlay,
+        status:        &mut StatusBar,
+        sbtex:         &mut StatusBarTexture,
+        stats:         &BarStats,
+        need_readback: bool,
     ) {
         if self.state.is_none() {
             self.init_gl();
@@ -288,62 +308,94 @@ impl Renderer for GlRenderer {
             (height + STATUS_BAR_HEIGHT) * self.scale as usize
         };
 
-        // Recompute quads when display resolution changes
-        if width != self.current_w || height != self.current_h {
+        // Recompute quads when display resolution or window size changes.
+        // Pixel coords: (0,0) = top-left, x right, y down.
+        // Main quad: top of window down to height*scale pixels.
+        // Status bar quad: height*scale down to win_h.
+        if width != self.current_w || height != self.current_h || win_h != self.current_win_h {
             self.current_w = width;
             self.current_h = height;
-            let max_u      = width  as f32 / 2048.0;
+            self.current_win_h = win_h;
+            let win_w      = (width  * self.scale as usize) as f32;
+            let main_h_px  = (height * self.scale as usize) as f32;
+            let win_h_px   = win_h as f32;
+            let max_u      = width as f32 / 2048.0;
             let max_v_main = height as f32 / 1024.0;
-            let sb_ndc_top = -1.0 + 2.0 * (STATUS_BAR_HEIGHT * self.scale as usize) as f32 / win_h as f32;
             unsafe {
+                // Main: (0,0)..(win_w, main_h_px) — top portion
                 Self::upload_quad(gl, state.main_vbo,
-                    -1.0, sb_ndc_top, 1.0, 1.0,
+                    0.0, 0.0, win_w, main_h_px,
                     0.0, 0.0, max_u, max_v_main);
+                // Status bar: (0, main_h_px)..(win_w, win_h_px) — bottom portion
                 Self::upload_quad(gl, state.status_vbo,
-                    -1.0, -1.0, 1.0, sb_ndc_top,
+                    0.0, main_h_px, win_w, win_h_px,
                     0.0, 0.0, max_u, 1.0);
             }
         }
 
+        let win_w = (width  * self.scale as usize) as f32;
+        let win_h_f = win_h as f32;
+        // quad_y_bottom for main = STATUS_BAR_HEIGHT*scale pixels from GL bottom
+        let main_quad_y_bottom = (STATUS_BAR_HEIGHT as u32 * self.scale) as i32;
+
+        let win_w_i   = (width * self.scale as usize) as i32;
+        let win_h_i   = win_h as i32;
+        let sb_h      = (STATUS_BAR_HEIGHT as u32 * self.scale) as i32;
+        let main_h_i  = win_h_i - sb_h;
+
         unsafe {
+            // ── Compositor runs first — it sets its own FBO/viewport ─────────
+            let src      = screen.compositor_source();
+            let main_tex = self.compositor.compose(&src, gl);
+
+            // Restore full-window viewport/scissor — compositor FBO left them dirty.
+            gl.viewport(0, 0, win_w_i, win_h_i);
+            gl.enable(glow::SCISSOR_TEST);
+            gl.scissor(0, 0, win_w_i, win_h_i);
+            gl.clear_color(0.0, 0.0, 0.0, 1.0);
+            gl.clear(glow::COLOR_BUFFER_BIT);
+
             gl.use_program(Some(state.program));
             gl.bind_vertex_array(Some(state.vao));
 
-            // ── Pass 1: compositor → main texture (opaque) ──────────────────
-            gl.disable(glow::BLEND);
-            let src      = screen.compositor_source();
-            let main_tex = self.compositor.compose(&src, gl);
-            // Write back CPU pixels for screenshots / CI reads
-            if let Some(pixels) = self.compositor.read_pixels() {
-                screen.rgba.copy_from_slice(pixels);
+            if need_readback {
+                if let Some(pixels) = self.compositor.read_pixels() {
+                    screen.rgba.copy_from_slice(pixels);
+                } else {
+                    self.compositor.readback_to_screen(&mut screen.rgba, width, height, gl);
+                }
             }
             Self::draw_tex(
                 gl, state.program, state.vao, state.main_vbo,
                 state.viewport_info_loc.as_ref(), state.scale_factor_loc.as_ref(),
                 main_tex,
                 width as i32, height as i32,
-                (STATUS_BAR_HEIGHT as u32 * self.scale) as i32,
+                main_quad_y_bottom,
                 self.scale,
+                win_w, win_h_f,
             );
 
             // ── Pass 2: debug overlay (alpha-blended) ────────────────────────
             if overlay.active() {
                 gl.enable(glow::BLEND);
                 gl.blend_func(glow::SRC_ALPHA, glow::ONE_MINUS_SRC_ALPHA);
-                let ov_src   = screen.overlay_source();
-                let ov_tex   = overlay.render(&ov_src, gl);
+                let ov_src = screen.overlay_source();
+                let ov_tex = overlay.render(&ov_src, gl);
                 Self::draw_tex(
                     gl, state.program, state.vao, state.main_vbo,
                     state.viewport_info_loc.as_ref(), state.scale_factor_loc.as_ref(),
                     ov_tex,
                     width as i32, height as i32,
-                    (STATUS_BAR_HEIGHT as u32 * self.scale) as i32,
+                    main_quad_y_bottom,
                     self.scale,
+                    win_w, win_h_f,
                 );
                 gl.disable(glow::BLEND);
             }
 
             // ── Pass 3: status bar (opaque, bottom of window) ────────────────
+            // Scissor: status bar area = 0..sb_h (GL y from bottom)
+            gl.scissor(0, 0, win_w_i, sb_h);
             let sb_tex = sbtex.render_and_upload(status, stats, width, gl);
             Self::draw_tex(
                 gl, state.program, state.vao, state.status_vbo,
@@ -352,7 +404,10 @@ impl Renderer for GlRenderer {
                 width as i32, STATUS_BAR_HEIGHT as i32,
                 0,
                 self.scale,
+                win_w, win_h_f,
             );
+
+            gl.disable(glow::SCISSOR_TEST);
 
             state.surface.swap_buffers(&state.context).unwrap();
         }
@@ -369,13 +424,37 @@ impl Renderer for GlRenderer {
         if let Some(state) = self.state.take() {
             self.compositor.destroy(&state.gl);
         }
-        self.current_w = 0;
-        self.current_h = 0;
+        self.current_w     = 0;
+        self.current_h     = 0;
+        self.current_win_h = 0;
     }
 
-    fn screenshot_pixels(&self) -> Option<Vec<u32>> {
-        self.compositor.read_pixels().map(|s| s.to_vec())
+    fn compositor_status(&self) -> String {
+        let comp = if self.use_gl_compositor { "gl" } else { "sw" };
+        let shader = match &self.state {
+            Some(s) => if s.integer_shader { "integer(texelFetch)" } else { "fallback(UV sampler)" },
+            None => "not-initialized",
+        };
+        format!("compositor={} shader={}", comp, shader)
     }
+
+    fn switch_compositor(&mut self, use_gl: bool) -> &'static str {
+        if use_gl == self.use_gl_compositor {
+            return if use_gl { "gl" } else { "sw" };
+        }
+        self.use_gl_compositor = use_gl;
+        if let Some(state) = &self.state {
+            self.compositor.destroy(&state.gl);
+        }
+        if use_gl {
+            self.compositor = Box::new(GlCompositor::new());
+            "gl"
+        } else {
+            self.compositor = Box::new(SwCompositor::new());
+            "sw"
+        }
+    }
+
 }
 
 struct MouseDelta {
@@ -429,9 +508,11 @@ impl Ui {
             gl_config,
             window_size: window_size.clone(),
             state:       None,
-            compositor:  SwCompositor::new(),
-            current_w:   0,
-            current_h:   0,
+            compositor:       Box::new(GlCompositor::new()),
+            use_gl_compositor: true,
+            current_w:     0,
+            current_h:     0,
+            current_win_h: 0,
             scale,
         };
 

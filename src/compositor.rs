@@ -10,7 +10,7 @@ pub struct CompositorSource<'a> {
     pub fb_aux:           &'a [u32],
     /// Decoded DID buffer in *display* coordinates, 2048×1024, stride 2048.
     /// Rex3Screen::decode_did() fills this before calling compose().
-    pub did:              &'a [u16],
+    pub did:              &'a [u8],
     /// XMAP9 mode table (32 entries × 24-bit word)
     pub xmap_mode:        &'a [u32; 32],
     pub xmap_config:      u8,
@@ -58,6 +58,11 @@ pub trait Compositor: Send {
     /// Return a CPU copy of the last composited frame for screenshots.
     /// Default: not supported (returns None).
     fn read_pixels(&self) -> Option<&[u32]> { None }
+
+    /// Read the composited frame back to CPU memory, writing into `dst` (stride-2048,
+    /// layout matching `screen.rgba`).  Only called on screenshot requests.
+    /// Default no-op (SwCompositor uses `read_pixels()` instead).
+    fn readback_to_screen(&self, _dst: &mut [u32], _width: usize, _height: usize, _gl: &glow::Context) {}
 }
 
 // ── Software compositor ──────────────────────────────────────────────────────
@@ -79,6 +84,9 @@ impl SwCompositor {
         }
     }
 
+    /// Raw composited pixel buffer (stride 2048, 0xFFBBGGRR). Valid after `compose_pixels()`.
+    pub fn pixels(&self) -> &[u32] { &self.buf }
+
     fn ensure_tex(&mut self, gl: &glow::Context) -> glow::Texture {
         if let Some(t) = self.tex { return t; }
         let t = unsafe {
@@ -95,8 +103,11 @@ impl SwCompositor {
     }
 }
 
-impl Compositor for SwCompositor {
-    fn compose(&mut self, src: &CompositorSource<'_>, gl: &glow::Context) -> glow::Texture {
+impl SwCompositor {
+    /// Run the per-pixel composition loop into `self.buf`. No GL calls.
+    /// After this, `self.buf` holds the composited frame; call `upload_gl` to
+    /// push it to the GPU, or read `self.buf` directly for CPU readback.
+    pub fn compose_pixels(&mut self, src: &CompositorSource<'_>) {
         use crate::vc2::{
             VC2_REG_CURRENT_CURSOR_X, VC2_REG_WORKING_CURSOR_Y, VC2_REG_CURSOR_ENTRY_PTR,
             VC2_REG_DISPLAY_CONTROL, VC2_CTRL_CURSOR_EN, VC2_CTRL_CURSOR_SIZE,
@@ -138,7 +149,7 @@ impl Compositor for SwCompositor {
                 let fb_x    = x + fb_x_offset_u;
                 let idx     = fb_y * 2048 + fb_x;
                 let out_idx = y    * 2048 + x;
-                let did5    = (did_buf[y * 2048 + fb_x] & 0x1F) as u8;
+                let did5    = did_buf[y * 2048 + fb_x];
                 let mode_entry = ModeEntry(xmap_mode[did5 as usize]);
 
                 let pix_mode     = mode_entry.pix_mode();
@@ -227,6 +238,14 @@ impl Compositor for SwCompositor {
                 buf[out_idx] = 0xFF000000 | (r_out << 16) | (g_out << 8) | b_out;
             }
         }
+    }
+}
+
+impl Compositor for SwCompositor {
+    fn compose(&mut self, src: &CompositorSource<'_>, gl: &glow::Context) -> glow::Texture {
+        let width  = src.width;
+        let height = src.height;
+        self.compose_pixels(src);
 
         // Upload to GL texture
         let tex = self.ensure_tex(gl);
