@@ -56,11 +56,16 @@ boots to a usable system: shell, networking, X11, the works.
 
 ## Getting started
 
+Super easy mode -> Thanks to Dani we have Windows/Mac/Linux builds at https://github.com/danifunker/iris/releases
+So if you dont feel comfortable building it yourself, please head there. Also, he submitted IRIS-GUI to Mac App Store!
+
 You need:
 - A hard-disk image with IRIX 6.5.22 for Indy. To produce one, follow
   `docs/irix-6.5.22-install.md` (install from the original 6.5.22 media
   CDs into an empty CHD/raw disk).
 - `070-9101-011.bin` — Indy PROM image (optional; a default is embedded)
+
+Now, if you feel like typing some commands in console. Sync the project and:
 
 ```
 cargo run --release
@@ -68,14 +73,13 @@ cargo run --release
 
 Build variants:
 ```
+cargo run --release --features lightning,rex-jit     # recommended for best speed right now
 cargo run --release --features lightning             # disable emulator breakpoints for a little bit more speed
-cargo run --release --features jit                   # enable Cranelift MIPS JIT compiler
 cargo run --release --features rex-jit               # enable REX3 graphics JIT compiler
-cargo run --release --features tlbvmap               # enable 8k slot to tlb entry map (increases cache use but may help depending on host cpu arch)
+cargo run --release --features jit                   # enable Cranelift MIPS JIT compiler
 cargo run --release --features ci_clock              # synthetic deterministic CP0 Compare clock (CI/snapshot validator only; loses realtime desktop timing)
 cargo run --release --features chd                   # mount .chd disk/CD-ROM images directly (via libchdman-rs); off by default to keep builds light
 cargo run --release --features camera                # use host camera as the IndyCam video source (macOS AVFoundation via nokhwa). See [vino] in iris.toml.
-cargo run --release --features lightning,rex-jit,tlbvmap     # recommended for best speed right now
 ```
 
 ### CHD image support (`--features chd`)
