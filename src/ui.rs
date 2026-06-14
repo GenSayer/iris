@@ -32,29 +32,36 @@ struct GlState {
     gl: glow::Context,
     context: PossiblyCurrentContext,
     surface: Surface<WindowSurface>,
-    // Shader program: one program for all draw passes (texelFetch + y-flip)
-    program: glow::Program,
-    viewport_info_loc: Option<glow::UniformLocation>,
-    scale_factor_loc:  Option<glow::UniformLocation>,
-    // true = primary texelFetch+integer shader; false = fallback UV sampler
-    integer_shader: bool,
+    // Integer texelFetch shader (used at 1x and 2x exact scales)
+    integer_program:      glow::Program,
+    viewport_info_loc:    Option<glow::UniformLocation>,
+    scale_factor_loc:     Option<glow::UniformLocation>,
+    // Fallback UV sampler shader with mipmap/trilinear (used at non-integer scales)
+    fallback_program:     glow::Program,
+    fallback_tex_loc:     Option<glow::UniformLocation>,
+    fallback_ortho_loc:   Option<glow::UniformLocation>,
     // Shared VAO + two VBOs: emulator quad and status-bar quad
     vao:        glow::VertexArray,
     main_vbo:   glow::Buffer,
     status_vbo: glow::Buffer,
 }
 
+// Snap-to request from event thread to render thread
+#[derive(Clone, Copy, PartialEq)]
+enum ScaleSnap { Scale1x, Scale2x }
+
 struct GlRenderer {
     window:      Arc<Window>,
     gl_config:   glutin::config::Config,
     window_size: Arc<Mutex<Option<(u32, u32)>>>,
+    scale_snap:  Arc<Mutex<Option<ScaleSnap>>>,
     state:       Option<GlState>,
     compositor:  Box<dyn Compositor>,
     use_gl_compositor: bool,
     current_w:     usize,
     current_h:     usize,
+    current_win_w: usize,
     current_win_h: usize,
-    scale:         u32,
 }
 
 // Safety: GlRenderer is sent to the refresh thread where it owns and uses the GL context.
@@ -90,9 +97,12 @@ impl GlRenderer {
 
         let _ = gl_surface.set_swap_interval(&gl_context, SwapInterval::Wait(NonZeroU32::new(1).unwrap()));
 
-        let (program, viewport_info_loc, scale_factor_loc, integer_shader, vao, main_vbo, status_vbo) = unsafe {
-            // Vertex shader: takes pixel coords, converts to NDC via ortho uniform.
-            // ortho = vec2(win_w, win_h); (0,0)=top-left, (win_w,win_h)=bottom-right.
+        let (integer_program, viewport_info_loc, scale_factor_loc,
+             fallback_program, fallback_tex_loc, fallback_ortho_loc,
+             vao, main_vbo, status_vbo) = unsafe {
+
+            // Shared vertex shader: pixel-coordinate ortho projection.
+            // ortho = (win_w, win_h); (0,0)=top-left, y increases downward.
             let vs_src = "
                 #version 150
                 in vec2 position;
@@ -106,18 +116,10 @@ impl GlRenderer {
                 }
             ";
 
-            let program = gl.create_program().unwrap();
-            let vs = gl.create_shader(glow::VERTEX_SHADER).unwrap();
-            gl.shader_source(vs, vs_src);
-            gl.compile_shader(vs);
-            if !gl.get_shader_compile_status(vs) {
-                panic!("Vertex shader compilation failed: {}", gl.get_shader_info_log(vs));
-            }
-
-            let fs = gl.create_shader(glow::FRAGMENT_SHADER).unwrap();
-            // Fragment shader: texelFetch using pixel coord / scale.
-            // tex_y: row 0 of texture = top of image; GL origin is bottom-left so flip.
-            gl.shader_source(fs, "
+            // ── Integer shader: texelFetch, no filtering. Used at 1x and 2x. ──
+            // scale_factor must be an exact integer (1 or 2).
+            // quad_y = bottom edge of quad in GL pixels from bottom of window.
+            let integer_fs_src = "
                 #version 150
                 in vec2 v_tex_coord;
                 out vec4 color;
@@ -129,83 +131,104 @@ impl GlRenderer {
                     int quad_y = viewport_info[1].y;
                     int scale  = max(scale_factor, 1);
                     int x = int(gl_FragCoord.x) / scale;
-                    // gl_FragCoord.y=0 is bottom of window; quad_y is top of this quad in pixels from bottom.
                     int y = (int(gl_FragCoord.y) - quad_y) / scale;
                     y = (tex_h - 1) - y;
                     color = texelFetch(tex, ivec2(x, y), 0);
                 }
-            ");
-            gl.compile_shader(fs);
+            ";
 
-            let mut linked = false;
-            if gl.get_shader_compile_status(fs) {
-                gl.attach_shader(program, vs);
-                gl.attach_shader(program, fs);
-                gl.link_program(program);
-                if gl.get_program_link_status(program) {
-                    linked = true;
-                } else {
-                    gl.detach_shader(program, fs);
+            // ── Fallback shader: UV sampler with trilinear filtering. ──
+            // Caller sets TEXTURE_MIN_FILTER = LINEAR_MIPMAP_LINEAR and generates mipmaps.
+            let fallback_fs_src = "
+                #version 150
+                in vec2 v_tex_coord;
+                out vec4 color;
+                uniform sampler2D tex;
+                void main() {
+                    color = texture(tex, v_tex_coord);
                 }
-            }
+            ";
 
-            if !linked {
-                gl.shader_source(fs, "
-                    #version 150
-                    in vec2 v_tex_coord;
-                    out vec4 color;
-                    uniform sampler2D tex;
-                    void main() {
-                        color = texture(tex, v_tex_coord);
-                    }
-                ");
-                gl.compile_shader(fs);
-                if !gl.get_shader_compile_status(fs) {
-                    panic!("Fragment shader compilation failed: {}", gl.get_shader_info_log(fs));
+            let compile_shader = |kind: u32, src: &str| -> Option<glow::Shader> {
+                let s = gl.create_shader(kind).unwrap();
+                gl.shader_source(s, src);
+                gl.compile_shader(s);
+                if gl.get_shader_compile_status(s) { Some(s) } else {
+                    eprintln!("Shader compile error: {}", gl.get_shader_info_log(s));
+                    gl.delete_shader(s);
+                    None
                 }
-                gl.attach_shader(program, vs);
-                gl.attach_shader(program, fs);
-                gl.link_program(program);
-                if !gl.get_program_link_status(program) {
-                    panic!("Program linking failed: {}", gl.get_program_info_log(program));
-                }
-            }
+            };
 
-            let viewport_info_loc = gl.get_uniform_location(program, "viewport_info");
-            let scale_factor_loc  = gl.get_uniform_location(program, "scale_factor");
+            let link_program = |vs: glow::Shader, fs: glow::Shader| -> Option<glow::Program> {
+                let p = gl.create_program().unwrap();
+                gl.attach_shader(p, vs);
+                gl.attach_shader(p, fs);
+                gl.link_program(p);
+                if gl.get_program_link_status(p) { Some(p) } else {
+                    eprintln!("Program link error: {}", gl.get_program_info_log(p));
+                    gl.delete_program(p);
+                    None
+                }
+            };
+
+            let vs = compile_shader(glow::VERTEX_SHADER, vs_src)
+                .expect("vertex shader must compile");
+
+            // Integer program — try to compile; fall back to fallback_program if it fails.
+            let int_fs    = compile_shader(glow::FRAGMENT_SHADER, integer_fs_src);
+            let int_prog  = int_fs.and_then(|fs| link_program(vs, fs));
+
+            // Fallback program — must always compile.
+            let fb_fs   = compile_shader(glow::FRAGMENT_SHADER, fallback_fs_src)
+                .expect("fallback fragment shader must compile");
+            let fb_prog = link_program(vs, fb_fs)
+                .expect("fallback program must link");
+
+            // If integer program failed, reuse fallback as integer_program too (same draw path,
+            // just won't do texelFetch). compositor_status() will reflect this.
+            let integer_program = int_prog.unwrap_or(fb_prog);
+
+            let viewport_info_loc = gl.get_uniform_location(integer_program, "viewport_info");
+            let scale_factor_loc  = gl.get_uniform_location(integer_program, "scale_factor");
+            let fallback_tex_loc  = gl.get_uniform_location(fb_prog, "tex");
+            let fallback_ortho_loc = gl.get_uniform_location(fb_prog, "ortho");
 
             let vao = gl.create_vertex_array().unwrap();
             gl.bind_vertex_array(Some(vao));
-            gl.use_program(Some(program));
 
             let main_vbo = gl.create_buffer().unwrap();
             gl.bind_buffer(glow::ARRAY_BUFFER, Some(main_vbo));
             gl.buffer_data_size(glow::ARRAY_BUFFER, VBO_SIZE, glow::DYNAMIC_DRAW);
-            Self::bind_vbo_attribs(&gl, program, main_vbo);
+            Self::bind_vbo_attribs(&gl, integer_program, main_vbo);
 
             let status_vbo = gl.create_buffer().unwrap();
             gl.bind_buffer(glow::ARRAY_BUFFER, Some(status_vbo));
             gl.buffer_data_size(glow::ARRAY_BUFFER, VBO_SIZE, glow::DYNAMIC_DRAW);
-            Self::bind_vbo_attribs(&gl, program, status_vbo);
+            Self::bind_vbo_attribs(&gl, integer_program, status_vbo);
 
-            (program, viewport_info_loc, scale_factor_loc, linked, vao, main_vbo, status_vbo)
+            (integer_program, viewport_info_loc, scale_factor_loc,
+             fb_prog, fallback_tex_loc, fallback_ortho_loc,
+             vao, main_vbo, status_vbo)
         };
 
         self.state = Some(GlState {
             gl,
             context: gl_context,
             surface: gl_surface,
-            program,
+            integer_program,
             viewport_info_loc,
             scale_factor_loc,
-            integer_shader,
+            fallback_program,
+            fallback_tex_loc,
+            fallback_ortho_loc,
             vao,
             main_vbo,
             status_vbo,
         });
     }
 
-    // Upload a quad covering pixel rect [x0..x1] × [y0..y1] (top-left origin).
+    // Upload a quad covering pixel rect [x0..x1] × [y0..y1] (top-left origin, y down).
     unsafe fn upload_quad(gl: &glow::Context, vbo: glow::Buffer,
         x0: f32, y0: f32, x1: f32, y1: f32,
         u0: f32, v0: f32, u1: f32, v1: f32)
@@ -221,20 +244,6 @@ impl GlRenderer {
         gl.buffer_sub_data_u8_slice(glow::ARRAY_BUFFER, 0, u8_slice);
     }
 
-    // quad_y_bottom: bottom edge of this quad in GL pixels (from bottom of window).
-    unsafe fn set_viewport_info(gl: &glow::Context, loc: Option<&glow::UniformLocation>,
-        tex_w: i32, tex_h: i32, quad_y_bottom: i32)
-    {
-        let info = [tex_w, tex_h, 0, quad_y_bottom];
-        gl.uniform_2_i32_slice(loc, &info);
-    }
-
-    unsafe fn set_scale_factor(gl: &glow::Context, loc: Option<&glow::UniformLocation>, scale: u32) {
-        if let Some(loc) = loc {
-            gl.uniform_1_i32(Some(loc), scale as i32);
-        }
-    }
-
     unsafe fn bind_vbo_attribs(gl: &glow::Context, program: glow::Program, vbo: glow::Buffer) {
         gl.bind_buffer(glow::ARRAY_BUFFER, Some(vbo));
         let pos_loc = gl.get_attrib_location(program, "position").unwrap();
@@ -246,31 +255,81 @@ impl GlRenderer {
         }
     }
 
-    // Draw a texture onto a quad.
-    // quad_y_bottom: bottom of quad in GL pixels from bottom of window.
-    unsafe fn draw_tex(
+    // Set trilinear filtering and regenerate mipmaps for a bound TEXTURE_2D.
+    // Call after binding the texture, before drawing.
+    unsafe fn setup_trilinear(gl: &glow::Context) {
+        gl.tex_parameter_i32(glow::TEXTURE_2D, glow::TEXTURE_MIN_FILTER, glow::LINEAR_MIPMAP_LINEAR as i32);
+        gl.tex_parameter_i32(glow::TEXTURE_2D, glow::TEXTURE_MAG_FILTER, glow::LINEAR as i32);
+        gl.generate_mipmap(glow::TEXTURE_2D);
+    }
+
+    // Draw a texture using the integer texelFetch shader.
+    // quad_y_bottom: bottom edge of the quad in GL pixels from bottom of window.
+    // scale_i: exact integer scale (1 or 2).
+    unsafe fn draw_tex_integer(
         gl: &glow::Context,
-        program: glow::Program,
-        vao: glow::VertexArray,
+        state: &GlState,
         vbo: glow::Buffer,
-        viewport_info_loc: Option<&glow::UniformLocation>,
-        scale_factor_loc: Option<&glow::UniformLocation>,
         tex: glow::Texture,
         tex_w: i32, tex_h: i32,
         quad_y_bottom: i32,
-        scale: u32,
+        scale_i: i32,
         win_w: f32, win_h: f32,
     ) {
-        gl.use_program(Some(program));
-        if let Some(loc) = gl.get_uniform_location(program, "ortho") {
+        gl.use_program(Some(state.integer_program));
+        if let Some(loc) = gl.get_uniform_location(state.integer_program, "ortho") {
             gl.uniform_2_f32(Some(&loc), win_w, win_h);
         }
-        gl.bind_vertex_array(Some(vao));
+        gl.bind_vertex_array(Some(state.vao));
         gl.bind_texture(glow::TEXTURE_2D, Some(tex));
-        Self::bind_vbo_attribs(gl, program, vbo);
-        Self::set_viewport_info(gl, viewport_info_loc, tex_w, tex_h, quad_y_bottom);
-        Self::set_scale_factor(gl, scale_factor_loc, scale);
+        Self::setup_trilinear(gl);
+        Self::bind_vbo_attribs(gl, state.integer_program, vbo);
+        // viewport_info[0] = (tex_w, tex_h), viewport_info[1] = (0, quad_y_bottom)
+        let info = [tex_w, tex_h, 0, quad_y_bottom];
+        gl.uniform_2_i32_slice(state.viewport_info_loc.as_ref(), &info);
+        if let Some(loc) = &state.scale_factor_loc {
+            gl.uniform_1_i32(Some(loc), scale_i);
+        }
         gl.draw_arrays(glow::TRIANGLE_STRIP, 0, 4);
+    }
+
+    // Draw a texture using the fallback UV sampler shader with trilinear filtering.
+    unsafe fn draw_tex_fallback(
+        gl: &glow::Context,
+        state: &GlState,
+        vbo: glow::Buffer,
+        tex: glow::Texture,
+        win_w: f32, win_h: f32,
+    ) {
+        gl.use_program(Some(state.fallback_program));
+        if let Some(loc) = &state.fallback_ortho_loc {
+            gl.uniform_2_f32(Some(loc), win_w, win_h);
+        }
+        if let Some(loc) = &state.fallback_tex_loc {
+            gl.uniform_1_i32(Some(loc), 0);
+        }
+        gl.bind_vertex_array(Some(state.vao));
+        gl.active_texture(glow::TEXTURE0);
+        gl.bind_texture(glow::TEXTURE_2D, Some(tex));
+        Self::setup_trilinear(gl);
+        Self::bind_vbo_attribs(gl, state.fallback_program, vbo);
+        gl.draw_arrays(glow::TRIANGLE_STRIP, 0, 4);
+    }
+
+    // Compute letterboxed quad rect and float scale for a given display and window size.
+    // Returns (x0, y0, x1, y1, scale_f) in window pixel coords (top-left origin).
+    // The status bar scales with the display: total content height = indy_h + STATUS_BAR_HEIGHT.
+    fn letterbox(indy_w: f32, indy_h: f32, win_w: f32, win_h: f32)
+        -> (f32, f32, f32, f32, f32)
+    {
+        let total_h = indy_h + STATUS_BAR_HEIGHT as f32;
+        let scale = (win_w / indy_w).min(win_h / total_h);
+        let disp_w = indy_w * scale;
+        let disp_h = indy_h * scale;
+        let sb_h   = STATUS_BAR_HEIGHT as f32 * scale;
+        let x0 = ((win_w - disp_w) * 0.5).floor();
+        let y0 = ((win_h - disp_h - sb_h) * 0.5).floor();
+        (x0, y0, x0 + disp_w, y0 + disp_h, scale)
     }
 }
 
@@ -295,53 +354,72 @@ impl Renderer for GlRenderer {
         let state = self.state.as_mut().unwrap();
         let gl    = &state.gl;
 
-        // Handle window resize
-        let win_h = if let Some((w, h)) = self.window_size.lock().take() {
+        // Handle pending scale-snap from keyboard hotkey (RCtrl+1 / RCtrl+2).
+        if let Some(snap) = self.scale_snap.lock().take() {
+            let s = match snap { ScaleSnap::Scale1x => 1u32, ScaleSnap::Scale2x => 2u32 };
+            let _ = self.window.request_inner_size(winit::dpi::PhysicalSize::new(
+                width as u32 * s,
+                (height as u32 + STATUS_BAR_HEIGHT as u32) * s,
+            ));
+        }
+
+        // Handle window resize — take the latest queued size.
+        let (win_w, win_h) = if let Some((w, h)) = self.window_size.lock().take() {
             state.surface.resize(
                 &state.context,
                 NonZeroU32::new(w).unwrap(),
                 NonZeroU32::new(h).unwrap(),
             );
-            unsafe { gl.viewport(0, 0, w as i32, h as i32); }
-            h as usize
+            (w as usize, h as usize)
+        } else if self.current_win_w > 0 {
+            (self.current_win_w, self.current_win_h)
         } else {
-            (height + STATUS_BAR_HEIGHT) * self.scale as usize
+            // First frame before any resize event: query actual window size.
+            let s = self.window.inner_size();
+            (s.width as usize, s.height as usize)
         };
 
-        // Recompute quads when display resolution or window size changes.
-        // Pixel coords: (0,0) = top-left, x right, y down.
-        // Main quad: top of window down to height*scale pixels.
-        // Status bar quad: height*scale down to win_h.
-        if width != self.current_w || height != self.current_h || win_h != self.current_win_h {
-            self.current_w = width;
-            self.current_h = height;
+        let win_w_f = win_w as f32;
+        let win_h_f = win_h as f32;
+        let win_w_i = win_w as i32;
+        let win_h_i = win_h as i32;
+
+        // Letterbox: status bar scales with display.
+        let (qx0, qy0, qx1, qy1, scale_f) = Self::letterbox(
+            width as f32, height as f32, win_w_f, win_h_f);
+        let sb_h_px = STATUS_BAR_HEIGHT as f32 * scale_f;
+        let sb_h_i  = sb_h_px as i32;
+
+        // Use integer texelFetch shader only at exactly 1x or 2x.
+        let use_integer = scale_f == 1.0 || scale_f == 2.0;
+        let scale_i = scale_f.round() as i32;
+
+        // Recompute quads when anything changes.
+        if width != self.current_w || height != self.current_h
+            || win_w != self.current_win_w || win_h != self.current_win_h
+        {
+            self.current_w     = width;
+            self.current_h     = height;
+            self.current_win_w = win_w;
             self.current_win_h = win_h;
-            let win_w      = (width  * self.scale as usize) as f32;
-            let main_h_px  = (height * self.scale as usize) as f32;
-            let win_h_px   = win_h as f32;
-            let max_u      = width as f32 / 2048.0;
+            // UV coords into 2048×1024 texture
+            let max_u      = width  as f32 / 2048.0;
             let max_v_main = height as f32 / 1024.0;
             unsafe {
-                // Main: (0,0)..(win_w, main_h_px) — top portion
+                // Main display quad (letterboxed).
                 Self::upload_quad(gl, state.main_vbo,
-                    0.0, 0.0, win_w, main_h_px,
+                    qx0, qy0, qx1, qy1,
                     0.0, 0.0, max_u, max_v_main);
-                // Status bar: (0, main_h_px)..(win_w, win_h_px) — bottom portion
+                // Status bar: same x extent as letterboxed display, scaled height, bottom of window.
+                // Texture is 2048×STATUS_BAR_HEIGHT, so v goes 0..1.
                 Self::upload_quad(gl, state.status_vbo,
-                    0.0, main_h_px, win_w, win_h_px,
+                    qx0, qy1, qx1, qy1 + sb_h_px,
                     0.0, 0.0, max_u, 1.0);
             }
         }
 
-        let win_w = (width  * self.scale as usize) as f32;
-        let win_h_f = win_h as f32;
-        // quad_y_bottom for main = STATUS_BAR_HEIGHT*scale pixels from GL bottom
-        let main_quad_y_bottom = (STATUS_BAR_HEIGHT as u32 * self.scale) as i32;
-
-        let win_w_i   = (width * self.scale as usize) as i32;
-        let win_h_i   = win_h as i32;
-        let sb_h      = (STATUS_BAR_HEIGHT as u32 * self.scale) as i32;
-        let main_h_i  = win_h_i - sb_h;
+        // quad_y_bottom for integer shader: how many GL pixels from bottom to bottom of main quad.
+        let main_quad_y_bottom = (win_h_f - qy1) as i32;
 
         unsafe {
             // ── Compositor runs first — it sets its own FBO/viewport ─────────
@@ -355,9 +433,6 @@ impl Renderer for GlRenderer {
             gl.clear_color(0.0, 0.0, 0.0, 1.0);
             gl.clear(glow::COLOR_BUFFER_BIT);
 
-            gl.use_program(Some(state.program));
-            gl.bind_vertex_array(Some(state.vao));
-
             if need_readback {
                 if let Some(pixels) = self.compositor.read_pixels() {
                     screen.rgba.copy_from_slice(pixels);
@@ -365,15 +440,17 @@ impl Renderer for GlRenderer {
                     self.compositor.readback_to_screen(&mut screen.rgba, width, height, gl);
                 }
             }
-            Self::draw_tex(
-                gl, state.program, state.vao, state.main_vbo,
-                state.viewport_info_loc.as_ref(), state.scale_factor_loc.as_ref(),
-                main_tex,
-                width as i32, height as i32,
-                main_quad_y_bottom,
-                self.scale,
-                win_w, win_h_f,
-            );
+
+            // ── Pass 1: main display ─────────────────────────────────────────
+            gl.scissor(0, 0, win_w_i, win_h_i);
+            if use_integer {
+                Self::draw_tex_integer(gl, state, state.main_vbo, main_tex,
+                    width as i32, height as i32, main_quad_y_bottom, scale_i,
+                    win_w_f, win_h_f);
+            } else {
+                Self::draw_tex_fallback(gl, state, state.main_vbo, main_tex,
+                    win_w_f, win_h_f);
+            }
 
             // ── Pass 2: debug overlay (alpha-blended) ────────────────────────
             if overlay.active() {
@@ -381,31 +458,21 @@ impl Renderer for GlRenderer {
                 gl.blend_func(glow::SRC_ALPHA, glow::ONE_MINUS_SRC_ALPHA);
                 let ov_src = screen.overlay_source();
                 let ov_tex = overlay.render(&ov_src, gl);
-                Self::draw_tex(
-                    gl, state.program, state.vao, state.main_vbo,
-                    state.viewport_info_loc.as_ref(), state.scale_factor_loc.as_ref(),
-                    ov_tex,
-                    width as i32, height as i32,
-                    main_quad_y_bottom,
-                    self.scale,
-                    win_w, win_h_f,
-                );
+                if use_integer {
+                    Self::draw_tex_integer(gl, state, state.main_vbo, ov_tex,
+                        width as i32, height as i32, main_quad_y_bottom, scale_i,
+                        win_w_f, win_h_f);
+                } else {
+                    Self::draw_tex_fallback(gl, state, state.main_vbo, ov_tex,
+                        win_w_f, win_h_f);
+                }
                 gl.disable(glow::BLEND);
             }
 
-            // ── Pass 3: status bar (opaque, bottom of window) ────────────────
-            // Scissor: status bar area = 0..sb_h (GL y from bottom)
-            gl.scissor(0, 0, win_w_i, sb_h);
+            // ── Pass 3: status bar ───────────────────────────────────────────
+            gl.scissor(0, 0, win_w_i, win_h_i);
             let sb_tex = sbtex.render_and_upload(status, stats, width, gl);
-            Self::draw_tex(
-                gl, state.program, state.vao, state.status_vbo,
-                state.viewport_info_loc.as_ref(), state.scale_factor_loc.as_ref(),
-                sb_tex,
-                width as i32, STATUS_BAR_HEIGHT as i32,
-                0,
-                self.scale,
-                win_w, win_h_f,
-            );
+            Self::draw_tex_fallback(gl, state, state.status_vbo, sb_tex, win_w_f, win_h_f);
 
             gl.disable(glow::SCISSOR_TEST);
 
@@ -414,9 +481,10 @@ impl Renderer for GlRenderer {
     }
 
     fn resize(&mut self, width: usize, height: usize) {
+        // On display resolution change, snap window to 1x of the new resolution.
         let _ = self.window.request_inner_size(winit::dpi::PhysicalSize::new(
-            width as u32 * self.scale,
-            (height + STATUS_BAR_HEIGHT) as u32 * self.scale,
+            width as u32,
+            (height + STATUS_BAR_HEIGHT) as u32,
         ));
     }
 
@@ -426,16 +494,13 @@ impl Renderer for GlRenderer {
         }
         self.current_w     = 0;
         self.current_h     = 0;
+        self.current_win_w = 0;
         self.current_win_h = 0;
     }
 
     fn compositor_status(&self) -> String {
         let comp = if self.use_gl_compositor { "gl" } else { "sw" };
-        let shader = match &self.state {
-            Some(s) => if s.integer_shader { "integer(texelFetch)" } else { "fallback(UV sampler)" },
-            None => "not-initialized",
-        };
-        format!("compositor={} shader={}", comp, shader)
+        format!("compositor={} shader=integer+fallback", comp)
     }
 
     fn switch_compositor(&mut self, use_gl: bool) -> &'static str {
@@ -469,8 +534,9 @@ pub struct Ui {
     rex3: Arc<Rex3>,
     window: Arc<Window>,
     window_size: Arc<Mutex<Option<(u32, u32)>>>,
+    scale_snap:  Arc<Mutex<Option<ScaleSnap>>>,
     timer_manager: Arc<TimerManager>,
-    scale: u32,
+    initial_scale: u32,
     scroll_pixels_per_line: f64,
 }
 
@@ -480,8 +546,7 @@ impl Ui {
         let h = (768 + STATUS_BAR_HEIGHT as u32) * scale;
         let window_builder = WindowBuilder::new()
             .with_title(crate::machine::emulator_name())
-            .with_resizable(false)
-            .with_enabled_buttons(winit::window::WindowButtons::CLOSE | winit::window::WindowButtons::MINIMIZE)
+            .with_resizable(true)
             .with_inner_size(winit::dpi::PhysicalSize::new(w, h));
 
         let template = ConfigTemplateBuilder::new()
@@ -502,28 +567,31 @@ impl Ui {
 
         let window      = Arc::new(window.unwrap());
         let window_size = Arc::new(Mutex::new(None));
+        let scale_snap  = Arc::new(Mutex::new(None));
 
         let renderer = GlRenderer {
             window:      window.clone(),
             gl_config,
             window_size: window_size.clone(),
+            scale_snap:  scale_snap.clone(),
             state:       None,
             compositor:       Box::new(GlCompositor::new()),
             use_gl_compositor: true,
             current_w:     0,
             current_h:     0,
+            current_win_w: 0,
             current_win_h: 0,
-            scale,
         };
 
         *rex3.renderer.lock() = Some(Box::new(renderer));
 
-        Self { ps2, rex3, window, window_size, timer_manager, scale, scroll_pixels_per_line }
+        Self { ps2, rex3, window, window_size, scale_snap, timer_manager, initial_scale: scale, scroll_pixels_per_line }
     }
 
     /// Run the UI event loop (blocks the current thread)
     pub fn run(self, event_loop: EventLoop<()>) {
-        let Ui { ps2, rex3, window, window_size, timer_manager, scale, scroll_pixels_per_line } = self;
+        let Ui { ps2, rex3, window, window_size, scale_snap, timer_manager, initial_scale, scroll_pixels_per_line } = self;
+        let scale = initial_scale;
 
         let mut mouse_grabbed = false;
         let mut rctrl_held = false;
@@ -554,7 +622,7 @@ impl Ui {
                         }
                     }
                     WindowEvent::KeyboardInput { event, .. } => {
-                        Self::handle_keyboard(&ps2, &rex3, event, &mut mouse_grabbed, &mut rctrl_held, &window);
+                        Self::handle_keyboard(&ps2, &rex3, &scale_snap, event, &mut mouse_grabbed, &mut rctrl_held, &window);
                     }
                     WindowEvent::MouseInput { state, button, .. } => {
                         if mouse_grabbed {
@@ -627,7 +695,9 @@ impl Ui {
         ps2.push_mouse_input(buttons, dx, dy, dz);
     }
 
-    fn handle_keyboard(ps2: &Ps2Controller, rex3: &Rex3, input: KeyEvent, grabbed: &mut bool, rctrl_held: &mut bool, window: &Window) {
+    fn handle_keyboard(ps2: &Ps2Controller, rex3: &Rex3, scale_snap: &Mutex<Option<ScaleSnap>>,
+        input: KeyEvent, grabbed: &mut bool, rctrl_held: &mut bool, window: &Window)
+    {
         use std::sync::atomic::Ordering;
         if let PhysicalKey::Code(keycode) = input.physical_key {
             let pressed = input.state == ElementState::Pressed;
@@ -645,6 +715,29 @@ impl Ui {
             if keycode == KeyCode::PrintScreen && pressed && !input.repeat && *rctrl_held {
                 rex3.screenshot_pending.store(true, Ordering::Relaxed);
                 return;
+            }
+
+            if keycode == KeyCode::F11 && pressed && !input.repeat && *rctrl_held {
+                let new_mode = if window.fullscreen().is_some() {
+                    None
+                } else {
+                    Some(winit::window::Fullscreen::Borderless(None))
+                };
+                window.set_fullscreen(new_mode);
+                return;
+            }
+
+            // RCtrl+1 / RCtrl+2: snap window to 1x or 2x scale.
+            if pressed && !input.repeat && *rctrl_held {
+                let snap = match keycode {
+                    KeyCode::Digit1 => Some(ScaleSnap::Scale1x),
+                    KeyCode::Digit2 => Some(ScaleSnap::Scale2x),
+                    _ => None,
+                };
+                if let Some(s) = snap {
+                    *scale_snap.lock() = Some(s);
+                    return;
+                }
             }
 
             ps2.push_kb(keycode, pressed);

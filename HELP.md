@@ -61,9 +61,16 @@ above).
 
 ## Keyboard
 
-Right control releases mouse grab.
+Right Ctrl releases mouse grab.
 
-**Right Ctrl + Print Screen** takes a screenshot (saved as `screenshot_NNNN.png` in the working directory).
+| Shortcut | Action |
+|----------|--------|
+| **Right Ctrl + Print Screen** | Take screenshot (saved as `screenshot_NNNN.png` in the working directory) |
+| **Right Ctrl + 1** | Snap window to 1× scale |
+| **Right Ctrl + 2** | Snap window to 2× scale |
+| **Right Ctrl + F11** | Toggle borderless fullscreen |
+
+The window is freely resizable. At 1× and 2× scale the display is rendered with nearest-neighbour pixel-perfect sampling; at all other sizes trilinear filtering with mipmaps is used.
 
 ### Addresses
 
