@@ -269,6 +269,13 @@ pub struct MachineConfig {
     #[serde(default = "default_scroll_pixels_per_line")]
     pub mouse_scroll_pixels_per_line: f64,
 
+    /// Lock the window's aspect ratio to the emulated display (picture +
+    /// status bar) while resizing, so it fills the window without letterbox
+    /// bars. Set to false if you have a non-standard monitor and prefer free
+    /// resizing — the display is then letterboxed to fit. Default: true.
+    #[serde(default = "default_lock_aspect_ratio")]
+    pub lock_aspect_ratio: bool,
+
     /// Optional file path that will receive every byte emitted on ttyd1
     /// (the IRIX serial console) in `--ci` mode. Append-only. Useful for
     /// keeping a continuously-updated transcript of the install or test run.
@@ -296,6 +303,7 @@ pub struct MachineConfig {
 
 fn default_ci_socket() -> String { "/tmp/iris.sock".to_string() }
 fn default_scroll_pixels_per_line() -> f64 { 40.0 }
+fn default_lock_aspect_ratio() -> bool { true }
 
 fn default_prom() -> String {
     "prom.bin".to_string()
@@ -352,6 +360,7 @@ impl Default for MachineConfig {
             serial_log: None,
             vino: VinoConfig::default(),
             mouse_scroll_pixels_per_line: default_scroll_pixels_per_line(),
+            lock_aspect_ratio: default_lock_aspect_ratio(),
         }
     }
 }

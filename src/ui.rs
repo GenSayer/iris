@@ -55,6 +55,9 @@ struct GlRenderer {
     gl_config:   glutin::config::Config,
     window_size: Arc<Mutex<Option<(u32, u32)>>>,
     scale_snap:  Arc<Mutex<Option<ScaleSnap>>>,
+    // Current emulated display resolution (width, height), published for the
+    // event thread so it can lock the window to the right aspect ratio.
+    display_res: Arc<Mutex<(u32, u32)>>,
     state:       Option<GlState>,
     compositor:  Box<dyn Compositor>,
     use_gl_compositor: bool,
@@ -402,6 +405,8 @@ impl Renderer for GlRenderer {
             self.current_h     = height;
             self.current_win_w = win_w;
             self.current_win_h = win_h;
+            // Publish the display resolution for the event thread's aspect lock.
+            *self.display_res.lock() = (width as u32, height as u32);
             // UV coords into 2048×1024 texture
             let max_u      = width  as f32 / 2048.0;
             let max_v_main = height as f32 / 1024.0;
@@ -481,6 +486,10 @@ impl Renderer for GlRenderer {
     }
 
     fn resize(&mut self, width: usize, height: usize) {
+        // Publish the new resolution *before* the snap below, so the event
+        // thread's aspect lock sees it when it handles the resulting Resized
+        // event (otherwise it would re-fit the window to the stale aspect).
+        *self.display_res.lock() = (width as u32, height as u32);
         // On display resolution change, snap window to 1x of the new resolution.
         let _ = self.window.request_inner_size(winit::dpi::PhysicalSize::new(
             width as u32,
@@ -535,15 +544,20 @@ pub struct Ui {
     window: Arc<Window>,
     window_size: Arc<Mutex<Option<(u32, u32)>>>,
     scale_snap:  Arc<Mutex<Option<ScaleSnap>>>,
+    display_res: Arc<Mutex<(u32, u32)>>,
     timer_manager: Arc<TimerManager>,
     initial_scale: u32,
     scroll_pixels_per_line: f64,
+    lock_aspect_ratio: bool,
 }
 
 impl Ui {
-    pub fn new(ps2: Arc<Ps2Controller>, rex3: Arc<Rex3>, timer_manager: Arc<TimerManager>, event_loop: &EventLoop<()>, scale: u32, scroll_pixels_per_line: f64) -> Self {
-        let w = 1024 * scale;
-        let h = (768 + STATUS_BAR_HEIGHT as u32) * scale;
+    pub fn new(ps2: Arc<Ps2Controller>, rex3: Arc<Rex3>, timer_manager: Arc<TimerManager>, event_loop: &EventLoop<()>, scale: u32, scroll_pixels_per_line: f64, lock_aspect_ratio: bool) -> Self {
+        // The Indy's default video mode is 1280×1024; open the window at that
+        // size (plus the status bar). The renderer snaps to the real resolution
+        // via resize() once the PROM/IRIX programs its actual mode.
+        let w = 1280 * scale;
+        let h = (1024 + STATUS_BAR_HEIGHT as u32) * scale;
         let window_builder = WindowBuilder::new()
             .with_title(crate::machine::emulator_name())
             .with_resizable(true)
@@ -568,12 +582,16 @@ impl Ui {
         let window      = Arc::new(window.unwrap());
         let window_size = Arc::new(Mutex::new(None));
         let scale_snap  = Arc::new(Mutex::new(None));
+        // Seed with the Indy's default 1280×1024; the render thread republishes
+        // the real resolution on the first frame and on any mode change.
+        let display_res = Arc::new(Mutex::new((1280u32, 1024u32)));
 
         let renderer = GlRenderer {
             window:      window.clone(),
             gl_config,
             window_size: window_size.clone(),
             scale_snap:  scale_snap.clone(),
+            display_res: display_res.clone(),
             state:       None,
             compositor:       Box::new(GlCompositor::new()),
             use_gl_compositor: true,
@@ -585,16 +603,22 @@ impl Ui {
 
         *rex3.renderer.lock() = Some(Box::new(renderer));
 
-        Self { ps2, rex3, window, window_size, scale_snap, timer_manager, initial_scale: scale, scroll_pixels_per_line }
+        Self { ps2, rex3, window, window_size, scale_snap, display_res, timer_manager, initial_scale: scale, scroll_pixels_per_line, lock_aspect_ratio }
     }
 
     /// Run the UI event loop (blocks the current thread)
     pub fn run(self, event_loop: EventLoop<()>) {
-        let Ui { ps2, rex3, window, window_size, scale_snap, timer_manager, initial_scale, scroll_pixels_per_line } = self;
+        let Ui { ps2, rex3, window, window_size, scale_snap, display_res, timer_manager, initial_scale, scroll_pixels_per_line, lock_aspect_ratio } = self;
         let scale = initial_scale;
 
         let mut mouse_grabbed = false;
         let mut rctrl_held = false;
+        // Last window size we accepted, used to tell which edge the user is
+        // dragging when locking the aspect ratio.
+        let mut last_win_size = {
+            let s = window.inner_size();
+            (s.width, s.height)
+        };
         let mouse_delta = Arc::new(Mutex::new(MouseDelta { accum: (0.0, 0.0), wheel: 0.0, buttons: 0 }));
 
         {
@@ -618,7 +642,31 @@ impl Ui {
                     WindowEvent::CloseRequested => { elwt.exit() },
                     WindowEvent::Resized(size) => {
                         if size.width != 0 && size.height != 0 {
-                            *window_size.lock() = Some((size.width, size.height));
+                            let mut new_size = (size.width, size.height);
+                            // Lock the window to the display's aspect ratio so the
+                            // picture fills it without letterbox bars. Skipped when
+                            // fullscreen or maximized (aspect can't be honoured there)
+                            // and when disabled by config.
+                            if lock_aspect_ratio
+                                && window.fullscreen().is_none()
+                                && !window.is_maximized()
+                            {
+                                let (dw, dh) = *display_res.lock();
+                                if let Some(fixed) = Self::aspect_fit(
+                                    size.width, size.height, last_win_size, dw, dh)
+                                {
+                                    new_size = match window.request_inner_size(
+                                        winit::dpi::PhysicalSize::new(fixed.0, fixed.1))
+                                    {
+                                        // Some => applied synchronously, no further
+                                        // Resized event; use the actual granted size.
+                                        Some(actual) => (actual.width, actual.height),
+                                        None => fixed,
+                                    };
+                                }
+                            }
+                            last_win_size = new_size;
+                            *window_size.lock() = Some(new_size);
                         }
                     }
                     WindowEvent::KeyboardInput { event, .. } => {
@@ -695,6 +743,33 @@ impl Ui {
         ps2.push_mouse_input(buttons, dx, dy, dz);
     }
 
+    /// Adjust an incoming window size to match the emulated display's aspect
+    /// ratio (display width : display height + status bar). Whichever axis the
+    /// user is actively dragging — the one that moved most from `prev` — is
+    /// kept, and the other is derived from it. Returns `None` when the size is
+    /// already within 1 px of the target (no correction needed), which keeps
+    /// the follow-up resize from oscillating.
+    fn aspect_fit(win_w: u32, win_h: u32, prev: (u32, u32), disp_w: u32, disp_h: u32)
+        -> Option<(u32, u32)>
+    {
+        if disp_w == 0 || disp_h == 0 { return None; }
+        let content_h = disp_h + STATUS_BAR_HEIGHT as u32;
+        // round(a * b / c) in u64 to avoid overflow/bias.
+        let muldiv = |a: u32, b: u32, c: u32| -> u32 {
+            ((a as u64 * b as u64 + c as u64 / 2) / c as u64) as u32
+        };
+        let (pw, ph) = prev;
+        if win_w.abs_diff(pw) >= win_h.abs_diff(ph) {
+            // Width is the driven axis: derive height from it.
+            let target_h = muldiv(win_w, content_h, disp_w).max(1);
+            if target_h.abs_diff(win_h) <= 1 { None } else { Some((win_w, target_h)) }
+        } else {
+            // Height is the driven axis: derive width from it.
+            let target_w = muldiv(win_h, disp_w, content_h).max(1);
+            if target_w.abs_diff(win_w) <= 1 { None } else { Some((target_w, win_h)) }
+        }
+    }
+
     fn handle_keyboard(ps2: &Ps2Controller, rex3: &Rex3, scale_snap: &Mutex<Option<ScaleSnap>>,
         input: KeyEvent, grabbed: &mut bool, rctrl_held: &mut bool, window: &Window)
     {
@@ -742,5 +817,51 @@ impl Ui {
 
             ps2.push_kb(keycode, pressed);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // Indy default mode. Content aspect = 1280 : (1024 + 16) = 1280 : 1040.
+    const DW: u32 = 1280;
+    const DH: u32 = 1024;
+
+    #[test]
+    fn dragging_width_derives_height() {
+        // Width grows from 1280 to 2560; height untouched. Expect height locked
+        // to the content ratio: 2560 * 1040 / 1280 = 2080.
+        let fixed = Ui::aspect_fit(2560, 1040, (1280, 1040), DW, DH);
+        assert_eq!(fixed, Some((2560, 2080)));
+    }
+
+    #[test]
+    fn dragging_height_derives_width() {
+        // Height grows from 1040 to 2080; width untouched. Expect width locked:
+        // 2080 * 1280 / 1040 = 2560.
+        let fixed = Ui::aspect_fit(1280, 2080, (1280, 1040), DW, DH);
+        assert_eq!(fixed, Some((2560, 2080)));
+    }
+
+    #[test]
+    fn already_locked_is_noop() {
+        // A size already on-ratio needs no correction (prevents oscillation on
+        // the follow-up Resized event after we apply a fix).
+        assert_eq!(Ui::aspect_fit(2560, 2080, (2560, 2080), DW, DH), None);
+        assert_eq!(Ui::aspect_fit(1280, 1040, (1280, 1040), DW, DH), None);
+    }
+
+    #[test]
+    fn within_one_pixel_tolerance() {
+        // 1 px off the exact ratio is accepted as-is (no visible letterbox).
+        assert_eq!(Ui::aspect_fit(2560, 2079, (2560, 2079), DW, DH), None);
+        assert_eq!(Ui::aspect_fit(2560, 2081, (2560, 2081), DW, DH), None);
+    }
+
+    #[test]
+    fn zero_resolution_is_noop() {
+        // Guard against a divide-by-zero before the first frame publishes a res.
+        assert_eq!(Ui::aspect_fit(800, 600, (800, 600), 0, 0), None);
     }
 }

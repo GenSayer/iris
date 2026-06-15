@@ -701,6 +701,14 @@ impl Machine {
         self.cpu.start();
     }
 
+    /// Whether the CPU thread is currently executing. Goes false when the CPU
+    /// is stopped — including the soft power-off path (a guest `poweroff` makes
+    /// the machine-events thread call `stop()`), so an embedder can tell the
+    /// guest has shut down without subscribing to machine events.
+    pub fn cpu_is_running(&self) -> bool {
+        self.cpu.is_running()
+    }
+
     /// Step the CPU `n` instructions in-line on the calling thread, with all
     /// peripheral threads stopped so the CPU sees no external interrupts.
     /// Used by Phase 3.3 snapshot determinism validator.
