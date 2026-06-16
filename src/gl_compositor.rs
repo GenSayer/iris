@@ -575,10 +575,10 @@ impl Compositor for GlCompositor {
                 glow::PixelPackData::Slice(&mut tight));
             gl.bind_framebuffer(glow::READ_FRAMEBUFFER, None);
         }
-        // GL origin bottom-left; screen.rgba origin top-left → flip rows.
+        // FBO gl_FragCoord.y=0 = display row 0 (top); glReadPixels row 0 = that same bottom.
+        // No flip: src row y → dst row y.
         for y in 0..height {
-            let src_row = height - 1 - y;
-            let src_start = src_row * row_bytes;
+            let src_start = y * row_bytes;
             let dst_start = y * 2048;
             for x in 0..width {
                 let r = tight[src_start + x * 4    ] as u32;
