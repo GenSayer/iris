@@ -182,6 +182,11 @@ struct App {
     /// Per-frame state for the egui→PS2 input pump (modifier diff,
     /// mouse button mask, last cursor position).
     input_state: input::InputState,
+    /// Previous frame's `cpu_halted` status, so we can edge-detect the guest
+    /// becoming "safe to stop" and auto-release the captured mouse/keyboard
+    /// exactly once on that transition. Reset to true on Start so the initial
+    /// idle-at-PROM state doesn't count as a halt.
+    prev_cpu_halted: bool,
     /// Active "Test Camera" preview (None when the window is closed). Opening it
     /// starts host-camera capture; dropping it releases the device.
     camera_test: Option<camera_test::CameraTest>,
@@ -193,6 +198,8 @@ struct App {
     serial_console: Option<serial_console::SerialConsole>,
     /// Pending line typed into the serial console input field.
     serial_input: String,
+    /// Whether the "How camera & networking work" Help window is open.
+    show_help_info: bool,
 }
 
 struct StopModal {
@@ -305,11 +312,13 @@ impl App {
             fb_nearest: true,
             pending_fb_snap: false,
             input_state: input::InputState::default(),
+            prev_cpu_halted: true,
             camera_test: None,
             camera_test_tex: None,
             camera_test_seq: 0,
             serial_console: None,
             serial_input: String::new(),
+            show_help_info: false,
         }
     }
 
@@ -413,6 +422,9 @@ impl App {
         // supersedes any pending first-launch fit.
         self.pending_fb_snap = true;
         self.pending_launcher_fit = false;
+        // Assume halted at boot (idle at the PROM) so the auto-release only
+        // fires on a later running→halted transition, not at startup.
+        self.prev_cpu_halted = true;
     }
 
     /// Walk the configured SCSI devices and report any whose image file
@@ -682,17 +694,25 @@ impl App {
                 ui.label(format!("Version {}", env!("APP_VERSION")));
                 ui.separator();
                 ui.label(RichText::new("Diagnostics").strong());
-                if ui.button("📷 Test Camera…").clicked() {
+                let running = self.emu.is_running();
+                if ui.add_enabled(running, egui::Button::new("📷 Test Camera…"))
+                    .on_hover_text("Preview the host camera used for the emulated IndyCam")
+                    .on_disabled_hover_text("Start a machine first")
+                    .clicked()
+                {
                     self.open_camera_test();
                     ui.close_menu();
                 }
-                let running = self.emu.is_running();
                 if ui.add_enabled(running, egui::Button::new("🌐 Network test (serial console)…"))
                     .on_hover_text("Connect to the emulator's loopback serial server (127.0.0.1:8881)")
                     .on_disabled_hover_text("Start a machine first")
                     .clicked()
                 {
                     self.open_serial_console();
+                    ui.close_menu();
+                }
+                if ui.button("ℹ How camera & networking work…").clicked() {
+                    self.show_help_info = true;
                     ui.close_menu();
                 }
                 ui.separator();
@@ -906,6 +926,19 @@ impl App {
             });
         }
 
+        // When the guest becomes "safe to stop" (CPU halted — a clean IRIX
+        // shutdown / `halt`), auto-release the captured mouse & keyboard so the
+        // user gets their cursor back without pressing Ctrl+Alt+Esc. Edge-
+        // triggered on the running→halted transition (prev is reset to true at
+        // Start, so idling at the PROM during boot doesn't count), and they can
+        // still click the display to re-capture.
+        let halted = self.emu.status.cpu_halted;
+        if halted && !self.prev_cpu_halted && self.input_state.captured {
+            input::force_release(ui.ctx(), &mut self.input_state);
+            self.toast("guest halted — mouse released (click display to re-capture)");
+        }
+        self.prev_cpu_halted = halted;
+
         // Pump egui input → PS/2 controller. Mouse/keyboard only reach the
         // guest while captured (click the framebuffer to capture, Ctrl+Alt+Esc
         // to release), so menu clicks and config typing don't leak in.
@@ -1110,6 +1143,75 @@ impl App {
         } else if connected {
             // Poll for new console output even when egui is otherwise idle.
             ctx.request_repaint_after(std::time::Duration::from_millis(80));
+        }
+    }
+
+    /// Explains the camera (IndyCam) and networking features — what they do and
+    /// how to use them (for end users), and what host capabilities they use and
+    /// why (for App Review). Opened from Help → "How camera & networking work".
+    fn help_info_window(&mut self, ctx: &egui::Context) {
+        if !self.show_help_info {
+            return;
+        }
+        let mut open = true;
+        egui::Window::new("How camera & networking work")
+            .open(&mut open)
+            .default_width(560.0)
+            .default_height(480.0)
+            .collapsible(false)
+            .resizable(true)
+            .show(ctx, |ui| {
+                egui::ScrollArea::vertical().max_height(420.0).auto_shrink([false, false]).show(ui, |ui| {
+                    ui.heading("📷 Camera — the IndyCam");
+                    ui.label(
+                        "IRIS emulates the SGI Indy's IndyCam video-input hardware (the VINO device). \
+                         When you pick your Mac's camera as the video source, IRIS captures live frames \
+                         from it and feeds them to the emulated video input — just as a real IndyCam fed \
+                         a real Indy.",
+                    );
+                    ui.add_space(6.0);
+                    ui.label(RichText::new("How to use it").strong());
+                    ui.label("• Help → Diagnostics → Test Camera shows a live preview (start a machine first).");
+                    ui.label("• Or set Video-In → Source = camera, boot IRIX, and run an IndyCam app like vino/cam.");
+                    ui.label("• On first use macOS asks for camera permission. Closing the preview releases the camera.");
+                    ui.add_space(6.0);
+                    ui.label(RichText::new("Privacy / for App Review").strong());
+                    ui.label(
+                        "Camera frames are used only as the emulated video input — IRIS never records, \
+                         stores, or transmits them. It uses the public AVFoundation API with the \
+                         com.apple.security.device.camera entitlement and the NSCameraUsageDescription \
+                         purpose string.",
+                    );
+
+                    ui.separator();
+                    ui.heading("🌐 Networking");
+                    ui.label(
+                        "The emulated Indy reaches the internet through a built-in user-mode NAT, like a \
+                         home router: outbound connections from IRIX are translated onto the host. No \
+                         system network settings or elevated privileges are touched.",
+                    );
+                    ui.add_space(6.0);
+                    ui.label(RichText::new("How to use it").strong());
+                    ui.label("• The guest serial console (ttyd1) and PROM monitor are exposed on loopback");
+                    ui.label("   TCP (127.0.0.1:8881 / 8888) so you can attach a terminal.");
+                    ui.label("• Help → Diagnostics → Network test opens an in-app viewer of that console.");
+                    ui.label("• Optional inbound port-forwards (Networking tab) let you reach guest services.");
+                    ui.add_space(6.0);
+                    ui.label(RichText::new("Privacy / for App Review").strong());
+                    ui.label(
+                        "Outbound guest traffic uses com.apple.security.network.client. The loopback \
+                         serial/monitor servers and any inbound port-forwards use \
+                         com.apple.security.network.server. Every socket is on loopback or user-initiated; \
+                         IRIS opens no network connections on its own.",
+                    );
+                });
+                ui.separator();
+                if ui.button("Close").clicked() {
+                    self.show_help_info = false;
+                }
+            });
+        if !open {
+            self.show_help_info = false;
         }
     }
 
@@ -1338,6 +1440,9 @@ impl eframe::App for App {
 
         // In-app IRIX serial-console viewer.
         self.serial_console_window(ctx);
+
+        // Help → "How camera & networking work" explainer.
+        self.help_info_window(ctx);
 
         // Safe-stop confirmation modal.
         let mut close_modal = false;
