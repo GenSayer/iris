@@ -42,6 +42,25 @@ fn load_icon() -> egui::IconData {
     }
 }
 
+/// Largest aspect-preserving size (egui points) that fits `avail` for a
+/// framebuffer whose native pixel dimensions are `px`.
+fn fb_fit_size(avail: egui::Vec2, px: egui::Vec2) -> egui::Vec2 {
+    let fb_aspect = px.x / px.y;
+    if avail.x / avail.y > fb_aspect {
+        egui::vec2(avail.y * fb_aspect, avail.y)
+    } else {
+        egui::vec2(avail.x, avail.x / fb_aspect)
+    }
+}
+
+/// True when `scale` (device pixels per emulated pixel) is close enough to a
+/// positive integer that nearest-neighbour sampling stays pixel-perfect. Off
+/// an integer, bilinear filtering avoids uneven pixel doubling.
+fn is_integer_scale(scale: f32) -> bool {
+    let rounded = scale.round();
+    rounded >= 1.0 && (scale - rounded).abs() <= 0.01
+}
+
 fn main() -> eframe::Result<()> {
     env_logger::init();
     // Prevent the iris lib from calling process::exit on guest soft-power-off
@@ -136,6 +155,11 @@ struct App {
     /// Sequence number of the last frame we uploaded; used to skip the
     /// upload when the renderer hasn't produced a new frame.
     last_fb_seq: u64,
+    /// Filter the framebuffer texture is currently uploaded with: `true` =
+    /// NEAREST (crisp; used at integer device-pixel scales), `false` = LINEAR
+    /// (smooths the uneven pixel doubling at fractional scales). Tracked so we
+    /// only re-upload when the integer/fractional status actually flips.
+    fb_nearest: bool,
     /// Set on Start; consumed on the first real REX3 frame to snap the window
     /// so the emulated display fills it at native scale (see `framebuffer_panel`).
     pending_fb_snap: bool,
@@ -264,6 +288,7 @@ impl App {
             restore_state_name: "snap1".into(),
             fb_tex: None,
             last_fb_seq: 0,
+            fb_nearest: true,
             pending_fb_snap: false,
             input_state: input::InputState::default(),
             camera_test: None,
@@ -435,8 +460,10 @@ impl App {
         ctx.request_repaint_after(std::time::Duration::from_millis(next));
     }
 
-    fn menu_bar(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
-        egui::menu::bar(ui, |ui| {
+    /// The File/Machine/Memory/SCSI/View/Help menus, stacked vertically for the
+    /// left control column. Each is a full-width drop-down button.
+    fn menu_list(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
+        ui.vertical(|ui| {
             ui.menu_button("File", |ui| {
                 ui.set_min_width(220.0);
                 if ui.button("New machine…").clicked() {
@@ -664,33 +691,42 @@ impl App {
         });
     }
 
-    fn toolbar(&mut self, ui: &mut egui::Ui) {
-        ui.horizontal(|ui| {
-            let running = self.emu.is_running();
-            if !running {
-                if ui.add(egui::Button::new(RichText::new("▶ Start").size(16.0))
-                    .fill(Color32::from_rgb(40, 110, 40))).clicked()
-                {
-                    self.start_emulator();
-                }
-            } else if ui.add(egui::Button::new(RichText::new("■ Stop").size(16.0))
-                .fill(Color32::from_rgb(160, 60, 60))).clicked()
+    /// Start/Stop + save-state controls, stacked full-width for the left column.
+    fn machine_controls(&mut self, ui: &mut egui::Ui) {
+        let running = self.emu.is_running();
+        let full = egui::vec2(ui.available_width(), 0.0);
+        if !running {
+            if ui.add_sized(full, egui::Button::new(RichText::new("▶ Start").size(16.0))
+                .fill(Color32::from_rgb(40, 110, 40))).clicked()
             {
-                self.request_stop();
+                self.start_emulator();
             }
-            ui.separator();
-            if ui.add_enabled(running, egui::Button::new("💾 Save state")).clicked() {
-                self.emu.send(Cmd::SaveState(self.save_state_name.clone()));
-            }
-            if ui.add_enabled(running, egui::Button::new("Restore state")).clicked() {
-                self.emu.send(Cmd::RestoreState(self.restore_state_name.clone()));
-            }
-            ui.separator();
-            let edit_label = if self.show_config_editor { "Hide config editor" } else { "Edit config…" };
-            if ui.button(edit_label).clicked() {
-                self.show_config_editor = !self.show_config_editor;
-            }
-            if self.show_config_editor {
+        } else if ui.add_sized(full, egui::Button::new(RichText::new("■ Stop").size(16.0))
+            .fill(Color32::from_rgb(160, 60, 60))).clicked()
+        {
+            self.request_stop();
+        }
+        if ui.add_enabled_ui(running, |ui| {
+            ui.add_sized(egui::vec2(ui.available_width(), 0.0), egui::Button::new("💾 Save state")).clicked()
+        }).inner {
+            self.emu.send(Cmd::SaveState(self.save_state_name.clone()));
+        }
+        if ui.add_enabled_ui(running, |ui| {
+            ui.add_sized(egui::vec2(ui.available_width(), 0.0), egui::Button::new("Restore state")).clicked()
+        }).inner {
+            self.emu.send(Cmd::RestoreState(self.restore_state_name.clone()));
+        }
+    }
+
+    /// "Edit config" toggle plus the quick-jump tab buttons (shown only while
+    /// the config editor is open). Stacked for the left column.
+    fn config_quick_buttons(&mut self, ui: &mut egui::Ui) {
+        let edit_label = if self.show_config_editor { "Hide config editor" } else { "Edit config…" };
+        if ui.add_sized(egui::vec2(ui.available_width(), 0.0), egui::Button::new(edit_label)).clicked() {
+            self.show_config_editor = !self.show_config_editor;
+        }
+        if self.show_config_editor {
+            ui.indent("quick_tabs", |ui| {
                 if ui.button("Network").clicked()  { self.tab = Tab::Network; }
                 if ui.button("Video-In").clicked() { self.tab = Tab::VideoIn; }
                 // Debug/JIT is compiled out of lightning builds; CI is hidden
@@ -702,25 +738,28 @@ impl App {
                 if !cfg!(feature = "appstore") && ui.button("CI").clicked() {
                     self.tab = Tab::Ci;
                 }
-            }
-
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                let halted = running && self.emu.status.cpu_halted;
-                let status = if halted {
-                    RichText::new("halted — safe to stop").color(Color32::LIGHT_GRAY)
-                } else if self.emu.status.in_prom {
-                    RichText::new("PROM").color(Color32::LIGHT_BLUE)
-                } else if running {
-                    RichText::new("IRIX running").color(Color32::LIGHT_GREEN)
-                } else {
-                    RichText::new("stopped").color(Color32::GRAY)
-                };
-                ui.label(status);
-                if running && !halted {
-                    ui.label(format!("{:.0} MIPS", self.emu.status.mips));
-                }
             });
-        });
+        }
+    }
+
+    /// Run-state line (IRIX running / PROM / halted / stopped + MIPS). Used in
+    /// the control column's status footer.
+    fn run_state_label(&self, ui: &mut egui::Ui) {
+        let running = self.emu.is_running();
+        let halted = running && self.emu.status.cpu_halted;
+        let status = if halted {
+            RichText::new("halted — safe to stop").color(Color32::LIGHT_GRAY)
+        } else if self.emu.status.in_prom {
+            RichText::new("PROM").color(Color32::LIGHT_BLUE)
+        } else if running {
+            RichText::new("IRIX running").color(Color32::LIGHT_GREEN)
+        } else {
+            RichText::new("stopped").color(Color32::GRAY)
+        };
+        ui.label(status);
+        if running && !halted {
+            ui.label(format!("{:.0} MIPS", self.emu.status.mips));
+        }
     }
 
     /// Resize the window so the central panel exactly holds the emulated
@@ -729,8 +768,10 @@ impl App {
     /// screens, so the picture stays crisp and fills the window without
     /// letterbox bars. Shrinks below native only if that wouldn't fit the
     /// monitor work area. `central_avail` is the framebuffer panel's free space;
-    /// `screen_rect − central_avail` is the surrounding chrome (menu / toolbar /
-    /// status bars) we must keep room for.
+    /// `screen_rect − central_avail` is the surrounding chrome (the left control
+    /// column, plus the config editor when open) we must keep room for. The math
+    /// is orientation-agnostic, so it works whether chrome is a side column or
+    /// the older top/bottom bars.
     fn snap_window_to_fb(ctx: &egui::Context, fb_px: egui::Vec2, central_avail: egui::Vec2) {
         if fb_px.x < 1.0 || fb_px.y < 1.0 { return; }
         // egui-winit reports screen_rect / available_size / monitor_size *and*
@@ -773,19 +814,44 @@ impl App {
             return;
         }
 
-        if self.fb_tex.is_none() || seq != self.last_fb_seq {
+        let avail = ui.available_size();
+
+        // Pick the texture filter from the *device-pixel* scale at which the
+        // framebuffer will actually be drawn. At an integer scale (native 1×,
+        // 2×, 3×, …) NEAREST keeps every emulated pixel crisp and square. At a
+        // fractional scale — which is what most users hit once they set a
+        // non-100% UI scale or resize the window freely — NEAREST has to double
+        // some source pixels and not others, so e.g. the strokes of a "T" come
+        // out uneven; LINEAR (bilinear) spreads the error and looks right. We
+        // need the native size to compute this, so on the very first frame
+        // (no texture yet) we default to NEAREST and correct on the next frame.
+        let want_nearest = match self.fb_tex.as_ref().map(|t| t.size_vec2()) {
+            Some(px) if px.x >= 1.0 && px.y >= 1.0 => {
+                let size = fb_fit_size(avail, px);
+                let scale = size.y * ui.ctx().pixels_per_point() / px.y;
+                is_integer_scale(scale)
+            }
+            _ => true,
+        };
+
+        if self.fb_tex.is_none() || seq != self.last_fb_seq || want_nearest != self.fb_nearest {
             let frame = self.emu.frame_sink.snapshot();
             if frame.width == 0 || frame.height == 0 { return; }
             let img = egui::ColorImage::from_rgba_unmultiplied(
                 [frame.width, frame.height], &frame.rgba);
+            let opts = if want_nearest {
+                egui::TextureOptions::NEAREST
+            } else {
+                egui::TextureOptions::LINEAR
+            };
             match &mut self.fb_tex {
-                Some(t) => t.set(img, egui::TextureOptions::NEAREST),
+                Some(t) => t.set(img, opts),
                 None => {
-                    self.fb_tex = Some(ui.ctx().load_texture(
-                        "rex3_fb", img, egui::TextureOptions::NEAREST));
+                    self.fb_tex = Some(ui.ctx().load_texture("rex3_fb", img, opts));
                 }
             }
             self.last_fb_seq = frame.seq;
+            self.fb_nearest = want_nearest;
         }
 
         // Consume the snap request before the immutable borrow of self.fb_tex.
@@ -793,19 +859,12 @@ impl App {
 
         let mut fb_rect = egui::Rect::NOTHING;
         if let Some(tex) = &self.fb_tex {
-            let avail = ui.available_size();
             let tex_size = tex.size_vec2();
             // First frame after Start: size the window to the guest display.
             if do_snap {
                 Self::snap_window_to_fb(ui.ctx(), tex_size, avail);
             }
-            let fb_aspect = tex_size.x / tex_size.y;
-            let avail_aspect = avail.x / avail.y;
-            let size = if avail_aspect > fb_aspect {
-                egui::vec2(avail.y * fb_aspect, avail.y)
-            } else {
-                egui::vec2(avail.x, avail.x / fb_aspect)
-            };
+            let size = fb_fit_size(avail, tex_size);
             ui.centered_and_justified(|ui| {
                 let response = ui.add(
                     egui::Image::new((tex.id(), size)).fit_to_exact_size(size).sense(egui::Sense::click())
@@ -1085,21 +1144,41 @@ impl App {
         }
     }
 
-    fn status_bar(&mut self, ui: &mut egui::Ui) {
-        ui.horizontal(|ui| {
-            let name = self.prefs.active_machine.as_deref().unwrap_or("(unsaved)");
-            ui.label(format!("Machine: {name}{}", if self.cfg_dirty { " *" } else { "" }));
-            ui.separator();
-            ui.label(format!("Dirty COW: {}", self.emu.status.dirty_cow));
-            if let Some((msg, when)) = self.toast.clone() {
-                if when.elapsed().as_secs() < 5 {
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        ui.label(RichText::new(msg).color(Color32::YELLOW));
-                    });
-                } else {
-                    self.toast = None;
-                }
+    /// Status footer for the left control column: run-state, machine name,
+    /// dirty-COW count, and the transient toast. Laid out vertically.
+    fn status_block(&mut self, ui: &mut egui::Ui) {
+        ui.add_space(4.0);
+        self.run_state_label(ui);
+        ui.separator();
+        let name = self.prefs.active_machine.as_deref().unwrap_or("(unsaved)");
+        ui.label(format!("Machine: {name}{}", if self.cfg_dirty { " *" } else { "" }));
+        ui.label(format!("Dirty COW: {}", self.emu.status.dirty_cow));
+        if let Some((msg, when)) = self.toast.clone() {
+            if when.elapsed().as_secs() < 5 {
+                ui.add_space(2.0);
+                ui.label(RichText::new(msg).color(Color32::YELLOW));
+            } else {
+                self.toast = None;
             }
+        }
+        ui.add_space(2.0);
+    }
+
+    /// The full left control column: machine controls, menus, and config
+    /// quick-buttons stacked vertically, with the status block pinned to the
+    /// bottom. This replaces the old top menu bar + toolbar + bottom status bar,
+    /// freeing vertical space for the (tall, 5:4) emulated display.
+    fn control_panel(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
+        egui::TopBottomPanel::bottom("ctl_status")
+            .show_inside(ui, |ui| self.status_block(ui));
+
+        egui::ScrollArea::vertical().show(ui, |ui| {
+            ui.add_space(4.0);
+            self.machine_controls(ui);
+            ui.separator();
+            self.menu_list(ui, ctx);
+            ui.separator();
+            self.config_quick_buttons(ui);
         });
     }
 }
@@ -1137,16 +1216,17 @@ impl eframe::App for App {
         if zoom_out   { self.prefs.ui_scale = (self.prefs.ui_scale - 0.1).max(UI_SCALE_MIN); ctx.set_zoom_factor(self.prefs.ui_scale); }
         if zoom_reset { self.prefs.ui_scale = settings::UI_SCALE_DEFAULT; ctx.set_zoom_factor(self.prefs.ui_scale); }
 
-        // In fullscreen, only reveal menu/toolbar when the cursor is near the top.
-        let pointer_y = ctx.input(|i| i.pointer.latest_pos().map(|p| p.y).unwrap_or(f32::MAX));
-        let chrome_visible = !self.fullscreen || pointer_y < 36.0;
+        // The control column lives on the left so the (tall, 5:4) emulated
+        // display gets the full window height. In fullscreen it auto-hides and
+        // reveals only when the cursor is near the left edge.
+        let pointer_x = ctx.input(|i| i.pointer.latest_pos().map(|p| p.x).unwrap_or(f32::MAX));
+        let chrome_visible = !self.fullscreen || pointer_x < 36.0;
 
         if chrome_visible {
-            egui::TopBottomPanel::top("menu_bar").show(ctx, |ui| self.menu_bar(ui, ctx));
-            egui::TopBottomPanel::top("toolbar").show(ctx, |ui| self.toolbar(ui));
-        }
-        if !self.fullscreen {
-            egui::TopBottomPanel::bottom("status_bar").show(ctx, |ui| self.status_bar(ui));
+            egui::SidePanel::left("control_panel")
+                .resizable(false)
+                .exact_width(186.0)
+                .show(ctx, |ui| self.control_panel(ui, ctx));
         }
 
         // Config editor lives in a collapsible side panel so the emulator
