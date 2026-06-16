@@ -275,7 +275,6 @@ impl BlockCompiler {
                         let old_gpr = gpr;
                         let old_hi = hi;
                         let old_lo = lo;
-                        let old_modified = modified_gprs;
                         let (_, delay_d) = &instrs[idx];
                         let delay_pc = block_pc.wrapping_add(idx as u64 * 4);
                         let delay_result = emit_instruction(
@@ -297,7 +296,9 @@ impl BlockCompiler {
                                 gpr = old_gpr;
                                 hi = old_hi;
                                 lo = old_lo;
-                                modified_gprs = old_modified;
+                                // modified_gprs intentionally not restored: the
+                                // post-loop flush stores every GPR (all_modified
+                                // = 0xFFFFFFFE), so its value is dead past here.
                                 compiled_count -= 1;
                                 break;
                             }
