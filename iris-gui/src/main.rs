@@ -105,7 +105,12 @@ fn main() -> eframe::Result<()> {
         // immediately; clamp to the monitor so it can't overflow a smaller
         // screen. Persisted size (once saved) takes precedence over the default.
         .with_inner_size(prefs.window_size.unwrap_or(WINDOW_DEFAULT_SIZE))
-        .with_clamp_size_to_monitor_size(true);
+        .with_clamp_size_to_monitor_size(true)
+        // Start hidden so the first frame can fit the window to the monitor
+        // (see the reveal logic in `update`) before it's shown — the window
+        // then appears already at the right size instead of opening at the
+        // default and visibly resizing.
+        .with_visible(false);
     if prefs.fullscreen {
         viewport = viewport.with_fullscreen(true);
     }
@@ -167,6 +172,13 @@ struct App {
     /// first frame that knows the monitor size, to fit the window to a 1280×1024
     /// display so it opens correctly sized before the first Start.
     pending_launcher_fit: bool,
+    /// The window starts hidden (`with_visible(false)`) so the first frame can
+    /// fit it to the monitor before it's shown. Set true once we've revealed it.
+    revealed: bool,
+    /// Frames rendered since launch; gates the reveal so the startup fit's
+    /// resize is applied before the window appears (and as a hard fallback so a
+    /// missing monitor size can't leave the window hidden).
+    startup_frame: u32,
     /// Per-frame state for the egui→PS2 input pump (modifier diff,
     /// mouse button mask, last cursor position).
     input_state: input::InputState,
@@ -269,6 +281,8 @@ impl App {
             // First-ever launch (no saved size) → fit the window to the monitor
             // on the first frame instead of using the static default verbatim.
             pending_launcher_fit: prefs.window_size.is_none(),
+            revealed: false,
+            startup_frame: 0,
             prefs,
             cfg,
             cfg_path,
@@ -666,6 +680,21 @@ impl App {
             ui.menu_button("Help  ▶", |ui| {
                 ui.label(RichText::new("IRIS — SGI Indy (MIPS R4400) Emulator").strong());
                 ui.label(format!("Version {}", env!("APP_VERSION")));
+                ui.separator();
+                ui.label(RichText::new("Diagnostics").strong());
+                if ui.button("📷 Test Camera…").clicked() {
+                    self.open_camera_test();
+                    ui.close_menu();
+                }
+                let running = self.emu.is_running();
+                if ui.add_enabled(running, egui::Button::new("🌐 Network test (serial console)…"))
+                    .on_hover_text("Connect to the emulator's loopback serial server (127.0.0.1:8881)")
+                    .on_disabled_hover_text("Start a machine first")
+                    .clicked()
+                {
+                    self.open_serial_console();
+                    ui.close_menu();
+                }
                 ui.separator();
                 ui.label(RichText::new("Authors").strong());
                 ui.label("Original: techomancer");
@@ -1249,7 +1278,13 @@ impl eframe::App for App {
                 egui::ScrollArea::vertical().show(ui, |ui| self.central_tabs(ui));
             });
 
-        egui::CentralPanel::default().show(ctx, |ui| {
+        // Zero the central panel's inner margin so the emulated display reaches
+        // the window edges — every reclaimed pixel makes the (tall, 5:4) picture
+        // a little bigger. Keep the dark panel fill so the aspect-ratio
+        // letterbox bars stay black.
+        let central_frame = egui::Frame::central_panel(&ctx.style())
+            .inner_margin(egui::Margin::ZERO);
+        egui::CentralPanel::default().frame(central_frame).show(ctx, |ui| {
             // The central panel always shows the emulator screen when the
             // machine is running (the REX3 framebuffer), falling back to the
             // welcome / status summary when idle. The config editor no longer
@@ -1426,6 +1461,23 @@ impl eframe::App for App {
                     .unwrap_or_default();
                 self.missing_modal = None;
                 self.detach_and_start(&ids);
+            }
+        }
+
+        // The window starts hidden so the first frame(s) can fit it to the
+        // monitor (the launcher fit, when not running) before it's shown —
+        // avoiding a visible open-then-resize. Reveal one frame after the fit
+        // settles so its resize has applied, or unconditionally after a short
+        // grace period so a missing monitor size can't leave the window hidden.
+        if !self.revealed {
+            self.startup_frame = self.startup_frame.saturating_add(1);
+            let fit_settled = !self.pending_launcher_fit;
+            if (fit_settled && self.startup_frame >= 2) || self.startup_frame >= 10 {
+                ctx.send_viewport_cmd(ViewportCommand::Visible(true));
+                self.revealed = true;
+            } else {
+                // Keep frames coming while hidden so we reach the reveal.
+                ctx.request_repaint();
             }
         }
     }

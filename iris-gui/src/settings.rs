@@ -55,14 +55,15 @@ pub const UI_SCALE_MIN: f32 = 1.0;
 pub const UI_SCALE_MAX: f32 = 3.0;
 pub const UI_SCALE_DEFAULT: f32 = 1.25;
 
-/// First-launch window size in logical points. Kept modest (fits a 1512×982
-/// laptop desktop and a 1080p screen) because a full 1280×1024 display + chrome
-/// is ~1120 pt tall and won't fit those desktops. On first launch the window is
-/// immediately fit to the monitor for a 1280×1024 display (see the launcher fit
-/// in `main`), and refined by the on-Start snap; this value is only the brief
-/// pre-fit size and the fallback when the monitor size is unknown. Once a real
-/// size is persisted to `gui.json`, that is used instead.
-pub const WINDOW_DEFAULT_SIZE: [f32; 2] = [1120.0, 880.0];
+/// First-launch window size in logical points. Sized to match the *running*
+/// window for the standard 1280×1024 display so the picture doesn't visibly
+/// jump when you press Start: with the left control column (~186 pt) and no
+/// top/bottom chrome, the running size at the default UI scale is ≈ the native
+/// 1280×1024 display plus the column width. The launcher fit (see `main`) and
+/// the on-Start snap still refine this — clamping to the monitor on smaller
+/// screens — so it's only the initial size and the fallback when the monitor
+/// size is unknown. Once a real size is persisted to `gui.json`, that's used.
+pub const WINDOW_DEFAULT_SIZE: [f32; 2] = [1512.0, 1024.0];
 
 fn default_ui_scale() -> f32 { UI_SCALE_DEFAULT }
 
