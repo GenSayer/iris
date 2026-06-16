@@ -150,5 +150,16 @@ name = "chd_extract"
 path = "src/bin/chd_extract.rs"
 required-features = ["chd"]
 
+# Mac App Store fix (guideline 2.5.1): eframe's winit (0.30) calls the private
+# SkyLight API `CGSSetWindowBackgroundBlurRadius`, whose symbol Apple's binary
+# scan rejects. Our vendored copy stubs WindowDelegate::set_blur to a no-op and
+# drops the private extern declarations; iris-gui never requests window blur,
+# so behaviour is unchanged. Only the 0.30.x requirement (eframe → egui-winit →
+# glutin-winit) matches this patch; iris's own winit 0.29 dependency is the
+# keyboard-KeyCode type only and creates no window in iris-gui, so its blur code
+# is dead-stripped. See rules/macos/appstore-private-api.md.
+[patch.crates-io]
+winit = { path = "third_party/winit-0.30.13" }
+
 
 
