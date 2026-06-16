@@ -464,7 +464,7 @@ impl App {
     /// left control column. Each is a full-width drop-down button.
     fn menu_list(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
         ui.vertical(|ui| {
-            ui.menu_button("File", |ui| {
+            ui.menu_button("File  ▶", |ui| {
                 ui.set_min_width(220.0);
                 if ui.button("New machine…").clicked() {
                     self.new_machine.open();
@@ -556,7 +556,7 @@ impl App {
                     ctx.send_viewport_cmd(ViewportCommand::Close);
                 }
             });
-            ui.menu_button("Machine", |ui| {
+            ui.menu_button("Machine  ▶", |ui| {
                 let running = self.emu.is_running();
                 if ui.add_enabled(!running, egui::Button::new("Start")).clicked() {
                     self.start_emulator();
@@ -601,7 +601,7 @@ impl App {
                     ui.close_menu();
                 }
             });
-            ui.menu_button("Memory", |ui| {
+            ui.menu_button("Memory  ▶", |ui| {
                 ui.set_min_width(220.0);
                 let total: u32 = self.cfg.banks.iter().sum();
                 ui.label(RichText::new(format!("Total: {total} MB")).strong());
@@ -629,7 +629,7 @@ impl App {
                     });
                 }
             });
-            ui.menu_button("SCSI", |ui| {
+            ui.menu_button("SCSI  ▶", |ui| {
                 let action = scsi_menu::draw(ui, &self.cfg);
                 match action {
                     scsi_menu::ScsiAction::None => {}
@@ -644,7 +644,7 @@ impl App {
                     }
                 }
             });
-            ui.menu_button("View", |ui| {
+            ui.menu_button("View  ▶", |ui| {
                 if ui.button(if self.fullscreen { "Exit fullscreen (F11)" } else { "Fullscreen (F11)" }).clicked() {
                     self.fullscreen = !self.fullscreen;
                     ctx.send_viewport_cmd(ViewportCommand::Fullscreen(self.fullscreen));
@@ -663,7 +663,7 @@ impl App {
                 });
                 ui.label(RichText::new("Ctrl+= / Ctrl+- / Ctrl+0 to zoom").weak().small());
             });
-            ui.menu_button("Help", |ui| {
+            ui.menu_button("Help  ▶", |ui| {
                 ui.label(RichText::new("IRIS — SGI Indy (MIPS R4400) Emulator").strong());
                 ui.label(format!("Version {}", env!("APP_VERSION")));
                 ui.separator();
