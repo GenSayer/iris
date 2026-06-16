@@ -19,7 +19,11 @@
     <key>com.apple.security.cs.allow-jit</key>
     <true/>
 
-    <!-- IndyCam / VINO emulation -->
+    <!-- Host-camera capture for the emulated IndyCam (VINO video-in source).
+         User-facing: Video-In tab → "Test Camera" (live preview), and
+         [vino] source = "camera" once IRIX is booted. Requires the matching
+         NSCameraUsageDescription in Info.plist. See
+         docs/appstore-review-response.md. -->
     <key>com.apple.security.device.camera</key>
     <true/>
 
@@ -34,9 +38,15 @@
     <key>com.apple.security.files.bookmarks.app-scope</key>
     <true/>
 
-    <!-- Ethernet emulation (SEEQ 8003) -->
+    <!-- Outbound: emulated SEEQ 8003 Ethernet (guest → internet via user-mode
+         NAT) and the in-app serial-console viewer connecting to loopback. -->
     <key>com.apple.security.network.client</key>
     <true/>
+    <!-- Inbound (listen/accept): the emulator exposes the guest's serial
+         console (ttyd1, 127.0.0.1:8881) and PROM monitor on loopback TCP — the
+         in-app "Serial console…" viewer connects to these — and binds
+         user-configured inbound port-forwards into the emulated Ethernet.
+         See docs/appstore-review-response.md. -->
     <key>com.apple.security.network.server</key>
     <true/>
 </dict>

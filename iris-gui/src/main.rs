@@ -1,5 +1,6 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+mod camera_test;
 mod config_ui;
 mod dialogs;
 mod framebuffer;
@@ -8,6 +9,7 @@ mod input;
 mod macos_sandbox;
 mod safe_stop;
 mod scsi_menu;
+mod serial_console;
 mod settings;
 mod single_instance;
 
@@ -144,6 +146,17 @@ struct App {
     /// Per-frame state for the egui→PS2 input pump (modifier diff,
     /// mouse button mask, last cursor position).
     input_state: input::InputState,
+    /// Active "Test Camera" preview (None when the window is closed). Opening it
+    /// starts host-camera capture; dropping it releases the device.
+    camera_test: Option<camera_test::CameraTest>,
+    /// egui texture for the camera-test preview + the last frame seq uploaded.
+    camera_test_tex: Option<egui::TextureHandle>,
+    camera_test_seq: u64,
+    /// Active in-app IRIX serial-console viewer (None when closed). Connects to
+    /// the loopback serial server; dropping it closes the connection.
+    serial_console: Option<serial_console::SerialConsole>,
+    /// Pending line typed into the serial console input field.
+    serial_input: String,
 }
 
 struct StopModal {
@@ -253,6 +266,11 @@ impl App {
             last_fb_seq: 0,
             pending_fb_snap: false,
             input_state: input::InputState::default(),
+            camera_test: None,
+            camera_test_tex: None,
+            camera_test_seq: 0,
+            serial_console: None,
+            serial_input: String::new(),
         }
     }
 
@@ -548,6 +566,13 @@ impl App {
                     }
                     ui.close_menu();
                 }
+                if ui.add_enabled(running, egui::Button::new("Serial console…"))
+                    .on_hover_text("View the IRIX serial console (ttyd1) over the loopback serial server")
+                    .clicked()
+                {
+                    self.open_serial_console();
+                    ui.close_menu();
+                }
             });
             ui.menu_button("Memory", |ui| {
                 ui.set_min_width(220.0);
@@ -827,7 +852,176 @@ impl App {
         ui.separator();
         match show_tab(ui, self.tab, &mut self.cfg, &mut self.jit) {
             ConfigAction::RequestEmbeddedProm => self.confirm_embedded_prom = true,
+            ConfigAction::TestCamera => self.open_camera_test(),
             ConfigAction::None => {}
+        }
+    }
+
+    /// Open (or restart) the live host-camera preview using the current
+    /// `[vino]` standard and camera index. Releases any previous test first.
+    fn open_camera_test(&mut self) {
+        use iris::video_source::VideoStandard;
+        let standard = match self.cfg.vino.standard {
+            iris::config::VinoStandard::Ntsc => VideoStandard::Ntsc,
+            iris::config::VinoStandard::Pal  => VideoStandard::Pal,
+        };
+        // Drop the previous instance first so the camera is fully released
+        // before re-opening (its Drop joins the capture thread).
+        self.camera_test = None;
+        self.camera_test_tex = None;
+        self.camera_test_seq = 0;
+        self.camera_test = Some(camera_test::CameraTest::start(standard, self.cfg.vino.camera_index));
+    }
+
+    /// Draw the live host-camera preview window (no-op when closed). Closing it
+    /// (or pressing Stop) drops the `CameraTest`, releasing the camera.
+    fn camera_test_window(&mut self, ctx: &egui::Context) {
+        let Some(test) = &self.camera_test else { return };
+
+        // Pull the latest frame and upload it to the preview texture.
+        if let Some((w, h, rgba)) = test.take_new_frame(&mut self.camera_test_seq) {
+            let image = egui::ColorImage::from_rgba_unmultiplied([w as usize, h as usize], &rgba);
+            match &mut self.camera_test_tex {
+                Some(tex) => tex.set(image, egui::TextureOptions::LINEAR),
+                None => {
+                    self.camera_test_tex =
+                        Some(ctx.load_texture("camera-test", image, egui::TextureOptions::LINEAR));
+                }
+            }
+        }
+        let status = test.status();
+        let error = test.error();
+
+        let mut open = true;
+        let mut close_now = false;
+        egui::Window::new("Test Camera")
+            .open(&mut open)
+            .collapsible(false)
+            .resizable(false)
+            .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+            .show(ctx, |ui| {
+                if let Some(e) = &error {
+                    ui.colored_label(Color32::from_rgb(200, 80, 80),
+                        format!("Camera unavailable: {e}"));
+                    ui.label(RichText::new(
+                        "Check that a camera is connected and that IRIS has camera \
+                         permission (System Settings → Privacy & Security → Camera).")
+                        .weak());
+                } else if let Some(tex) = &self.camera_test_tex {
+                    // The capture field is half-height (interlaced), so present
+                    // it at ~4:3 by drawing into a fixed-size rect.
+                    ui.add(egui::Image::new(&*tex)
+                        .fit_to_exact_size(egui::vec2(480.0, 360.0))
+                        .rounding(4.0));
+                } else {
+                    ui.add_space(110.0);
+                    ui.label("Starting capture…");
+                    ui.label(RichText::new(
+                        "If no image appears, grant camera access in System \
+                         Settings → Privacy & Security → Camera, then reopen.")
+                        .weak().small());
+                }
+                ui.add_space(6.0);
+                ui.label(RichText::new(&status).weak().small());
+                ui.add_space(6.0);
+                if ui.button("Close").clicked() {
+                    close_now = true;
+                }
+            });
+
+        if !open || close_now {
+            // Drop releases the camera (CameraTest::Drop joins the worker).
+            self.camera_test = None;
+            self.camera_test_tex = None;
+            self.camera_test_seq = 0;
+        } else {
+            // Keep the preview animating even when egui is otherwise idle.
+            ctx.request_repaint_after(std::time::Duration::from_millis(33));
+        }
+    }
+
+    /// Open (or reconnect) the in-app IRIX serial-console viewer. Connects to
+    /// the loopback serial server the running emulator exposes.
+    fn open_serial_console(&mut self) {
+        self.serial_console = Some(serial_console::SerialConsole::connect());
+    }
+
+    /// Draw the in-app serial-console window (no-op when closed). Demonstrates
+    /// the loopback serial server: the emulator listens on 127.0.0.1:8881 and
+    /// this viewer connects to it.
+    fn serial_console_window(&mut self, ctx: &egui::Context) {
+        let Some(console) = &self.serial_console else { return };
+        let (text, connected, error, _seq) = console.snapshot();
+
+        let mut open = true;
+        let mut close_now = false;
+        let mut clear_now = false;
+        let mut to_send: Option<String> = None;
+        egui::Window::new("IRIX Serial Console (ttyd1)")
+            .open(&mut open)
+            .default_width(620.0)
+            .default_height(420.0)
+            .resizable(true)
+            .show(ctx, |ui| {
+                ui.horizontal(|ui| {
+                    if let Some(e) = &error {
+                        ui.colored_label(Color32::from_rgb(200, 80, 80), e);
+                    } else if connected {
+                        ui.colored_label(Color32::from_rgb(90, 170, 90),
+                            format!("● connected to {}", serial_console::SERIAL_ADDR));
+                    } else {
+                        ui.label("disconnected");
+                    }
+                });
+                ui.separator();
+
+                egui::ScrollArea::vertical()
+                    .stick_to_bottom(true)
+                    .auto_shrink([false, false])
+                    .max_height(320.0)
+                    .show(ui, |ui| {
+                        ui.add(
+                            egui::Label::new(
+                                RichText::new(&text).monospace().size(12.0),
+                            )
+                            .wrap(),
+                        );
+                    });
+
+                ui.separator();
+                ui.horizontal(|ui| {
+                    let resp = ui.add(
+                        egui::TextEdit::singleline(&mut self.serial_input)
+                            .hint_text("type a command, press Enter")
+                            .desired_width(420.0),
+                    );
+                    let entered = resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+                    if (ui.button("Send").clicked() || entered) && connected {
+                        to_send = Some(std::mem::take(&mut self.serial_input));
+                        resp.request_focus();
+                    }
+                    if ui.button("Clear").clicked() {
+                        clear_now = true;
+                    }
+                    if ui.button("Close").clicked() {
+                        close_now = true;
+                    }
+                });
+            });
+
+        if let Some(line) = to_send {
+            let mut bytes = line.into_bytes();
+            bytes.push(b'\n');
+            console.send(&bytes);
+        }
+        if clear_now {
+            console.clear();
+        }
+        if !open || close_now {
+            self.serial_console = None;
+        } else if connected {
+            // Poll for new console output even when egui is otherwise idle.
+            ctx.request_repaint_after(std::time::Duration::from_millis(80));
         }
     }
 
@@ -1024,6 +1218,12 @@ impl eframe::App for App {
             self.toast(format!("created {path_str} and attached at scsi{}", result.scsi_id));
         }
 
+        // Live host-camera test window.
+        self.camera_test_window(ctx);
+
+        // In-app IRIX serial-console viewer.
+        self.serial_console_window(ctx);
+
         // Safe-stop confirmation modal.
         let mut close_modal = false;
         let mut do_force = false;
@@ -1051,25 +1251,16 @@ impl eframe::App for App {
         if close_modal { self.stop_modal = None; }
         if do_force { self.emu.send(Cmd::Stop); }
         if do_halt  {
-            // iris always opens 127.0.0.1:8881 as the ttyd1 (IRIX serial
-            // console) TCP listener in non-CI mode. Connect to it,
-            // write "halt\n", disconnect. IRIX takes a few seconds to
-            // shut down cleanly; the user can hit Stop again once the
-            // PROM "halted" message appears.
-            use std::io::Write as _;
-            match std::net::TcpStream::connect_timeout(
-                &"127.0.0.1:8881".parse().unwrap(),
-                std::time::Duration::from_millis(500),
-            ) {
-                Ok(mut s) => {
-                    let _ = s.write_all(b"halt\n");
-                    self.toast("sent 'halt' to IRIX — wait for shutdown, then Stop");
-                }
-                Err(e) => {
-                    self.toast(format!("halt failed: {e} — falling back to Force stop"));
-                    self.emu.send(Cmd::Stop);
-                }
-            }
+            // Type "halt\n" at the IRIX serial console in-process (see
+            // EmulatorHandle / Machine::inject_serial_console). This used to
+            // open a loopback TCP client to 127.0.0.1:8881; doing it in-process
+            // means clean shutdown no longer depends on the serial server
+            // socket (which the macOS App Sandbox would otherwise gate behind
+            // the network.server entitlement). IRIX takes a few seconds to shut
+            // down cleanly; the user can hit Stop once the PROM "halted"
+            // message appears.
+            self.emu.send(Cmd::HaltIrix);
+            self.toast("sent 'halt' to IRIX — wait for shutdown, then Stop");
         }
 
         // Confirm switching from a custom PROM back to the built-in image.

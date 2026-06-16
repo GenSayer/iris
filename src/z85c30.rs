@@ -584,6 +584,12 @@ pub struct Z85c30 {
     // so `Z85c30` stays `Clone` and the swap is thread-safe.
     backend_a: Arc<Mutex<Arc<dyn SerialBackend>>>,
     backend_b: Arc<Mutex<Arc<dyn SerialBackend>>>,
+    // In-process injection queue for channel B (tty1, the IRIX serial console).
+    // Bytes queued via `inject_b` are delivered to the guest by the channel-B
+    // RX thread ahead of any socket input, so a host action (e.g. the GUI's
+    // "Send IRIX halt") can type at the console without opening a loopback TCP
+    // client. Independent of whichever backend is installed.
+    inject_b: Arc<Mutex<VecDeque<u8>>>,
     running: Arc<AtomicBool>,
     threads: Arc<Mutex<Vec<thread::JoinHandle<()>>>>,
 }
@@ -628,6 +634,7 @@ impl Z85c30 {
             channel_b: Arc::new((Mutex::new(Channel::new("B", ip_b, ip_a, callback)), Condvar::new())),
             backend_a: Arc::new(Mutex::new(backend_a)),
             backend_b: Arc::new(Mutex::new(backend_b)),
+            inject_b: Arc::new(Mutex::new(VecDeque::new())),
             running: Arc::new(AtomicBool::new(false)),
             threads: Arc::new(Mutex::new(Vec::new())),
         }
@@ -652,6 +659,16 @@ impl Z85c30 {
     /// `TeeBackend` without replacing the listener.
     pub fn backend_b(&self) -> Arc<dyn SerialBackend> {
         self.backend_b.lock().clone()
+    }
+
+    /// Queue host bytes to be delivered to channel B (tty1, the IRIX serial
+    /// console) as if typed at the console — entirely in-process, with no
+    /// loopback TCP client. The bytes ride the same RX path as socket input
+    /// (FIFO backpressure + baud pacing), so the guest sees them identically.
+    /// Used by the GUI's "Send IRIX halt" for a clean shutdown that doesn't
+    /// depend on the serial server socket.
+    pub fn inject_b(&self, data: &[u8]) {
+        self.inject_b.lock().extend(data.iter().copied());
     }
 
     pub fn read_a_control(&self) -> u8 { 
@@ -871,6 +888,9 @@ impl Device for Z85c30 {
             let rx_channel = channel_arc.clone();
             let rx_backend = backend.clone();
             let running = self.running.clone();
+            // Only channel B (the IRIX serial console) accepts in-process
+            // injection; channel A has no queue.
+            let rx_inject = if i == 1 { Some(self.inject_b.clone()) } else { None };
 
             threads.push(thread::Builder::new().name(format!("SCC-RX-{}", ch_name)).spawn(move || {
                 let mut last_rx_time = Instant::now();
@@ -886,12 +906,18 @@ impl Device for Z85c30 {
                 while running.load(Ordering::Relaxed) {
                     let mut byte = match pending.take() {
                         Some(b) => b,
-                        None => match rx_backend.recv_byte() {
-                            Ok(b) => b,
-                            Err(_) => {
-                                thread::sleep(Duration::from_millis(10));
-                                continue;
-                            }
+                        // In-process injection (channel B) takes priority over
+                        // socket input, so a queued "halt\n" is delivered even
+                        // when no TCP client is attached.
+                        None => match rx_inject.as_ref().and_then(|q| q.lock().pop_front()) {
+                            Some(b) => b,
+                            None => match rx_backend.recv_byte() {
+                                Ok(b) => b,
+                                Err(_) => {
+                                    thread::sleep(Duration::from_millis(10));
+                                    continue;
+                                }
+                            },
                         },
                     };
                     if byte == 0x05 {

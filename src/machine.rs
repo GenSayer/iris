@@ -694,6 +694,13 @@ impl Machine {
         self.ci_serial.clone()
     }
 
+    /// Type bytes at the IRIX serial console (tty1) in-process, without any
+    /// loopback TCP client. Used by the GUI to send `halt\n` for a clean
+    /// shutdown so the feature doesn't depend on the serial server socket.
+    pub fn inject_serial_console(&self, bytes: &[u8]) {
+        self.hpc3.ioc().scc().inject_b(bytes);
+    }
+
     /// CPU thread, started explicitly by the CI `start` command or by
     /// `ci_restore`. In `--ci` mode the CPU is not autostarted in `start()`
     /// — the harness drives startup via `restore`.

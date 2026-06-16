@@ -12,6 +12,9 @@ use std::thread::JoinHandle;
 pub enum Cmd {
     Start(Box<MachineConfig>),
     Stop,
+    /// Type `halt\n` at the IRIX serial console in-process (no loopback socket)
+    /// for a clean guest shutdown.
+    HaltIrix,
     SaveState(String),
     RestoreState(String),
     Screenshot(PathBuf),
@@ -236,6 +239,12 @@ fn worker_loop(
                         let msg = panic_msg(&panic);
                         let _ = evt_tx.send(Evt::Error(format!("start failed: {msg}")));
                     }
+                }
+            }
+            Ok(Cmd::HaltIrix) => {
+                match machine.as_ref() {
+                    Some(m) => m.inject_serial_console(b"halt\n"),
+                    None => { let _ = evt_tx.send(Evt::Error("halt: not running".into())); }
                 }
             }
             Ok(Cmd::Stop) => {
