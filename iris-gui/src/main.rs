@@ -430,6 +430,11 @@ impl App {
         // supersedes any pending first-launch fit.
         self.pending_fb_snap = true;
         self.pending_launcher_fit = false;
+        // Drop the previous run's cached texture so we never flash its last
+        // frame before the new run renders (the shared FrameSink is reset
+        // worker-side on Start; this clears the GUI's mirror of it).
+        self.fb_tex = None;
+        self.last_fb_seq = 0;
         // Assume halted at boot (idle at the PROM) so the auto-release only
         // fires on a later running→halted transition, not at startup.
         self.prev_cpu_halted = true;

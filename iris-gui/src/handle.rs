@@ -197,6 +197,10 @@ fn worker_loop(
                     let _ = evt_tx.send(Evt::Error("emulator already running".into()));
                     continue;
                 }
+                // Clear the previous run's last frame so the restarted machine
+                // shows the "waiting for first REX3 frame" placeholder instead
+                // of the stale screen until its first frame is rendered.
+                frame_sink.reset();
                 // Wrap construction in catch_unwind: Machine::new and
                 // friends may panic on missing files, bad images, etc.
                 // We surface those as Evt::Error toasts instead of

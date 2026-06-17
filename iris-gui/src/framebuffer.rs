@@ -44,6 +44,14 @@ impl FrameSink {
     /// copying the whole buffer on every repaint when nothing is new.
     pub fn snapshot(&self) -> Frame { self.frame.lock().clone() }
 
+    /// Reset to the "no frame yet" state (seq 0, blank frame). Call before a
+    /// fresh run starts rendering so a restart shows the "waiting for first
+    /// frame" placeholder instead of the previous run's last frame.
+    pub fn reset(&self) {
+        *self.frame.lock() = Frame::default();
+        self.seq.store(0, Ordering::Release);
+    }
+
     fn lock(&self) -> MutexGuard<'_, Frame> { self.frame.lock() }
 }
 
