@@ -105,6 +105,37 @@ pub fn write_nvram_mac(path: &str, mac: [u8; 6]) -> std::io::Result<bool> {
     Ok(true)
 }
 
+/// Default NVRAM image baked into the binary: the repo's known-good NVRAM (boot
+/// env present) with the MAC zeroed. Lets a fresh install — especially the
+/// bundled `.app`, which has nothing in its working dir to migrate — boot with
+/// proper PROM env, while the auto-write fills in a per-machine MAC.
+pub const DEFAULT_NVRAM: &[u8] = include_bytes!("../assets/nvram-default.bin");
+
+/// Write the embedded default NVRAM to `path` if there's no (non-empty) file
+/// there yet. Returns true if it seeded one. Creates the parent dir as needed.
+pub fn ensure_nvram_seeded(path: &str) -> bool {
+    if std::fs::metadata(path).map(|m| m.len() > 0).unwrap_or(false) {
+        return false;
+    }
+    if let Some(parent) = Path::new(path).parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    std::fs::write(path, DEFAULT_NVRAM).is_ok()
+}
+
+/// Overwrite the NVRAM at `path` with the embedded default (boot env, blank
+/// MAC) — backs the current file up to `<path>.bak` first. Used by the
+/// "Reset NVRAM / fresh PRAM" menu action.
+pub fn reset_nvram(path: &str) -> std::io::Result<()> {
+    if std::fs::metadata(path).map(|m| m.len() > 0).unwrap_or(false) {
+        let _ = std::fs::copy(path, format!("{path}.bak"));
+    }
+    if let Some(parent) = Path::new(path).parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    std::fs::write(path, DEFAULT_NVRAM)
+}
+
 /// Allowed UI-scale range, shared by the View-menu slider, the Ctrl +/-/0
 /// keyboard zoom, and the load-time clamp so a stale persisted value can never
 /// put the UI into a state the slider can't represent (which egui would then

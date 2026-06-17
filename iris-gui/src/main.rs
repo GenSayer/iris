@@ -460,6 +460,12 @@ impl App {
         // hold the machine at the PROM by interrupting autoboot (see the Esc
         // guard in `update`) so the user sets the MAC before IRIX boots — one
         // boot instead of boot-then-reboot.
+        // Seed a default NVRAM if there's none yet (a fresh install / bundled
+        // app has nothing in the working dir to migrate), so the machine boots
+        // with proper PROM env instead of a blank one.
+        if settings::ensure_nvram_seeded(&self.cfg.nvram) {
+            self.toast("seeded a default NVRAM");
+        }
         // Networking needs an Ethernet MAC in NVRAM (6 raw bytes at a fixed
         // offset). If there's none, write a generated one *now*, before boot —
         // so IRIX attaches ec0 on the first boot, no PROM monitor / reboot.
@@ -643,6 +649,23 @@ impl App {
                 if ui.add_enabled(running, egui::Button::new("Reset")).clicked() {
                     self.emu.send(Cmd::Stop);
                     self.start_emulator();
+                    ui.close_menu();
+                }
+                if ui.add_enabled(!running, egui::Button::new("Reset NVRAM (fresh PRAM)"))
+                    .on_hover_text(format!(
+                        "Restore this machine's NVRAM to defaults and assign a fresh Ethernet MAC.\n{}",
+                        abs_path(&self.cfg.nvram)))
+                    .clicked()
+                {
+                    match settings::reset_nvram(&self.cfg.nvram) {
+                        Ok(()) => {
+                            let seed = self.prefs.active_machine.as_deref().unwrap_or("indy");
+                            let mac = settings::generate_mac_bytes(seed);
+                            let _ = settings::write_nvram_mac(&self.cfg.nvram, mac);
+                            self.toast(format!("NVRAM reset — new MAC {}", settings::mac_to_string(mac)));
+                        }
+                        Err(e) => self.toast(format!("NVRAM reset failed: {e}")),
+                    }
                     ui.close_menu();
                 }
                 ui.separator();
