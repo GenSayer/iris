@@ -1,7 +1,7 @@
 use iris::config::MachineConfig;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 /// GUI-only persisted state. Lives at `~/.config/iris/gui.json`.
 ///
@@ -85,7 +85,50 @@ fn default_vm_scale() -> f32 { VM_SCALE_DEFAULT }
 
 impl GuiSettings {
     pub fn config_path() -> Option<PathBuf> {
-        dirs::config_dir().map(|d| d.join("iris").join("gui.json"))
+        Self::data_dir().map(|d| d.join("gui.json"))
+    }
+
+    /// Stable per-user directory for GUI state (gui.json, nvram.bin, …). The OS
+    /// maps this into the sandbox container automatically on the App Store
+    /// build, so the *same* code resolves the right place for `cargo run` and
+    /// the bundled app alike.
+    pub fn data_dir() -> Option<PathBuf> {
+        dirs::config_dir().map(|d| d.join("iris"))
+    }
+
+    /// Default absolute NVRAM path: `<data_dir>/nvram.bin`. Absolute on purpose
+    /// — a relative `nvram.bin` resolves against the process's working
+    /// directory, which differs between `cargo run` (repo root) and a bundled
+    /// `.app`, silently loading different (often blank, MAC-less) NVRAMs. Anchor
+    /// it once and every launch shares one NVRAM.
+    pub fn default_nvram_path() -> String {
+        Self::data_dir()
+            .map(|d| d.join("nvram.bin").to_string_lossy().into_owned())
+            .unwrap_or_else(|| "nvram.bin".to_string())
+    }
+
+    /// Anchor a machine's NVRAM path to [`data_dir`] if it's relative (the
+    /// legacy default was a bare `"nvram.bin"`). Best-effort: if the anchored
+    /// file doesn't exist yet but the old cwd-relative one does, copy it over so
+    /// the PROM env (boot settings, any MAC) carries forward instead of starting
+    /// blank. Idempotent — absolute paths are left untouched.
+    pub fn migrate_nvram_path(nvram: &mut String) {
+        if !nvram.is_empty() && Path::new(&nvram).is_absolute() {
+            return;
+        }
+        let Some(dir) = Self::data_dir() else { return; };
+        let _ = std::fs::create_dir_all(&dir);
+        let leaf = Path::new(nvram.as_str())
+            .file_name()
+            .and_then(|s| s.to_str())
+            .filter(|s| !s.is_empty())
+            .unwrap_or("nvram.bin");
+        let dst = dir.join(leaf);
+        let src = PathBuf::from(nvram.as_str()); // relative to cwd
+        if !dst.exists() && !nvram.is_empty() && src.exists() {
+            let _ = std::fs::copy(&src, &dst);
+        }
+        *nvram = dst.to_string_lossy().into_owned();
     }
 
     pub fn load() -> Self {
@@ -107,6 +150,12 @@ impl GuiSettings {
         } else {
             s.vm_scale.min(VM_SCALE_MAX)
         };
+        // Anchor every machine's NVRAM to the stable data dir so all launch
+        // methods share one file (the persisted path becomes absolute on the
+        // next save).
+        for m in s.machines.values_mut() {
+            Self::migrate_nvram_path(&mut m.nvram);
+        }
         s
     }
 

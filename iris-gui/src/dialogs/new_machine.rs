@@ -32,7 +32,7 @@ impl Default for NewMachineDialog {
             name: "indy".into(),
             prom_path: "prom.bin".into(),
             use_embedded_prom: true,
-            nvram_path: "nvram.bin".into(),
+            nvram_path: crate::settings::GuiSettings::default_nvram_path(),
             ram_total_mb: 256,
             ram_advanced: false,
             ram_banks: [128, 128, 0, 0],

@@ -289,6 +289,10 @@ impl App {
             opened_new_machine = true;
         }
         let _ = opened_new_machine; // (kept for future telemetry)
+        // Anchor the live config's NVRAM to the stable data dir too — covers the
+        // legacy-TOML import path above, which doesn't go through load()'s
+        // per-machine migration.
+        GuiSettings::migrate_nvram_path(&mut cfg.nvram);
 
         Self {
             fullscreen: false,
