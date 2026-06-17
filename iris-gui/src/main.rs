@@ -146,6 +146,11 @@ struct App {
     /// Set on Start when the NVRAM has no Ethernet MAC; drives the guided
     /// "set up networking" modal (generated MAC + setenv command + rtc save).
     mac_modal: Option<MacModal>,
+    /// Frames remaining to spam `Esc` into the guest keyboard after a no-MAC
+    /// Start, to interrupt the PROM autoboot countdown so it stops at the
+    /// System Maintenance Menu (where the user sets `eaddr`) instead of booting
+    /// IRIX. Decrements each frame; injects on a cadence while > 0.
+    mac_guard_frames: u32,
     missing_modal: Option<MissingDiskModal>,
     /// Set when the user clicks "Use embedded PROM"; drives a confirmation modal.
     confirm_embedded_prom: bool,
@@ -324,6 +329,7 @@ impl App {
             toast: None,
             stop_modal: None,
             mac_modal: None,
+            mac_guard_frames: 0,
             missing_modal: None,
             confirm_embedded_prom: false,
             new_machine,
@@ -456,10 +462,16 @@ impl App {
         // fires on a later running→halted transition, not at startup.
         self.prev_cpu_halted = true;
         // If the NVRAM has no Ethernet MAC, IRIX won't attach ec0 — networking,
-        // System Manager, and Disk Manager all fail. Offer to set one up.
-        if !settings::nvram_has_mac(&self.cfg.nvram) {
+        // System Manager, and Disk Manager all fail. Offer to set one up, and
+        // hold the machine at the PROM by interrupting autoboot (see the Esc
+        // guard in `update`) so the user sets the MAC before IRIX boots — one
+        // boot instead of boot-then-reboot.
+        if settings::nvram_has_mac(&self.cfg.nvram) {
+            self.mac_guard_frames = 0; // MAC present — don't interrupt this boot
+        } else {
             let seed = self.prefs.active_machine.as_deref().unwrap_or("indy");
             self.mac_modal = Some(MacModal { mac: settings::generate_mac(seed), status: None });
+            self.mac_guard_frames = 480; // ~8 s at the running 60 fps repaint cadence
         }
     }
 
@@ -1435,6 +1447,20 @@ impl eframe::App for App {
         self.handle_events(ctx);
         self.maybe_autosave();
 
+        // No-MAC boot guard: spam Esc at the guest keyboard over the PROM
+        // autoboot countdown so it stops at the System Maintenance Menu (where
+        // the MAC is set) instead of booting IRIX. Best-effort over the window;
+        // extra Esc once at the menu is harmless.
+        if self.mac_guard_frames > 0 {
+            self.mac_guard_frames -= 1;
+            if self.mac_guard_frames % 15 == 0 {
+                if let Some(ps2) = self.emu.ps2.lock().clone() {
+                    input::tap_escape(&ps2);
+                }
+            }
+            ctx.request_repaint();
+        }
+
         // Remember the current window size so the next launch reopens at it.
         // inner_rect is in logical points — the same unit ViewportBuilder's
         // with_inner_size() takes — so this round-trips regardless of UI zoom.
@@ -1614,10 +1640,13 @@ impl eframe::App for App {
                          network — System Manager, Disk Manager and file sharing will fail.")
                         .strong());
                     ui.add_space(6.0);
-                    ui.label("1.  Reboot to the PROM monitor (press Esc, then 5, during the countdown).");
-                    ui.label("2.  At the  >>  prompt, type:");
+                    ui.label("Auto-boot is being held at the PROM so you can set this up first:");
+                    ui.label("1.  At the System Maintenance Menu, choose  5) Enter Command Monitor.");
+                    ui.label("2.  At the  >>  prompt, type (click the screen to capture the keyboard):");
                     ui.add(egui::Label::new(RichText::new(&cmd).monospace().strong()).selectable(true));
-                    ui.label("3.  Come back here and click Save NVRAM, then reboot the machine.");
+                    ui.label("3.  Click Save NVRAM below, then type  boot  to start IRIX — just once.");
+                    ui.label(RichText::new("(If IRIX boots anyway, Stop and Start again — it'll hold at the menu.)")
+                        .weak().small());
                     ui.add_space(8.0);
                     ui.horizontal(|ui| {
                         if ui.button("Save NVRAM (rtc save)").clicked() { do_rtc_save = true; }
