@@ -143,10 +143,6 @@ struct App {
     toast: Option<(String, std::time::Instant)>,
     fullscreen: bool,
     stop_modal: Option<StopModal>,
-    /// Set on Start when the NVRAM has no Ethernet MAC; drives the guided
-    /// "set up networking" modal (generated MAC + setenv command + rtc save).
-    /// (Latent fallback — the auto-write path normally handles this silently.)
-    mac_modal: Option<MacModal>,
     missing_modal: Option<MissingDiskModal>,
     /// Set when the user clicks "Use embedded PROM"; drives a confirmation modal.
     confirm_embedded_prom: bool,
@@ -215,15 +211,6 @@ struct App {
 
 struct StopModal {
     lines: Vec<String>,
-}
-
-/// Guided "no Ethernet MAC" setup modal. Shows a generated MAC + the PROM
-/// `setenv` command, and a button to persist NVRAM (`rtc save` over :8888).
-struct MacModal {
-    /// Generated `08:00:69:xx:xx:xx` to suggest.
-    mac: String,
-    /// Last result of a "Save NVRAM" attempt (shown under the button).
-    status: Option<String>,
 }
 
 /// One SCSI device that is missing its backing file at Start time.
@@ -324,7 +311,6 @@ impl App {
             emu: EmulatorHandle::spawn(),
             toast: None,
             stop_modal: None,
-            mac_modal: None,
             missing_modal: None,
             confirm_embedded_prom: false,
             new_machine,
@@ -475,22 +461,6 @@ impl App {
         }
     }
 
-    /// Send a one-line command to the iris monitor server (loopback :8888,
-    /// always running — see `Machine::start_server`). Used by the MAC-setup
-    /// modal to `rtc save` the NVRAM after the user sets `eaddr`.
-    fn send_monitor_command(cmd: &str) -> Result<String, String> {
-        use std::io::{Read, Write};
-        use std::time::Duration;
-        let addr: std::net::SocketAddr = "127.0.0.1:8888".parse().unwrap();
-        let mut s = std::net::TcpStream::connect_timeout(&addr, Duration::from_millis(600))
-            .map_err(|e| format!("monitor not reachable: {e}"))?;
-        let _ = s.set_read_timeout(Some(Duration::from_millis(600)));
-        s.write_all(format!("{cmd}\n").as_bytes()).map_err(|e| e.to_string())?;
-        let _ = s.flush();
-        let mut buf = [0u8; 512];
-        let n = s.read(&mut buf).unwrap_or(0);
-        Ok(String::from_utf8_lossy(&buf[..n]).trim().to_string())
-    }
 
     /// Walk the configured SCSI devices and report any whose image file
     /// is missing. Scratch volumes are skipped (iris auto-creates those).
@@ -1607,53 +1577,6 @@ impl eframe::App for App {
             self.emu.send(Cmd::HaltIrix);
             self.toast("sent 'halt' to IRIX — wait for shutdown, then Stop");
         }
-
-        // Guided Ethernet-MAC setup — shown when the NVRAM has no MAC (set in
-        // start_emulator). The user runs one PROM command; we handle persistence.
-        let mut close_mac = false;
-        let mut do_rtc_save = false;
-        if let Some(modal) = &self.mac_modal {
-            let cmd = format!("setenv -f eaddr {}", modal.mac);
-            egui::Window::new("Set up Ethernet networking")
-                .collapsible(true)
-                .resizable(false)
-                // Movable (not anchored) so it can be dragged aside to see the
-                // PROM monitor behind it while typing the command.
-                .default_pos(egui::pos2(60.0, 60.0))
-                .show(ctx, |ui| {
-                    ui.label(RichText::new(
-                        "This machine has no Ethernet MAC in NVRAM, so IRIX won't bring up the \
-                         network — System Manager, Disk Manager and file sharing will fail.")
-                        .strong());
-                    ui.add_space(6.0);
-                    ui.label("Auto-boot is being held at the PROM so you can set this up first:");
-                    ui.label("1.  At the System Maintenance Menu, choose  5) Enter Command Monitor.");
-                    ui.label("2.  At the  >>  prompt, type (click the screen to capture the keyboard):");
-                    ui.add(egui::Label::new(RichText::new(&cmd).monospace().strong()).selectable(true));
-                    ui.label("3.  Click Save NVRAM below, then type  boot  to start IRIX — just once.");
-                    ui.label(RichText::new("(If IRIX boots anyway, Stop and Start again — it'll hold at the menu.)")
-                        .weak().small());
-                    ui.add_space(8.0);
-                    ui.horizontal(|ui| {
-                        if ui.button("Save NVRAM (rtc save)").clicked() { do_rtc_save = true; }
-                        if ui.button("Close").clicked() { close_mac = true; }
-                    });
-                    if let Some(s) = &modal.status {
-                        ui.add_space(4.0);
-                        ui.label(RichText::new(s).color(Color32::LIGHT_GREEN));
-                    }
-                });
-        }
-        if do_rtc_save {
-            let res = Self::send_monitor_command("rtc save");
-            if let Some(modal) = &mut self.mac_modal {
-                modal.status = Some(match res {
-                    Ok(_)  => "Saved. Reboot the machine to bring up networking.".to_string(),
-                    Err(e) => format!("Save failed — set eaddr at the PROM monitor first. ({e})"),
-                });
-            }
-        }
-        if close_mac { self.mac_modal = None; }
 
         // Confirm switching from a custom PROM back to the built-in image.
         if self.confirm_embedded_prom {
