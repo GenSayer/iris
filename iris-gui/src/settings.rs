@@ -190,6 +190,21 @@ impl GuiSettings {
             .unwrap_or_else(|| "nvram.bin".to_string())
     }
 
+    /// Managed directory for newly-created disk images: `<data_dir>/disks`.
+    /// Absolute and writable in every launch context — the OS maps it into the
+    /// sandbox container on the App Store build, so creating a disk here needs
+    /// no permission prompt. Users can still pick another location.
+    pub fn disks_dir() -> Option<PathBuf> {
+        Self::data_dir().map(|d| d.join("disks"))
+    }
+
+    /// Default absolute path for a new SCSI disk image: `<disks_dir>/scsiN.raw`.
+    pub fn default_disk_path(scsi_id: u8) -> String {
+        Self::disks_dir()
+            .map(|d| d.join(format!("scsi{scsi_id}.raw")).to_string_lossy().into_owned())
+            .unwrap_or_else(|| format!("scsi{scsi_id}.raw"))
+    }
+
     /// Anchor a machine's NVRAM path to [`data_dir`] if it's relative (the
     /// legacy default was a bare `"nvram.bin"`). Best-effort: if the anchored
     /// file doesn't exist yet but the old cwd-relative one does, copy it over so

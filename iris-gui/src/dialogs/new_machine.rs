@@ -36,7 +36,7 @@ impl Default for NewMachineDialog {
             ram_total_mb: 256,
             ram_advanced: false,
             ram_banks: [128, 128, 0, 0],
-            scsi1_path: "scsi1.raw".into(),
+            scsi1_path: crate::settings::GuiSettings::default_disk_path(1),
             create_blank_scsi1: false,
             cdrom4_path: String::new(),
             attach_cdrom: false,
