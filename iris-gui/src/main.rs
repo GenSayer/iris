@@ -53,6 +53,19 @@ fn fb_fit_size(avail: egui::Vec2, px: egui::Vec2) -> egui::Vec2 {
     }
 }
 
+/// Resolve a config path to an absolute string for display — a relative path is
+/// joined to the process working directory (where the emulator actually looks
+/// for it), so the user never sees a bare `scsi3.raw` with no idea where it is.
+fn abs_path(p: &str) -> String {
+    let path = std::path::Path::new(p);
+    if path.is_absolute() || p.is_empty() {
+        return p.to_string();
+    }
+    std::env::current_dir()
+        .map(|d| d.join(path).to_string_lossy().into_owned())
+        .unwrap_or_else(|_| p.to_string())
+}
+
 /// True when `scale` (device pixels per emulated pixel) is close enough to a
 /// positive integer that nearest-neighbour sampling stays pixel-perfect. Off
 /// an integer, bilinear filtering avoids uneven pixel doubling.
@@ -1330,13 +1343,13 @@ impl App {
         egui::Grid::new("summary_grid").num_columns(2).striped(true).show(ui, |ui| {
             ui.label("PROM");
             ui.label(if std::path::Path::new(&self.cfg.prom).exists() {
-                self.cfg.prom.clone()
+                abs_path(&self.cfg.prom)
             } else {
                 format!("{} (missing -> embedded fallback)", self.cfg.prom)
             });
             ui.end_row();
             ui.label("NVRAM");
-            ui.label(&self.cfg.nvram);
+            ui.label(abs_path(&self.cfg.nvram));
             ui.end_row();
             ui.label("RAM");
             ui.label(format!("{total_ram} MB ({:?})", self.cfg.banks));
@@ -1351,7 +1364,7 @@ impl App {
                 for id in ids {
                     let d = &self.cfg.scsi[&id];
                     let kind = if d.cdrom { "CD" } else { "HDD" };
-                    ui.label(format!("scsi{id} {kind}: {}", d.path));
+                    ui.label(format!("scsi{id} {kind}: {}", abs_path(&d.path)));
                 }
                 ui.label(RichText::new("Use the SCSI menu to attach / detach / replace.").weak().small());
             });
