@@ -16,6 +16,12 @@ pub struct GuiSettings {
     /// egui UI scale (1.0 = default).
     #[serde(default = "default_ui_scale")]
     pub ui_scale: f32,
+    /// Emulated-display (VM screen) magnification: 1.0 = native (1 emulated
+    /// pixel : 1 logical point). Driven by the View-menu slider (0.5×–3× in 0.5
+    /// steps), **independent of `ui_scale`** — scaling the controls doesn't
+    /// resize the picture, and vice-versa.
+    #[serde(default = "default_vm_scale")]
+    pub vm_scale: f32,
     /// Was the app left in fullscreen mode at last close?
     #[serde(default)]
     pub fullscreen: bool,
@@ -55,6 +61,15 @@ pub const UI_SCALE_MIN: f32 = 1.0;
 pub const UI_SCALE_MAX: f32 = 3.0;
 pub const UI_SCALE_DEFAULT: f32 = 1.25;
 
+/// Allowed VM-screen scale range and step for the View-menu slider. ¼× steps
+/// (0.5, 0.75, 1.0, 1.25, …) give finer control; on a HiDPI (2×) display the
+/// half-integer steps (0.5, 1.0, 1.5, …) are pixel-crisp and the ¼ steps in
+/// between are bilinear-smoothed — the footer readout tags which is which.
+pub const VM_SCALE_MIN: f32 = 0.5;
+pub const VM_SCALE_MAX: f32 = 3.0;
+pub const VM_SCALE_STEP: f64 = 0.25;
+pub const VM_SCALE_DEFAULT: f32 = 1.0;
+
 /// First-launch window size in logical points. Sized to match the *running*
 /// window for the standard 1280×1024 display so the picture doesn't visibly
 /// jump when you press Start: with the left control column (~186 pt) and no
@@ -66,6 +81,7 @@ pub const UI_SCALE_DEFAULT: f32 = 1.25;
 pub const WINDOW_DEFAULT_SIZE: [f32; 2] = [1512.0, 1024.0];
 
 fn default_ui_scale() -> f32 { UI_SCALE_DEFAULT }
+fn default_vm_scale() -> f32 { VM_SCALE_DEFAULT }
 
 impl GuiSettings {
     pub fn config_path() -> Option<PathBuf> {
@@ -85,6 +101,11 @@ impl GuiSettings {
             UI_SCALE_DEFAULT
         } else {
             s.ui_scale.min(UI_SCALE_MAX)
+        };
+        s.vm_scale = if !s.vm_scale.is_finite() || s.vm_scale < VM_SCALE_MIN {
+            VM_SCALE_DEFAULT
+        } else {
+            s.vm_scale.min(VM_SCALE_MAX)
         };
         s
     }
