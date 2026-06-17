@@ -53,6 +53,34 @@ pub struct GuiSettings {
     pub bookmarks: BTreeMap<String, Vec<u8>>,
 }
 
+/// Heuristic check for whether an NVRAM file already has an Ethernet MAC set.
+/// The SGI PROM stores env *values* as ASCII, so a configured `eaddr` shows up
+/// as a literal `xx:xx:xx:xx:xx:xx` substring. A missing file (fresh machine) or
+/// no such pattern means no MAC — which is why IRIX never attaches `ec0`.
+pub fn nvram_has_mac(path: &str) -> bool {
+    let Ok(bytes) = std::fs::read(path) else { return false; };
+    bytes.windows(17).any(is_mac_ascii)
+}
+
+fn is_mac_ascii(w: &[u8]) -> bool {
+    w.len() >= 17
+        && w[..17].iter().enumerate().all(|(i, &b)| {
+            if i % 3 == 2 { b == b':' } else { b.is_ascii_hexdigit() }
+        })
+}
+
+/// A deterministic SGI-OUI MAC (`08:00:69:xx:xx:xx`) derived from `seed` (the
+/// machine name), so re-prompting the same machine always shows the same
+/// address. `08:00:69` is SGI's OUI; the low 3 octets come from a stable hash.
+/// Uniqueness across instances doesn't matter — each runs on its own NAT.
+pub fn generate_mac(seed: &str) -> String {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    seed.hash(&mut h);
+    let v = h.finish();
+    format!("08:00:69:{:02x}:{:02x}:{:02x}", (v >> 16) as u8, (v >> 8) as u8, v as u8)
+}
+
 /// Allowed UI-scale range, shared by the View-menu slider, the Ctrl +/-/0
 /// keyboard zoom, and the load-time clamp so a stale persisted value can never
 /// put the UI into a state the slider can't represent (which egui would then
