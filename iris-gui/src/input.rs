@@ -249,6 +249,11 @@ fn map_key(k: Key) -> Option<KeyCode> {
         Key::OpenBracket  => KeyCode::BracketLeft,
         Key::CloseBracket => KeyCode::BracketRight,
         Key::Backtick     => KeyCode::Backquote,
+        // egui reports the *shifted* symbol as its own Key; these two share a
+        // physical key with Backslash/Slash (Shift is sent separately, so the
+        // guest forms '|' and '?'). Without them those keys send nothing.
+        Key::Pipe         => KeyCode::Backslash,
+        Key::Questionmark => KeyCode::Slash,
         // F-keys (egui has no F5; iris likely doesn't need F13+ either)
         Key::F1 => KeyCode::F1, Key::F2 => KeyCode::F2,  Key::F3  => KeyCode::F3,
         Key::F4 => KeyCode::F4, Key::F6 => KeyCode::F6,  Key::F7  => KeyCode::F7,
