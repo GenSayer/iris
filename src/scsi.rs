@@ -486,7 +486,7 @@ impl ScsiDevice {
 
     fn exec_inquiry(&self, cdb: &[u8]) -> Result<ScsiResponse, std::io::Error> {
         let alloc_len = cdb[4] as usize;
-        let mut data = vec![0u8; alloc_len.max(36)];
+        let mut data = vec![0u8; 36];
         let lun = (cdb[1] >> 5) & 0x7;
 
         if lun == 0 {
@@ -517,6 +517,7 @@ impl ScsiDevice {
             //println!("SCSI: INQUIRY LUN={} AllcLen={} - Invalid LUN (returning 0x7F)", lun, alloc_len);
         }
 
+        data.truncate(alloc_len);
         Ok(ScsiResponse {
             status: 0x00,
             data,
@@ -636,10 +637,19 @@ impl ScsiDevice {
         Ok(ScsiResponse { status: 0x00, data: vec![] })
     }
 
-    fn exec_mode_sense_6(&self, cdb: &[u8]) -> Result<ScsiResponse, std::io::Error> {
+    fn exec_mode_sense_6(&mut self, cdb: &[u8]) -> Result<ScsiResponse, std::io::Error> {
         let page_code = cdb[2] & 0x3F;
         let dbd      = (cdb[1] & 0x08) != 0; // Disable Block Descriptor
         let alloc_len = cdb[4] as usize;
+
+        // Reject HDD-only pages when operating as CDROM.
+        // sd.c asks for page 8 (Caching) — CDROMs don't support it.
+        // Returning a page-8-incompatible response triggers the noisy
+        // "Got wrong page" path; CHECK CONDITION with ASC 0x24 hits the
+        // clean "Cache data unavailable" / "bad_sense" path instead.
+        if self.is_cdrom && matches!(page_code, 0x08 | 0x03 | 0x04) {
+            return Ok(self.check_condition(0x05, 0x24, 0x00)); // Illegal Request: Invalid field in CDB
+        }
 
         let lbs = self.logical_block_size as u32;
 
@@ -678,6 +688,26 @@ impl ScsiDevice {
                 0x00, 0x00, 0x00, 0x00, // Correction span, head offset, data strobe offset, reserved
                 0x01,       // Write retry count
                 0x00, 0x00, 0x00, // Reserved, recovery time limit (MSB, LSB)
+            ]);
+        }
+
+        // Page 0x2a: CD Capabilities and Mechanical Status (MMC, CD-ROM only)
+        // sr.c reads this to determine drive speed and capabilities.
+        // Return minimal read-only CD-ROM capabilities at 4x speed.
+        if self.is_cdrom && want_page(0x2a) {
+            pages.extend_from_slice(&[
+                0x2a, 0x12,             // page code, length (18 bytes follow)
+                0x00, 0x00,             // methods 1/2 not supported
+                0x71, 0x00,             // read capabilities: CD-R/RW readable, audio, composite, digital port
+                0x00, 0x00,             // write capabilities: none
+                0x01, 0x00,             // max read speed: 706kB/s (4x)
+                0x00, 0x00,             // # of volume levels: 0
+                0x00, 0x00,             // buffer size: 0
+                0x01, 0x00,             // current read speed: 4x
+                0x00,                   // reserved
+                0x00,                   // BCK/LSBF/RCK/LRCK flags
+                0x00, 0x00,             // max write speed: 0
+                0x00, 0x00,             // current write speed: 0
             ]);
         }
 

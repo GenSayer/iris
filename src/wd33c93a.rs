@@ -97,55 +97,67 @@ pub mod ssr {
 
 // SCSI Status Register (SSR) values (from IRIX wd93.h)
 pub mod scsi_status {
-    pub const RESET: u8 = 0x00;
-    pub const RESET_EAF: u8 = 0x01;
+    // Group 0x00: reset
+    pub const RESET: u8 = 0x00;                    // chip reset
+    pub const RESET_EAF: u8 = 0x01;                // reset with advanced features (93A)
 
-    pub const RESELECT_SUCCESS: u8 = 0x10;
-    pub const SELECT_SUCCESS: u8 = 0x11;  // ST_SELECT
-    pub const COMMAND_SUCCESS: u8 = 0x13;
-    pub const COMMAND_ATN_SUCCESS: u8 = 0x14;
-    pub const TRANSLATE_SUCCESS: u8 = 0x15;
-    pub const SELECT_TRANSFER_SUCCESS: u8 = 0x16;  // ST_SATOK
-    pub const TRANSFER_DATA_OUT: u8 = 0x18;  // ST_TR_DATAOUT - transfer cmd done, target requesting data
-    pub const TRANSFER_DATA_IN: u8 = 0x19;   // ST_TR_DATAIN - transfer cmd done, target sending data
-    pub const TRANSFER_STATUS_IN: u8 = 0x1B;  // ST_TR_STATIN - target sending status
-    pub const TRANSFER_MSG_IN: u8 = 0x1F;  // ST_TR_MSGIN - transfer cmd done, target sending msg
+    // Group 0x10: selection / reselection complete
+    pub const RESELECT_SUCCESS: u8 = 0x10;         // (T) reselection complete
+    pub const SELECT_SUCCESS: u8 = 0x11;           // (I) selection complete — ST_SELECT
 
-    pub const TRANSFER_PAUSE: u8 = 0x20;  // ST_TRANPAUSE - transfer cmd paused with ACK
-    pub const SAVE_DATA_POINTERS: u8 = 0x21;  // ST_SAVEDP
-    pub const SELECTION_ABORTED: u8 = 0x22;
-    pub const RECEIVE_SEND_ABORTED: u8 = 0x23;
-    pub const RECEIVE_SEND_ABORTED_ATN: u8 = 0x24;
-    pub const ABORT_DURING_SELECTION: u8 = 0x25;
-    pub const RESELECTED_AFTER_DISC: u8 = 0x27;  // ST_A_RESELECT (93A)
-    pub const TRANSFER_ABORTED: u8 = 0x28;
+    // Group 0x13: command/transfer completion
+    pub const COMMAND_SUCCESS: u8 = 0x13;          // (T) send/receive cmd done, no ATN
+    pub const COMMAND_ATN_SUCCESS: u8 = 0x14;      // (T) send/receive cmd done, ATN asserted
+    pub const TRANSLATE_SUCCESS: u8 = 0x15;        // translate address complete
+    pub const SELECT_TRANSFER_SUCCESS: u8 = 0x16;  // (I) select-and-transfer complete — ST_SATOK
+    pub const TRANSFER_DATA_OUT: u8 = 0x18;        // (I) xfer done, target requesting DATA OUT — ST_TR_DATAOUT
+    pub const TRANSFER_DATA_IN: u8 = 0x19;         // (I) xfer done, target sending DATA IN — ST_TR_DATAIN
+    pub const TRANSFER_STATUS_IN: u8 = 0x1B;       // (I) xfer done, target sending STATUS — ST_TR_STATIN
+    pub const TRANSFER_MSG_IN: u8 = 0x1F;          // (I) xfer done, target sending MSG IN — ST_TR_MSGIN
 
-    pub const INVALID_COMMAND: u8 = 0x40;
-    pub const UNEXPECTED_DISCONNECT: u8 = 0x41;  // ST_UNEXPDISC
-    pub const SELECTION_TIMEOUT: u8 = 0x42;  // ST_TIMEOUT
-    pub const PARITY_ERROR: u8 = 0x43;  // ST_PARITY
-    pub const PARITY_ERROR_ATN: u8 = 0x44;  // ST_PARITY_ATN
+    // Group 0x20: service required / pause
+    pub const TRANSFER_PAUSE: u8 = 0x20;           // (I) transfer paused with ACK asserted — ST_TRANPAUSE
+    pub const SAVE_DATA_POINTERS: u8 = 0x21;       // (I) SDP message received — ST_SAVEDP
+    pub const SELECTION_ABORTED: u8 = 0x22;        // selection/reselection aborted
+    pub const RECEIVE_SEND_ABORTED: u8 = 0x23;     // receive/send aborted (93A: was 0x13)
+    pub const RECEIVE_SEND_ABORTED_ATN: u8 = 0x24; // receive/send aborted, ATN asserted
+    pub const ABORT_DURING_SELECTION: u8 = 0x25;   // abort cmd issued during selection
+    pub const RESELECTED_AFTER_DISC: u8 = 0x27;    // (I) lost selection, AM mode — ST_A_RESELECT (93A)
+    pub const TRANSFER_ABORTED: u8 = 0x28;         // (I) transfer aborted due to phase mismatch — ST_MIS
+
+    // Group 0x40: errors
+    pub const INVALID_COMMAND: u8 = 0x40;          // command not valid in current state
+    pub const UNEXPECTED_DISCONNECT: u8 = 0x41;    // (I) target disconnected unexpectedly — ST_UNEXPDISC
+    pub const SELECTION_TIMEOUT: u8 = 0x42;        // (I) no response to selection — ST_TIMEOUT
+    pub const PARITY_ERROR: u8 = 0x43;             // (I) SCSI parity error — ST_PARITY
+    pub const PARITY_ERROR_ATN: u8 = 0x44;         // (I) parity error, ATN asserted — ST_PARITY_ATN
     pub const LOGICAL_ADDRESS_TOO_LARGE: u8 = 0x45;
-    pub const RESELECTION_MISMATCH: u8 = 0x46;
-    pub const INCORRECT_STATUS_BYTE: u8 = 0x47;  // ST_INCORR_DATA
-    pub const UNEXPECTED_PHASE: u8 = 0x48;
-    pub const UNEXPECTED_RECV_DATA: u8 = 0x48;  // ST_UNEX_RDATA
-    pub const UNEXPECTED_SEND_DATA: u8 = 0x49;  // ST_UNEX_SDATA
-    pub const UNEXPECTED_CMD_PHASE: u8 = 0x4A;  // ST_UNEX_CMDPH
-    pub const UNEXPECTED_SEND_STATUS: u8 = 0x4B;  // ST_UNEX_SSTATUS
-    pub const UNEXPECTED_REQ_MSG_OUT: u8 = 0x4E;  // ST_UNEX_RMESGOUT
-    pub const UNEXPECTED_SEND_MSG_IN: u8 = 0x4F;  // ST_UNEX_SMESGIN
+    pub const RESELECTION_MISMATCH: u8 = 0x46;     // (I) reselected but ID didn't match
+    pub const INCORRECT_STATUS_BYTE: u8 = 0x47;    // (I) bad status byte received — ST_INCORR_DATA
+    pub const UNEXPECTED_RECV_DATA: u8 = 0x48;     // (I) unexpected DATA IN phase — ST_UNEX_RDATA
+    pub const UNEXPECTED_SEND_DATA: u8 = 0x49;     // (I) unexpected DATA OUT phase — ST_UNEX_SDATA
+    pub const UNEXPECTED_CMD_PHASE: u8 = 0x4A;     // (I) unexpected COMMAND phase — ST_UNEX_CMDPH
+    pub const UNEXPECTED_SEND_STATUS: u8 = 0x4B;   // (I) unexpected STATUS phase — ST_UNEX_SSTATUS
+    pub const UNEXPECTED_REQ_MSG_OUT: u8 = 0x4E;   // (I) unexpected MSG OUT phase — ST_UNEX_RMESGOUT
+    pub const UNEXPECTED_SEND_MSG_IN: u8 = 0x4F;   // (I) unexpected MSG IN phase — ST_UNEX_SMESGIN
 
-    pub const RESELECTED: u8 = 0x80;  // ST_RESELECT (WD33C93)
-    pub const RESELECTED_EAF: u8 = 0x81;  // ST_93A_RESEL (reselected while idle, 93A)
-    pub const SELECTED: u8 = 0x82;
-    pub const SELECTED_ATN: u8 = 0x83;
-    pub const ATN: u8 = 0x84;
-    pub const DISCONNECT: u8 = 0x85;  // ST_DISCONNECT
-    pub const NEED_COMMAND_SIZE: u8 = 0x87;  // ST_NEEDCMD
-    pub const REQ: u8 = 0x88;
-    pub const REQ_SEND_MSG_OUT: u8 = 0x8E;  // ST_REQ_SMESGOUT
-    pub const REQ_SEND_MSG_IN: u8 = 0x8F;  // ST_REQ_SMESGIN
+    // Group 0x80: target-mode / bus-free statuses
+    pub const RESELECTED: u8 = 0x80;               // (I) reselected while idle, no AM — ST_RESELECT
+    pub const RESELECTED_EAF: u8 = 0x81;           // (I) reselected while idle, AM mode — ST_93A_RESEL (93A)
+    pub const SELECTED: u8 = 0x82;                 // (T) selected without ATN
+    pub const SELECTED_ATN: u8 = 0x83;             // (T) selected with ATN
+    pub const ATN: u8 = 0x84;                      // (T) ATN asserted
+    pub const DISCONNECT: u8 = 0x85;               // (I) bus free after disconnect — ST_DISCONNECT
+    pub const UNKNOWN_GROUP: u8 = 0x87;            // CDB1 specifies unknown group (SBIC_CSR_UNK_GROUP)
+
+    // Group 0x88: bus-service REQ — low nibble encodes SCSI phase (SBIC_CSR_MIS_2)
+    // REQ = 0x88 base; specific phase variants below
+    pub const REQ_DATA_OUT:     u8 = 0x88;         // DATA OUT phase requested
+    pub const REQ_DATA_IN:      u8 = 0x89;         // DATA IN phase requested
+    pub const REQ_CMD_PHASE:    u8 = 0x8A;         // COMMAND phase requested — ST_NEEDCMD
+    pub const REQ_STATUS:       u8 = 0x8B;         // STATUS phase requested
+    pub const REQ_SEND_MSG_OUT: u8 = 0x8E;         // MSG OUT phase requested — ST_REQ_SMESGOUT
+    pub const REQ_MSG_IN:       u8 = 0x8F;         // MSG IN phase requested — ST_REQ_SMESGIN
 }
 
 // Command Register (CMD) values (indirect reg 0x18)
@@ -180,19 +192,20 @@ pub mod cmd {
 // Command Phase Register (0x10) values
 #[allow(dead_code)]
 pub mod command_phase {
-    pub const DISCONNECTED: u8 = 0x00;
-    pub const SELECTED: u8 = 0x10;
-    pub const IDENTIFY_SENT: u8 = 0x20;
-    pub const COMMAND_START: u8 = 0x30;
-    pub const SAVE_DATA_POINTER: u8 = 0x41;
-    pub const DISCONNECT_MSG: u8 = 0x42;
-    pub const DISCONNECTED_OK: u8 = 0x43;
-    pub const RESELECTED: u8 = 0x44;
-    pub const IDENTIFY_RECEIVED: u8 = 0x45;
-    pub const DATA_XFER_DONE: u8 = 0x46;
-    pub const STATUS_PHASE: u8 = 0x47;
-    pub const STATUS_RECEIVED: u8 = 0x50;
-    pub const COMPLETE_MSG: u8 = 0x60;
+    pub const DISCONNECTED: u8 = 0x00;    // no device selected
+    pub const SELECTED: u8 = 0x10;        // target selected
+    pub const IDENTIFY_SENT: u8 = 0x20;   // identify message sent to target
+    pub const COMMAND_START: u8 = 0x30;   // command phase started, 0 bytes sent
+    // 0x31-0x3C: command phase, N bytes sent (N = low nibble + unit digit)
+    pub const SAVE_DATA_POINTER: u8 = 0x41;  // SDP message received
+    pub const DISCONNECT_MSG: u8 = 0x42;     // disconnect message received, bus not free
+    pub const DISCONNECTED_OK: u8 = 0x43;    // target disconnected, bus free
+    pub const RESELECTED: u8 = 0x44;         // reselected by original target
+    pub const IDENTIFY_RECEIVED: u8 = 0x45;  // identify message received from target
+    pub const TRANSFER_COUNT: u8 = 0x46;     // data transfer complete (TC = 0)
+    pub const RECEIVE_STATUS: u8 = 0x47;     // target has begun status phase
+    pub const STATUS_RECEIVED: u8 = 0x50;    // status byte received, stored in TARGET_LUN
+    pub const COMPLETE_MSG: u8 = 0x60;       // command complete message received
 }
 
 struct Wd33c93aState {
@@ -216,9 +229,17 @@ struct Wd33c93aState {
     xfer_data: Vec<u8>,         // full data buffer for current SCSI command
     xfer_offset: usize,         // bytes already transferred
     xfer_direction_in: bool,    // true=send to host (READ cmd), false=receive from host (WRITE cmd)
+    // IRQ status FIFO (mirrors MAME wd33c9x irq_fifo).
+    // Statuses are pushed here; update_irq() pops the front into SCSI_STATUS and
+    // sets ASR.INT. On SCSI_STATUS read (INT ack), update_irq() is called again —
+    // if another entry is waiting it immediately re-asserts INT without toggling the
+    // interrupt line low. This allows SELECT_ATN to push 0x11 then 0x8E as two
+    // separate interrupts, matching real hardware behaviour.
+    irq_fifo: VecDeque<u8>,
     // Debug tracking: last values returned for register reads
     last_read_asr: Option<u8>,
     last_read_reg: Option<(u8, u8)>, // (register, value)
+    last_cmd: u8,                    // last command written to COMMAND register
 }
 
 pub trait ScsiCallback: Send + Sync {
@@ -259,8 +280,10 @@ impl Wd33c93a {
                 xfer_data: Vec::new(),
                 xfer_offset: 0,
                 xfer_direction_in: false,
+                irq_fifo: VecDeque::new(),
                 last_read_asr: None,
                 last_read_reg: None,
+                last_cmd: 0,
             })),
             cond: Arc::new(Condvar::new()),
             thread: Mutex::new(None),
@@ -521,12 +544,7 @@ impl Wd33c93a {
 
         if addr == 0 {
             // Read ASR (Auxiliary Status Register)
-            let mut val = state.asr;
-
-            // Compute DBR bit based on COMMAND_PHASE and FIFO state
-            if state.compute_dbr() {
-                val |= asr::DBR;
-            }
+            let val = state.asr;
 
             wdt_log(format_args!("R ASR -> {:02x} (phase={:02x} stat={:02x})",
                 val, state.regs[regs::COMMAND_PHASE as usize],
@@ -546,17 +564,56 @@ impl Wd33c93a {
                 wdt_log(format_args!("R FIFO -> {:02x} (fifo_remaining={})",
                     val, state.fifo.len()));
                 dlog!(LogModule::Scsi, "WD33C93A: Read FIFO -> {:02x}", val);
+
+                // DBR-based PIO delivery: when DBR was set (data/status/msg byte ready),
+                // each DATA read decrements TC and advances phase on fifo drain.
+                // TRANSFER_COUNT = data-in bytes, RECEIVE_STATUS = status byte, STATUS_RECEIVED = msg byte.
+                let cmd_phase = state.regs[regs::COMMAND_PHASE as usize];
+                let mut fire_irq = false;
+                let dbr_was_set = (state.asr & asr::DBR) != 0;
+                if dbr_was_set {
+                    state.decrement_transfer_count();
+                    state.asr &= !asr::DBR;
+                    if !state.fifo.is_empty() {
+                        // More bytes remain in this phase — re-arm DBR for next byte.
+                        state.asr |= asr::DBR;
+                    } else {
+                        // Fifo drained — advance to next phase via interrupt.
+                        match cmd_phase {
+                            command_phase::TRANSFER_COUNT => {
+                                dlog!(LogModule::Scsi, "WD33C93A: DATA_IN PIO complete → ST_TR_STATIN");
+                                state.regs[regs::TARGET_LUN as usize] = state.pending_status;
+                                state.raise_interrupt(command_phase::RECEIVE_STATUS, scsi_status::TRANSFER_STATUS_IN);
+                                fire_irq = true;
+                            }
+                            command_phase::RECEIVE_STATUS => {
+                                dlog!(LogModule::Scsi, "WD33C93A: STATUS byte read → ST_TR_MSGIN");
+                                state.raise_interrupt(command_phase::STATUS_RECEIVED, scsi_status::TRANSFER_MSG_IN);
+                                fire_irq = true;
+                            }
+                            command_phase::STATUS_RECEIVED => {
+                                dlog!(LogModule::Scsi, "WD33C93A: MSG byte read → DISCONNECT");
+                                state.raise_interrupt(command_phase::COMPLETE_MSG, scsi_status::DISCONNECT);
+                                fire_irq = true;
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+
                 state.last_read_asr = None;
                 state.last_read_reg = None;
+                drop(state);
+                if fire_irq {
+                    if let Some(cb) = &self.callback {
+                        cb.set_interrupt(true);
+                    }
+                }
                 return BusRead8::ok(val);
             }
 
             if ar == regs::AUX_STATUS_DIRECT {
-                let mut val = state.asr;
-                if state.compute_dbr() {
-                    val |= asr::DBR;
-                }
-                return BusRead8::ok(val);
+                return BusRead8::ok(state.asr);
             }
 
             let val = state.regs[ar as usize];
@@ -569,16 +626,102 @@ impl Wd33c93a {
             // stays asserted forever once the chip-INT is cleared, IP2 storms,
             // and the IRIX 6.5 miniroot stalls.
             if ar == regs::SCSI_STATUS {
-                if (state.asr & asr::INT) != 0 {
-                    state.asr &= !asr::INT;
+                // Ack the current interrupt and advance the IRQ FIFO.
+                // If another entry is queued, update_irq() re-asserts INT immediately
+                // without dropping the interrupt line — the handler sees a new status
+                // without any line toggle. If the FIFO is empty, deassert the line.
+                let had_int = (state.asr & asr::INT) != 0;
+                let more = state.update_irq();
+                if had_int && !more {
                     if let Some(cb) = &self.callback {
                         cb.set_interrupt(false);
-                        // Also drop any lingering PDMA DMA-IRQ: the chip's
-                        // ack on the IOC SCSI0 line is also the kernel's
-                        // global ack for this SCSI transaction.
                         cb.clear_pdma_int();
                     }
                 }
+/*
+                let status_name = match val {
+                    0x00 => "RESET",
+                    0x01 => "RESET_EAF",
+                    0x10 => "RESELECT_SUCCESS",
+                    0x11 => "SELECT_SUCCESS",
+                    0x13 => "COMMAND_SUCCESS",
+                    0x14 => "COMMAND_ATN_SUCCESS",
+                    0x15 => "TRANSLATE_SUCCESS",
+                    0x16 => "SELECT_TRANSFER_SUCCESS",
+                    0x18 => "TRANSFER_DATA_OUT",
+                    0x19 => "TRANSFER_DATA_IN",
+                    0x1B => "TRANSFER_STATUS_IN",
+                    0x1F => "TRANSFER_MSG_IN",
+                    0x20 => "TRANSFER_PAUSE",
+                    0x21 => "SAVE_DATA_POINTERS",
+                    0x22 => "SELECTION_ABORTED",
+                    0x23 => "RECEIVE_SEND_ABORTED",
+                    0x24 => "RECEIVE_SEND_ABORTED_ATN",
+                    0x25 => "ABORT_DURING_SELECTION",
+                    0x27 => "RESELECTED_AFTER_DISC",
+                    0x28 => "TRANSFER_ABORTED",
+                    0x40 => "INVALID_COMMAND",
+                    0x41 => "UNEXPECTED_DISCONNECT",
+                    0x42 => "SELECTION_TIMEOUT",
+                    0x43 => "PARITY_ERROR",
+                    0x44 => "PARITY_ERROR_ATN",
+                    0x45 => "LOGICAL_ADDRESS_TOO_LARGE",
+                    0x46 => "RESELECTION_MISMATCH",
+                    0x47 => "INCORRECT_STATUS_BYTE",
+                    0x48 => "UNEXPECTED_RECV_DATA",
+                    0x49 => "UNEXPECTED_SEND_DATA",
+                    0x4A => "UNEXPECTED_CMD_PHASE",
+                    0x4B => "UNEXPECTED_SEND_STATUS",
+                    0x4E => "UNEXPECTED_REQ_MSG_OUT",
+                    0x4F => "UNEXPECTED_SEND_MSG_IN",
+                    0x80 => "RESELECTED",
+                    0x81 => "RESELECTED_EAF",
+                    0x82 => "SELECTED",
+                    0x83 => "SELECTED_ATN",
+                    0x84 => "ATN",
+                    0x85 => "DISCONNECT",
+                    0x87 => "UNKNOWN_GROUP",
+                    0x88 => "REQ_DATA_OUT",
+                    0x89 => "REQ_DATA_IN",
+                    0x8A => "REQ_CMD_PHASE",
+                    0x8B => "REQ_STATUS",
+                    0x8E => "REQ_SEND_MSG_OUT",
+                    0x8F => "REQ_MSG_IN",
+                    _    => "?",
+                };
+                let cmd_name = match state.last_cmd & 0x7F {
+                    0x00 => "RESET",
+                    0x01 => "ABORT",
+                    0x02 => "ASSERT_ATN",
+                    0x03 => "NEGATE_ACK",
+                    0x04 => "DISCONNECT",
+                    0x05 => "RESELECT",
+                    0x06 => "SELECT_ATN",
+                    0x07 => "SELECT",
+                    0x08 => "SELECT_ATN_XFER",
+                    0x09 => "SELECT_XFER",
+                    0x0A => "RESELECT_RECEIVE",
+                    0x0B => "RESELECT_SEND",
+                    0x0C => "WAIT_SELECT_RECEIVE",
+                    0x10 => "SEND_STATUS",
+                    0x11 => "SEND_DISCONNECT",
+                    0x12 => "SET_IDI",
+                    0x13 => "RECEIVE_COMMAND",
+                    0x14 => "RECEIVE_DATA",
+                    0x15 => "RECEIVE_MSG_OUT",
+                    0x16 => "RECEIVE_INFO",
+                    0x17 => "SEND_COMMAND",
+                    0x18 => "SEND_DATA",
+                    0x19 => "SEND_MSG_IN",
+                    0x1A => "SEND_INFO",
+                    0x20 => "TRANSFER_INFO",
+                    _    => "?",
+                };
+                eprintln!("SCSI INT: status={:#04x} ({}) cmd={:#04x} ({}{})",
+                    val, status_name,
+                    state.last_cmd, cmd_name,
+                    if state.last_cmd & 0x80 != 0 { "+SBT" } else { "" });
+*/                    
             }
 
             wdt_log(format_args!("R REG[{:02x}] -> {:02x} (phase={:02x} stat={:02x} asr_after={:02x})",
@@ -646,13 +789,54 @@ impl Wd33c93a {
 
             if ar == regs::DATA {
                 state.fifo.push_back(val);
-                self.cond.notify_one();
+                let mut fire_irq = false;
+                if (state.asr & asr::DBR) != 0 {
+                    state.decrement_transfer_count();
+                    let tc = state.get_transfer_count();
+                    let cmd_phase = state.regs[regs::COMMAND_PHASE as usize];
+                    if tc == 0 {
+                        if cmd_phase == command_phase::SELECTED {
+                            dlog!(LogModule::Scsi, "WD33C93A: PIO MESG_OUT complete, → CMD phase");
+                            state.raise_interrupt(command_phase::IDENTIFY_SENT, scsi_status::REQ_CMD_PHASE);
+                            fire_irq = true;
+                        } else if cmd_phase == command_phase::COMMAND_START {
+                            dlog!(LogModule::Scsi, "WD33C93A: PIO CMD complete, waking worker ({} bytes)", state.fifo.len());
+                            state.asr &= !asr::DBR;
+                            state.regs[regs::COMMAND as usize] = cmd::TRANSFER_INFO;
+                            state.has_pending_command = true;
+                            drop(state);
+                            self.cond.notify_one();
+                            return BUS_OK;
+                        }
+                    } else {
+                        let sbt = (state.regs[regs::COMMAND as usize] & 0x80) != 0;
+                        if !sbt {
+                            state.asr |= asr::DBR;
+                        } else {
+                            state.asr &= !asr::DBR;
+                        }
+                    }
+                }
+                drop(state);
+                if fire_irq {
+                    if let Some(cb) = &self.callback {
+                        cb.set_interrupt(true);
+                    }
+                }
                 return BUS_OK;
             }
 
             state.regs[ar as usize] = val;
 
+            // QUEUE_TAG (0x1A) is not implemented on WD33C93A — the register
+            // doesn't latch. OpenBSD probes by writing 0x55 and reading back;
+            // returning 0 here makes it detect us as WD33C93A, not B.
+            if ar == regs::QUEUE_TAG {
+                state.regs[regs::QUEUE_TAG as usize] = 0;
+            }
+
             if ar == regs::COMMAND {
+                state.last_cmd = val;
                 state.has_pending_command = true;
                 state.asr |= asr::CIP;  // Set Command In Progress
                 self.cond.notify_one();
@@ -744,7 +928,7 @@ impl Device for Wd33c93a {
 
     fn register_commands(&self) -> Vec<(String, String)> {
         vec![
-            ("scsi".to_string(), "SCSI: scsi status | scsi eject <id> | scsi add <id> <path> | scsi list <id> | scsi del <id> <ord> | scsi next <id> <ord> | scsi debug <on|off> [DEV]".to_string()),
+            ("scsi".to_string(), "SCSI: scsi regs | scsi status | scsi eject <id> | scsi add <id> <path> | scsi list <id> | scsi del <id> <ord> | scsi next <id> <ord> | scsi debug <on|off> [DEV]".to_string()),
             ("cow".to_string(), "COW overlay: cow status | cow commit [id] | cow reset [id]".to_string()),
         ]
     }
@@ -762,6 +946,53 @@ impl Device for Wd33c93a {
                         }
                     }
                     writeln!(writer, "(total_seen={})", WDT_SEQ.load(Ordering::Relaxed)).unwrap();
+                    return Ok(());
+                }
+                Some("regs") => {
+                    let state = self.state.lock();
+                    let r = &state.regs;
+                    writeln!(writer, "WD33C93A Register Dump").unwrap();
+                    writeln!(writer, "  AR  (addr reg) : {:02x}", state.ar).unwrap();
+                    writeln!(writer, "  ASR (aux stat) : {:02x}  INT={} LCI={} BSY={} CIP={} PE={} DBR={}",
+                        state.asr,
+                        (state.asr & asr::INT) != 0,
+                        (state.asr & asr::LCI) != 0,
+                        (state.asr & asr::BSY) != 0,
+                        (state.asr & asr::CIP) != 0,
+                        (state.asr & asr::PE)  != 0,
+                        (state.asr & asr::DBR) != 0,
+                    ).unwrap();
+                    writeln!(writer, "  00 OWN_ID       : {:02x}  id={} clk={} eaf={}",
+                        r[0x00], r[0x00] & 0x07, (r[0x00] >> 6) & 0x03, (r[0x00] & 0x08) != 0).unwrap();
+                    writeln!(writer, "  01 CONTROL      : {:02x}  hsp={} haf={} esr={} edbo={} polled={}",
+                        r[0x01],
+                        (r[0x01] & 0x01) != 0, (r[0x01] & 0x02) != 0,
+                        (r[0x01] & 0x04) != 0, (r[0x01] & 0x08) != 0,
+                        (r[0x01] & 0x80) != 0).unwrap();
+                    writeln!(writer, "  02 TIMEOUT      : {:02x}", r[0x02]).unwrap();
+                    writeln!(writer, "  03-0E CDB       : {:02x} {:02x} {:02x} {:02x} {:02x} {:02x}  {:02x} {:02x} {:02x} {:02x} {:02x} {:02x}",
+                        r[0x03], r[0x04], r[0x05], r[0x06], r[0x07], r[0x08],
+                        r[0x09], r[0x0A], r[0x0B], r[0x0C], r[0x0D], r[0x0E]).unwrap();
+                    writeln!(writer, "  0F TARGET_LUN   : {:02x}  tgt={} lun={}", r[0x0F], (r[0x0F] >> 3) & 0x07, r[0x0F] & 0x07).unwrap();
+                    writeln!(writer, "  10 CMD_PHASE    : {:02x}", r[0x10]).unwrap();
+                    writeln!(writer, "  11 SYNC_XFER    : {:02x}  tp={} offset={}", r[0x11], (r[0x11] >> 4) & 0x07, r[0x11] & 0x0F).unwrap();
+                    let tc = ((r[0x12] as u32) << 16) | ((r[0x13] as u32) << 8) | (r[0x14] as u32);
+                    writeln!(writer, "  12-14 XFER_CNT  : {:02x} {:02x} {:02x} = {}", r[0x12], r[0x13], r[0x14], tc).unwrap();
+                    writeln!(writer, "  15 DEST_ID      : {:02x}  id={}", r[0x15], r[0x15] & 0x07).unwrap();
+                    writeln!(writer, "  16 SOURCE_ID    : {:02x}", r[0x16]).unwrap();
+                    writeln!(writer, "  17 SCSI_STATUS  : {:02x}", r[0x17]).unwrap();
+                    writeln!(writer, "  18 COMMAND      : {:02x}", r[0x18]).unwrap();
+                    writeln!(writer, "  19 DATA         : {:02x}", r[0x19]).unwrap();
+                    writeln!(writer, "  1A QUEUE_TAG    : {:02x}", r[0x1A]).unwrap();
+                    writeln!(writer, "  Internal state:").unwrap();
+                    writeln!(writer, "    target_id={} adv_mode={} has_pending_cmd={}",
+                        state.target_id, state.advanced_mode, state.has_pending_command).unwrap();
+                    writeln!(writer, "    pending_status={:02x} pending_msg={:02x}",
+                        state.pending_status, state.pending_msg).unwrap();
+                    writeln!(writer, "    xfer_offset={}/{} dir_in={} fifo_len={} tc={}",
+                        state.xfer_offset, state.xfer_data.len(),
+                        state.xfer_direction_in, state.fifo.len(),
+                        state.get_transfer_count()).unwrap();
                     return Ok(());
                 }
                 Some("debug") => {
@@ -933,6 +1164,7 @@ impl Resettable for Wd33c93a {
         let mut state = self.state.lock();
         // Mirrors process_wd_command(cmd::RESET, ...) logic.
         state.fifo.clear();
+        state.irq_fifo.clear();
         state.xfer_data.clear();
         state.xfer_offset = 0;
         state.regs[regs::COMMAND_PHASE as usize] = command_phase::DISCONNECTED;
@@ -944,14 +1176,14 @@ impl Resettable for Wd33c93a {
         state.has_pending_command = false;
         state.last_read_asr = None;
         state.last_read_reg = None;
-        for i in 0x01..=0x16usize {
+        // Hardware reset clears all registers including OWN_ID.
+        // (Software CMD_RESET preserves OWN_ID and uses its EAF bit for RESET_EAF.)
+        for i in 0x00..=0x16usize {
             state.regs[i] = 0;
         }
         state.regs[regs::COMMAND as usize] = 0;
-        let own_id = state.regs[regs::OWN_ID as usize];
-        let eaf = (own_id & 0x08) != 0;
-        state.advanced_mode = eaf;
-        state.regs[regs::SCSI_STATUS as usize] = if eaf { scsi_status::RESET_EAF } else { scsi_status::RESET };
+        state.advanced_mode = false;
+        state.regs[regs::SCSI_STATUS as usize] = scsi_status::RESET;
     }
 }
 
@@ -998,27 +1230,24 @@ impl Wd33c93aState {
     }
 
     /// Compute DBR (Data Buffer Ready) bit based on COMMAND_PHASE register
-    fn compute_dbr(&self) -> bool {
-        let cmd_phase = self.regs[regs::COMMAND_PHASE as usize];
-        match cmd_phase & 0xF0 {
-            0x00 | 0x10 | 0x20 => false,  // Disconnected, Selected, Identify - no data ready
-            0x30 => true,                  // Command phase - ready to receive CDB bytes
-            0x40 => {
-                // Disconnect/reselect/data transfer phases
-                match cmd_phase {
-                    0x46 => self.data_direction_in && !self.fifo.is_empty(),  // Data transfer done, data in
-                    0x47 | 0x50 => !self.fifo.is_empty(),  // Status phase - data ready when in FIFO
-                    _ => false,
-                }
-            }
-            0x50 => !self.fifo.is_empty(),  // Status received - message in FIFO
-            0x60 => !self.fifo.is_empty(),  // Command complete message in FIFO
-            _ => false,
+
+    /// Pop the front of the IRQ FIFO into SCSI_STATUS and assert ASR.INT.
+    /// If the FIFO is empty, SCSI_STATUS is left unchanged and ASR.INT is cleared.
+    /// Returns true if INT was asserted.
+    fn update_irq(&mut self) -> bool {
+        if let Some(next) = self.irq_fifo.pop_front() {
+            self.regs[regs::SCSI_STATUS as usize] = next;
+            self.asr |= asr::INT;
+            true
+        } else {
+            self.asr &= !asr::INT;
+            false
         }
     }
 
-    /// Set new phase and/or status, logging changes via LogModule::Scsi.
-    fn set_phase_status(&mut self, phase: u8, status: u8) {
+    /// Set COMMAND_PHASE and SCSI_STATUS registers, logging the transition.
+    /// Does not touch ASR.INT — use raise_interrupt() to also queue an interrupt.
+    fn set_status(&mut self, phase: u8, status: u8) {
         let old_phase = self.regs[regs::COMMAND_PHASE as usize];
         let old_status = self.regs[regs::SCSI_STATUS as usize];
 
@@ -1037,7 +1266,34 @@ impl Wd33c93aState {
         }
     }
 
-    fn process_wd_command(&mut self, cmd: u8, dma: Option<&dyn DmaClient>) {
+    /// Set phase, push status into the IRQ FIFO, and assert ASR.INT.
+    /// This is the standard way to deliver an interrupt: one call replaces
+    /// set_status() + "self.asr |= asr::INT".
+    fn raise_interrupt(&mut self, phase: u8, status: u8) {
+        let old_phase = self.regs[regs::COMMAND_PHASE as usize];
+        let old_status = self.regs[regs::SCSI_STATUS as usize];
+        self.regs[regs::COMMAND_PHASE as usize] = phase;
+        if old_phase != phase || old_status != status {
+            dlog!(LogModule::Scsi, "WD33C93A: raise_interrupt phase {:02x}->{:02x} status {:02x}->{:02x}",
+                old_phase, phase, old_status, status);
+        }
+        // DBR and CIP are always cleared when the chip raises an interrupt.
+        self.asr &= !(asr::DBR | asr::CIP);
+        self.irq_fifo.push_back(status);
+        self.update_irq();
+    }
+
+    fn process_wd_command(&mut self, raw_cmd: u8, dma: Option<&dyn DmaClient>) {
+        // Strip SBT (Single Byte Transfer) qualifier bit. SBT changes the host
+        // polling protocol but not the logical operation — treat as the base command.
+        let cmd = raw_cmd & !0x80;
+        // Update target_id from DESTINATION_ID before logging so the log is accurate.
+        match cmd {
+            cmd::SELECT_ATN | cmd::SELECT_ATN_XFER | cmd::SELECT | cmd::SELECT_XFER => {
+                self.target_id = (self.regs[regs::DESTINATION_ID as usize] & 0x7) as usize;
+            }
+            _ => {}
+        }
         {
             let cmd_phase = self.regs[regs::COMMAND_PHASE as usize];
             dlog!(LogModule::Scsi, "WD33C93A: Command {:02x} (CmdPhase: {:02x}, Tgt: {}, ASR: {:02x})",
@@ -1048,6 +1304,7 @@ impl Wd33c93aState {
 
         if cmd == cmd::RESET {
             self.fifo.clear();
+            self.irq_fifo.clear();
             self.regs[regs::COMMAND_PHASE as usize] = command_phase::DISCONNECTED;
             self.asr = asr::INT;
             self.target_id = 0;
@@ -1115,24 +1372,15 @@ impl Wd33c93aState {
                 }
             }
             // Transfer complete — raise final completion interrupt
-            self.set_phase_status(command_phase::COMPLETE_MSG, scsi_status::SELECT_TRANSFER_SUCCESS);
             self.regs[regs::TARGET_LUN as usize] = self.pending_status;
-            self.asr |= asr::INT;
+            self.raise_interrupt(command_phase::COMPLETE_MSG, scsi_status::SELECT_TRANSFER_SUCCESS);
             self.asr &= !asr::CIP;
             return;
         }
 
-        match cmd {
-            cmd::SELECT_ATN | cmd::SELECT_ATN_XFER | cmd::SELECT | cmd::SELECT_XFER => {
-                self.target_id = (self.regs[regs::DESTINATION_ID as usize] & 0x7) as usize;
-            }
-            _ => {}
-        }
-
         if self.devices[self.target_id].is_none() {
             dlog!(LogModule::Scsi, "WD33C93A: No device at target {}, timing out", self.target_id);
-            self.set_phase_status(command_phase::DISCONNECTED, scsi_status::SELECTION_TIMEOUT);
-            self.asr |= asr::INT;
+            self.raise_interrupt(command_phase::DISCONNECTED, scsi_status::SELECTION_TIMEOUT);
             self.asr &= !asr::CIP;
             return;
         }
@@ -1140,23 +1388,23 @@ impl Wd33c93aState {
         match cmd {
             cmd::ABORT => {
                 self.fifo.clear();
+                self.irq_fifo.clear();
                 self.xfer_data.clear();
                 self.xfer_offset = 0;
-                self.asr = asr::INT;
+                self.asr &= !(asr::CIP | asr::BSY);
                 let status = if self.advanced_mode { scsi_status::RESET_EAF } else { scsi_status::RESET };
-                self.set_phase_status(command_phase::DISCONNECTED, status);
+                self.raise_interrupt(command_phase::DISCONNECTED, status);
             }
             cmd::ASSERT_ATN => {
                 self.asr &= !asr::CIP;
             }
             cmd::DISCONNECT => {
-                self.set_phase_status(command_phase::DISCONNECTED, scsi_status::DISCONNECT);
-                self.asr |= asr::INT;
+                self.raise_interrupt(command_phase::DISCONNECTED, scsi_status::DISCONNECT);
                 self.asr &= !(asr::CIP | asr::BSY);
             }
             cmd::SELECT_ATN | cmd::SELECT_ATN_XFER | cmd::SELECT | cmd::SELECT_XFER => {
                 let status = self.regs[regs::SCSI_STATUS as usize];
-                self.set_phase_status(command_phase::SELECTED, status);
+                self.set_status(command_phase::SELECTED, status);
 
                 if cmd == cmd::SELECT_ATN_XFER || cmd == cmd::SELECT_XFER {
                     dlog!(LogModule::Scsi, "WD33C93A: SELECT_XFER/SELECT_ATN_XFER");
@@ -1169,78 +1417,106 @@ impl Wd33c93aState {
                     }
                     self.process_scsi_command(&cdb, true, dma);
                 } else {
-                    dlog!(LogModule::Scsi, "WD33C93A: SELECT/SELECT_ATN");
-                    // Manual SELECT: Just assert interrupt "Select Complete" (0x11)
-                    // Driver will then write CDB and issue TRANSFER_INFO
-                    let phase = self.regs[regs::COMMAND_PHASE as usize];
-                    self.set_phase_status(phase, scsi_status::SELECT_SUCCESS);
-                    self.asr |= asr::INT;
+                    // SELECT_ATN fires two interrupts:
+                    //   1st: SELECT_SUCCESS (0x11) — selection complete
+                    //   2nd: REQ_SEND_MSG_OUT (0x8E) — bus requesting MESG_OUT
+                    // SELECT (no ATN) goes straight to CMD phase in one interrupt.
+                    self.regs[regs::COMMAND_PHASE as usize] = command_phase::SELECTED;
+                    if cmd == cmd::SELECT_ATN {
+                        dlog!(LogModule::Scsi, "WD33C93A: SELECT_ATN → 0x11 then 0x8E");
+                        self.irq_fifo.push_back(scsi_status::SELECT_SUCCESS);
+                        self.irq_fifo.push_back(scsi_status::REQ_SEND_MSG_OUT);
+                    } else {
+                        dlog!(LogModule::Scsi, "WD33C93A: SELECT → 0x8A (CMD phase)");
+                        self.irq_fifo.push_back(scsi_status::REQ_CMD_PHASE);
+                    }
+                    self.update_irq();
                     self.asr &= !asr::CIP;
                 }
             }
             cmd::TRANSFER_INFO => {
+                let scsi_st = self.regs[regs::SCSI_STATUS as usize];
                 let cmd_phase = self.regs[regs::COMMAND_PHASE as usize];
-                dlog!(LogModule::Scsi, "WD33C93A: TRANSFER_INFO CmdPhase={:02x}", cmd_phase);
-                match cmd_phase & 0xF0 {
-                    0x10 | 0x20 | 0x30 => {
-                        // Selected, Identify sent, or Command phase - execute CDB
-                        let mut cdb = Vec::new();
-                        if !self.fifo.is_empty() {
-                            let opcode = self.fifo.pop_front().unwrap_or(0);
-                            let len = self.get_cdb_length(opcode);
-                            cdb.reserve(len);
-                            cdb.push(opcode);
-                            for _ in 1..len {
-                                cdb.push(self.fifo.pop_front().unwrap_or(0));
-                            }
-                        } else {
-                            // Fallback to CDB registers
-                            let opcode = self.regs[regs::CDB_1 as usize];
-                            let len = self.get_cdb_length(opcode);
-                            cdb.reserve(len);
-                            for i in 0..len {
-                                cdb.push(self.regs[(regs::CDB_1 as usize) + i]);
-                            }
-                        }
+                dlog!(LogModule::Scsi, "WD33C93A: TRANSFER_INFO scsi_status={:02x} cmd_phase={:02x}",
+                    scsi_st, cmd_phase);
 
+                match cmd_phase {
+                    command_phase::SELECTED => {
+                        // Just did SELECT_ATN; bus is in MESG_OUT.
+                        // Driver sends IDENTIFY (+ optional SDTR) via DBR polling.
+                        let tc = self.get_transfer_count();
+                        if tc == 0 { self.set_transfer_count(1); }
+                        dlog!(LogModule::Scsi, "WD33C93A: XFER_INFO MESG_OUT tc={}", if tc == 0 { 1 } else { tc });
+                        self.fifo.clear();
+                        self.asr |= asr::DBR;
+                        self.asr &= !(asr::CIP | asr::INT);
+                    }
+                    command_phase::IDENTIFY_SENT => {
+                        // MESG_OUT done; bus is now in CMD phase.
+                        // Driver sends CDB bytes one at a time via DBR polling.
+                        // Do NOT raise an interrupt here — the DATA write handler fires
+                        // REQ_CMD_PHASE (via worker wakeup) after the last CDB byte lands.
+                        let tc = self.get_transfer_count();
+                        let tc = if tc == 0 { self.set_transfer_count(6); 6 } else { tc };
+                        dlog!(LogModule::Scsi, "WD33C93A: XFER_INFO CMD phase, tc={}", tc);
+                        self.fifo.clear();
+                        self.regs[regs::COMMAND_PHASE as usize] = command_phase::COMMAND_START;
+                        self.asr |= asr::DBR;
+                        self.asr &= !(asr::CIP | asr::INT);
+                    }
+                    command_phase::COMMAND_START => {
+                        // CDB fully received via DBR — execute it.
+                        dlog!(LogModule::Scsi, "WD33C93A: XFER_INFO CMD execute CDB from fifo ({} bytes)", self.fifo.len());
+                        let cdb: Vec<u8> = self.fifo.drain(..).collect();
                         self.process_scsi_command(&cdb, false, dma);
                     }
-                    0x40 if cmd_phase == command_phase::DATA_XFER_DONE => {
-                        // Resume after data transfer - move to Status
-                        self.regs[regs::TARGET_LUN as usize] = self.pending_status;
-                        self.set_phase_status(command_phase::STATUS_PHASE, scsi_status::TRANSFER_STATUS_IN);
-                        self.asr |= asr::INT;
-                        self.asr &= !asr::CIP;
+                    command_phase::TRANSFER_COUNT => {
+                        if !self.fifo.is_empty() {
+                            // Data-in PIO: fifo pre-loaded and TC set by process_scsi_command.
+                            // Arm DBR so driver can poll-read bytes one at a time via DATA register.
+                            dlog!(LogModule::Scsi, "WD33C93A: XFER_INFO DATA_IN PIO, {} bytes, arming DBR", self.fifo.len());
+                            self.asr |= asr::DBR;
+                            self.asr &= !(asr::CIP | asr::INT);
+                        } else {
+                            // No data (or fifo already drained), target now asserting STATUS phase.
+                            dlog!(LogModule::Scsi, "WD33C93A: XFER_INFO → STATUS phase");
+                            self.regs[regs::TARGET_LUN as usize] = self.pending_status;
+                            self.raise_interrupt(command_phase::RECEIVE_STATUS, scsi_status::TRANSFER_STATUS_IN);
+                            self.asr &= !asr::CIP;
+                        }
                     }
-                    0x40 if cmd_phase == command_phase::STATUS_PHASE => {
-                        // In status phase - move to Message In
+                    command_phase::RECEIVE_STATUS => {
+                        // Driver issued TRANSFER_INFO to read 1 status byte via DBR.
+                        // Push status byte to fifo, arm DBR. DATA read handler fires TRANSFER_MSG_IN when drained.
                         self.regs[regs::TARGET_LUN as usize] = self.pending_status;
-                        self.set_phase_status(command_phase::STATUS_RECEIVED, scsi_status::TRANSFER_MSG_IN);
-                        self.asr |= asr::INT;
-                        self.asr &= !asr::CIP;
+                        self.set_transfer_count(1);
+                        self.fifo.push_back(self.pending_status);
+                        dlog!(LogModule::Scsi, "WD33C93A: XFER_INFO RECEIVE_STATUS → DBR status={:02x}", self.pending_status);
+                        self.asr |= asr::DBR;
+                        self.asr &= !(asr::CIP | asr::INT);
                     }
-                    0x50 => {
-                        // Status received - send message byte (COMMAND COMPLETE)
+                    command_phase::STATUS_RECEIVED => {
+                        // Driver issued TRANSFER_INFO to read 1 msg byte via DBR.
+                        // Push msg byte to fifo, arm DBR. DATA read handler fires DISCONNECT when drained.
+                        self.set_transfer_count(1);
                         self.fifo.push_back(self.pending_msg);
-                        self.set_phase_status(command_phase::COMPLETE_MSG, scsi_status::DISCONNECT);
-                        self.asr |= asr::INT;
-                        self.asr &= !asr::CIP;
+                        dlog!(LogModule::Scsi, "WD33C93A: XFER_INFO STATUS_RECEIVED → DBR msg={:02x}", self.pending_msg);
+                        self.asr |= asr::DBR;
+                        self.asr &= !(asr::CIP | asr::INT);
                     }
                     _ => {
-                        dlog!(LogModule::Scsi, "WD33C93A: TRANSFER_INFO in unexpected phase {:02x}", cmd_phase);
+                        dlog!(LogModule::Scsi, "WD33C93A: TRANSFER_INFO in unexpected state scsi_st={:02x} cmd_phase={:02x}",
+                            scsi_st, cmd_phase);
                         self.asr &= !asr::CIP;
                     }
                 }
             }
             cmd::NEGATE_ACK => {
-                // Often used to complete a message transfer
+                // CLR_ACK after message-in byte(s): produce disconnect interrupt
+                // so the driver's SBIC_WAIT loop gets the next CSR.
                 let cmd_phase = self.regs[regs::COMMAND_PHASE as usize];
-                if cmd_phase == command_phase::DISCONNECTED || cmd_phase == command_phase::COMPLETE_MSG {
-                     // Command Complete
-                     self.set_phase_status(cmd_phase, scsi_status::SELECT_TRANSFER_SUCCESS);
-                     // Or 0x85 (Disconnect)
-                     // For now, just clear interrupt
-                     self.asr &= !asr::INT;
+                if cmd_phase == command_phase::COMPLETE_MSG {
+                    self.raise_interrupt(command_phase::DISCONNECTED, scsi_status::DISCONNECT);
                 }
                 self.asr &= !asr::CIP;
             }
@@ -1253,21 +1529,14 @@ impl Wd33c93aState {
 
 
     fn get_cdb_length(&self, opcode: u8) -> usize {
-        // In advanced mode, OWN_ID register can override the standard CDB length
-        if self.advanced_mode {
-            let own_id_len = self.regs[regs::OWN_ID as usize] as usize;
-            if own_id_len > 0 {
-                return own_id_len;
-            }
-        }
-        // Use standard SCSI CDB length based on opcode group
         scsi::get_cdb_length(opcode)
     }
 
     fn process_scsi_command(&mut self, cdb: &[u8], auto_mode: bool, dma: Option<&dyn DmaClient>) {
         if cdb.is_empty() {
             dlog!(LogModule::Scsi, "WD33C93A: Empty CDB!");
-            self.asr |= asr::LCI | asr::INT;
+            self.asr |= asr::LCI;
+            self.raise_interrupt(command_phase::DISCONNECTED, scsi_status::INVALID_COMMAND);
             self.asr &= !asr::CIP;
             return;
         }
@@ -1423,11 +1692,26 @@ impl Wd33c93aState {
                         if !self.send_data_chunked(response.data, 0, dma) {
                             return;
                         }
-                    } else {
+                        self.finish_command(response.status);
+                    } else if auto_mode {
                         self.send_data(&response.data, dma);
+                        self.finish_command(response.status);
+                    } else {
+                        // PIO data-in: load fifo, set TC, save status, raise TRANSFER_DATA_IN.
+                        // Driver issues TRANSFER_INFO; TRANSFER_COUNT handler arms DBR for byte-by-byte delivery.
+                        // finish_command skipped — pending_status/msg set directly, TC set to data length.
+                        self.pending_status = response.status;
+                        self.pending_msg = 0x00;
+                        self.set_transfer_count(response.data.len() as u32);
+                        self.fifo.extend(response.data);
+                        dlog!(LogModule::Scsi, "WD33C93A: PIO DATA_IN {} bytes, raising TRANSFER_DATA_IN", self.fifo.len());
+                        self.raise_interrupt(command_phase::TRANSFER_COUNT, scsi_status::TRANSFER_DATA_IN);
+                        self.asr &= !asr::CIP;
+                        return;
                     }
+                } else {
+                    self.finish_command(response.status);
                 }
-                self.finish_command(response.status);
             }
             Err(_) => {
                 self.finish_command(0x02); // Check Condition
@@ -1435,13 +1719,15 @@ impl Wd33c93aState {
         }
 
         if auto_mode {
-            self.set_phase_status(command_phase::COMPLETE_MSG, scsi_status::SELECT_TRANSFER_SUCCESS);
             self.regs[regs::TARGET_LUN as usize] = self.pending_status;
-            self.asr |= asr::INT;
+            self.raise_interrupt(command_phase::COMPLETE_MSG, scsi_status::SELECT_TRANSFER_SUCCESS);
             self.asr &= !asr::CIP;
         } else {
-            self.set_phase_status(command_phase::DATA_XFER_DONE, scsi_status::TRANSFER_STATUS_IN);
-            self.asr |= asr::INT;
+            // PIO path, no data (or data done via DMA): target now in STATUS phase.
+            // Use RECEIVE_STATUS phase directly so the next TRANSFER_INFO arms DBR
+            // for the status byte without looping through TRANSFER_COUNT again.
+            self.regs[regs::TARGET_LUN as usize] = self.pending_status;
+            self.raise_interrupt(command_phase::RECEIVE_STATUS, scsi_status::TRANSFER_STATUS_IN);
             self.asr &= !asr::CIP;
         }
     }
@@ -1481,9 +1767,7 @@ impl Wd33c93aState {
                     self.xfer_data = data;
                     self.xfer_offset = i;
                     self.xfer_direction_in = true;
-                    // ST_UNEX_SDATA (0x49): target is unexpectedly sending data (long READ)
-                    self.set_phase_status(command_phase::DATA_XFER_DONE, scsi_status::UNEXPECTED_SEND_DATA);
-                    self.asr |= asr::INT;
+                    self.raise_interrupt(command_phase::TRANSFER_COUNT, scsi_status::UNEXPECTED_SEND_DATA);
                     self.asr &= !asr::CIP;
                     return false;
                 }
@@ -1515,9 +1799,7 @@ impl Wd33c93aState {
                             self.xfer_data = data;
                             self.xfer_offset = total; // store total as sentinel; xfer_data.len() is progress
                             self.xfer_direction_in = false;
-                            // ST_UNEX_RDATA (0x48): host is unexpectedly receiving data (long WRITE)
-                            self.set_phase_status(command_phase::DATA_XFER_DONE, scsi_status::UNEXPECTED_RECV_DATA);
-                            self.asr |= asr::INT;
+                            self.raise_interrupt(command_phase::TRANSFER_COUNT, scsi_status::UNEXPECTED_RECV_DATA);
                             self.asr &= !asr::CIP;
                             return None;
                         }
@@ -1530,8 +1812,7 @@ impl Wd33c93aState {
                             self.xfer_data = data;
                             self.xfer_offset = total;
                             self.xfer_direction_in = false;
-                            self.set_phase_status(command_phase::DATA_XFER_DONE, scsi_status::UNEXPECTED_RECV_DATA);
-                            self.asr |= asr::INT;
+                            self.raise_interrupt(command_phase::TRANSFER_COUNT, scsi_status::UNEXPECTED_RECV_DATA);
                             self.asr &= !asr::CIP;
                             return None;
                         }
@@ -1589,6 +1870,13 @@ impl Wd33c93aState {
         data
     }
 
+    fn get_transfer_count(&self) -> u32 {
+        let lo  = self.regs[regs::TRANSFER_COUNT_LSB as usize] as u32;
+        let mid = self.regs[regs::TRANSFER_COUNT_2ND as usize] as u32;
+        let hi  = self.regs[regs::TRANSFER_COUNT_MSB as usize] as u32;
+        (hi << 16) | (mid << 8) | lo
+    }
+
     fn set_transfer_count(&mut self, count: u32) {
         self.regs[regs::TRANSFER_COUNT_MSB as usize] = ((count >> 16) & 0xFF) as u8;
         self.regs[regs::TRANSFER_COUNT_2ND as usize] = ((count >> 8)  & 0xFF) as u8;
@@ -1599,14 +1887,8 @@ impl Wd33c93aState {
     /// which decrements on every byte transferred. save_datap() reads this to compute
     /// count_xferd = wd_xferlen - count_remain.
     fn decrement_transfer_count(&mut self) {
-        let lo  = self.regs[regs::TRANSFER_COUNT_LSB as usize] as u32;
-        let mid = self.regs[regs::TRANSFER_COUNT_2ND as usize] as u32;
-        let hi  = self.regs[regs::TRANSFER_COUNT_MSB as usize] as u32;
-        let count = (hi << 16) | (mid << 8) | lo;
-        let count = count.saturating_sub(1);
-        self.regs[regs::TRANSFER_COUNT_MSB as usize] = ((count >> 16) & 0xFF) as u8;
-        self.regs[regs::TRANSFER_COUNT_2ND as usize] = ((count >> 8)  & 0xFF) as u8;
-        self.regs[regs::TRANSFER_COUNT_LSB as usize] = (count         & 0xFF) as u8;
+        let count = self.get_transfer_count().saturating_sub(1);
+        self.set_transfer_count(count);
     }
 }
 

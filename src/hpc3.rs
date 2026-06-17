@@ -79,8 +79,12 @@ pub const MISC_EEPROM_DATA: u32 = 0x0008;
 pub const MISC_INTSTAT_BUG: u32 = 0x000C;
 pub const MISC_GIO_BUS_ERROR: u32 = 0x0010;
 
-// SCSI Registers
-pub const SCSI_REG_BASE: u32 = 0x40000;
+// SCSI chip registers appear at two addresses due to HPC3 address line aliasing:
+//   0x40000 (0x1fbc0000) — IRIX hpc3.h HPC3_SCSI_REG0 (wrong per spec, works on hw)
+//   0x44000 (0x1fbc4000) — HPC3 spec / OpenBSD HPC3_SCSI0_DEVREGS (correct)
+// Both map to the same WD33C93A chip.
+pub const SCSI_REG_BASE: u32  = 0x40000;
+pub const SCSI_REG_BASE2: u32 = 0x44000;
 pub const SEEQ_BASE: u32 = 0x54000;
 
 // PBUS PIO
@@ -736,7 +740,9 @@ impl PdmaChannelOps for PbusDmaOps {
     }
 }
 
-struct ScsiDmaOps;
+struct ScsiDmaOps {
+    wd: Arc<OnceLock<Arc<Wd33c93a>>>,
+}
 impl PdmaChannelOps for ScsiDmaOps {
     fn read(&self, chan: &mut PdmaChannel, reg: u32) -> u32 {
         match reg {
@@ -773,6 +779,7 @@ impl PdmaChannelOps for ScsiDmaOps {
                 chan.endian = (val & SCSI_CTRL_ENDIAN) != 0;
 
                 let was_active = chan.is_active();
+                let prev_reset = (chan.ctrl & SCSI_CTRL_RESET) != 0;
                 // Update control register, preserving the active bit for now
                 chan.ctrl = (val & !SCSI_CTRL_ACTIVE) | (chan.ctrl & SCSI_CTRL_ACTIVE);
 
@@ -781,6 +788,12 @@ impl PdmaChannelOps for ScsiDmaOps {
                 let mut should_be_active = if mask_active { was_active } else { (val & SCSI_CTRL_ACTIVE) != 0 };
 
                 if reset { should_be_active = false; }
+
+                // Falling edge of RESET: pulse the WD33C93A chip reset.
+                // After reset the chip sets ASR.INT; OpenBSD wdsc_match() polls for this.
+                if prev_reset && !reset {
+                    if let Some(wd) = self.wd.get() { wd.power_on(); }
+                }
 
                 chan.set_active(should_be_active);
 
@@ -1017,6 +1030,9 @@ impl Hpc3 {
             pbus_pio: [0; 0x1000],
         }));
 
+        // Shared OnceLock so ScsiDmaOps can call power_on() on the WD33C93A reset falling edge.
+        let scsi_wd_lock: Arc<OnceLock<Arc<Wd33c93a>>> = Arc::new(OnceLock::new());
+
         // Shared OnceLock so EnetRx/TxDmaOps can pull SEEQ status on CTRL read.
         // Populated after seeq creation below.
         let enet_seeq_lock: Arc<OnceLock<Arc<Seeq8003>>> = Arc::new(OnceLock::new());
@@ -1050,7 +1066,7 @@ impl Hpc3 {
             if i <= HPC3_PDMA_CHAN_GENERIC as usize {
                 pdma_ops.push(Arc::new(PbusDmaOps));
             } else if i <= HPC3_PDMA_CHAN_SCSI1 as usize {
-                pdma_ops.push(Arc::new(ScsiDmaOps));
+                pdma_ops.push(Arc::new(ScsiDmaOps { wd: scsi_wd_lock.clone() }));
             } else if i == HPC3_PDMA_CHAN_ENET_RX as usize {
                 pdma_ops.push(Arc::new(EnetRxDmaOps { seeq: enet_seeq_lock.clone() }));
             } else {
@@ -1086,7 +1102,8 @@ impl Hpc3 {
         });
 
         let scsi_dev = Arc::new(Wd33c93a::new(Some(scsi0_dma), Some(scsi0_irq), heartbeat.clone()));
-        
+        let _ = scsi_wd_lock.set(scsi_dev.clone());
+
         let hal2 = if no_audio { None } else { Some(Arc::new(Hal2::new(dma_clients[0..8].to_vec()))) };
 
         Self {
@@ -1330,9 +1347,11 @@ impl BusDevice for Hpc3 {
             return self.ioc.read8(addr);
         }
 
-        // SCSI Registers (0x40000 - 0x40007) - these are 8-bit devices
-        if (SCSI_REG_BASE..SCSI_REG_BASE + 8).contains(&offset) {
-            let idx = (offset - SCSI_REG_BASE) >> 2;
+        // SCSI Registers — two aliases: 0x40000 (IRIX) and 0x44000 (HPC3 spec/OpenBSD)
+        if (SCSI_REG_BASE..SCSI_REG_BASE + 8).contains(&offset)
+            || (SCSI_REG_BASE2..SCSI_REG_BASE2 + 8).contains(&offset) {
+            let base = if offset >= SCSI_REG_BASE2 { SCSI_REG_BASE2 } else { SCSI_REG_BASE };
+            let idx = (offset - base) >> 2;
             return self.scsi_dev.read(idx);
         }
 
@@ -1399,9 +1418,11 @@ impl BusDevice for Hpc3 {
             return self.ioc.write8(addr, val);
         }
 
-        // SCSI Registers (0x40000 - 0x40007) - 8-bit devices
-        if (SCSI_REG_BASE..SCSI_REG_BASE + 8).contains(&offset) {
-            let idx = (offset - SCSI_REG_BASE) >> 2;
+        // SCSI Registers — two aliases: 0x40000 (IRIX) and 0x44000 (HPC3 spec/OpenBSD)
+        if (SCSI_REG_BASE..SCSI_REG_BASE + 8).contains(&offset)
+            || (SCSI_REG_BASE2..SCSI_REG_BASE2 + 8).contains(&offset) {
+            let base = if offset >= SCSI_REG_BASE2 { SCSI_REG_BASE2 } else { SCSI_REG_BASE };
+            let idx = (offset - base) >> 2;
             return self.scsi_dev.write(idx, val);
         }
 
@@ -1488,8 +1509,9 @@ impl BusDevice for Hpc3 {
             return BusRead32::ok(0); // Placeholder
         }
 
-        // SCSI Registers (0x40000 - 0x40007) - 8-bit devices, convert to 32-bit
-        if (SCSI_REG_BASE..SCSI_REG_BASE + 8).contains(&offset) {
+        // SCSI Registers — two aliases: 0x40000 (IRIX) and 0x44000 (HPC3 spec/OpenBSD)
+        if (SCSI_REG_BASE..SCSI_REG_BASE + 8).contains(&offset)
+            || (SCSI_REG_BASE2..SCSI_REG_BASE2 + 8).contains(&offset) {
             let r = self.read8(addr);
             return if r.is_ok() { BusRead32::ok(r.data as u32) } else { BusRead32 { status: r.status, data: 0 } };
         }
@@ -1636,8 +1658,9 @@ impl BusDevice for Hpc3 {
             return self.write8(addr, val as u8);
         }
 
-        // SCSI Registers (0x40000 - 0x40007) - 8-bit devices
-        if (SCSI_REG_BASE..SCSI_REG_BASE + 8).contains(&offset) {
+        // SCSI Registers — two aliases: 0x40000 (IRIX) and 0x44000 (HPC3 spec/OpenBSD)
+        if (SCSI_REG_BASE..SCSI_REG_BASE + 8).contains(&offset)
+            || (SCSI_REG_BASE2..SCSI_REG_BASE2 + 8).contains(&offset) {
             return self.write8(addr, val as u8);
         }
 
