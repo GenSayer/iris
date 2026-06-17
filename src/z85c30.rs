@@ -130,6 +130,9 @@ pub struct Channel {
     pub ip_num: Arc<AtomicU8>,
     pub ip_other: Arc<AtomicU8>,
     pub callback: Option<Arc<dyn IrqCallback>>,
+    // Z85C30 Tx interrupt fires once when buffer empties, then arms again only
+    // after RES_Tx_P.  Without this latch the IRQ line stays asserted forever.
+    pub tx_int_pending: bool,
 }
 
 impl Channel {
@@ -145,6 +148,7 @@ impl Channel {
             ip_num,
             ip_other,
             callback,
+            tx_int_pending: false,
         };
         c.update_tx_delay();
         c
@@ -173,6 +177,7 @@ impl Channel {
         self.reg_ptr = 0;
         self.status = rr0::TX_BUFFER_EMPTY;
         self.regs.fill(0);
+        self.tx_int_pending = false;
         self.update_ip();
         self.update_tx_delay();
     }
@@ -248,8 +253,21 @@ impl Channel {
             match cmd {
                 0 => {}, // Null
                 1 => {}, // Point High (handled above)
+                2 => { // Reset Ext/Status Interrupts
+                },
                 3 => self.reset(), // Channel Reset
-                _ => {}, // Other commands ignored for now
+                4 => { // Enable Interrupt on Next Rx Character
+                },
+                5 => { // Reset Tx Interrupt Pending (RES_Tx_P)
+                    // Re-arms the Tx interrupt latch so the next transmit
+                    // opportunity will fire it again.
+                    self.tx_int_pending = false;
+                },
+                6 => { // Error Reset (ERR_RES) — clears error bits in RR1
+                },
+                7 => { // Reset Highest IUS (RES_H_IUS)
+                },
+                _ => {},
             }
         }
         self.update_ip();
@@ -259,20 +277,22 @@ impl Channel {
     pub fn get_ip(&self) -> u8 {
         let wr1 = self.regs[1];
         let mut ip = 0;
-        
+
         // Rx Interrupt (Bit 2 in local IP group)
         // Check if Rx Interrupts enabled (WR1 bits 4,3 != 00)
         if (wr1 & 0x18) != 0 && !self.rx_queue.is_empty() {
             ip |= 1 << 2;
         }
-        
+
         // Tx Interrupt (Bit 1 in local IP group)
         // Check if Tx Interrupt enabled (WR1 bit 1)
-        // And Tx Buffer Empty (RR0 bit 2)
-        if (wr1 & wr1::TX_INT_EN) != 0 && (self.status & rr0::TX_BUFFER_EMPTY) != 0 {
+        // Real Z85C30: Tx IUS fires once on buffer-empty, must be reset by
+        // RES_Tx_P before re-arming.  Gate on tx_int_pending so IRQ line
+        // doesn't stay asserted continuously when Tx FIFO is idle.
+        if (wr1 & wr1::TX_INT_EN) != 0 && self.tx_int_pending {
             ip |= 1 << 1;
         }
-        
+
         ip
     }
 
@@ -308,10 +328,23 @@ impl Channel {
         }
         self.tx_queue.push_back(val);
 
+        // A new write re-arms the Tx interrupt latch so it fires again when
+        // this char completes (TX_BUFFER_EMPTY goes high after the TX thread
+        // drains it and calls notify_tx_empty).
+        self.tx_int_pending = false;
+
         // Update status to indicate Tx Buffer Full (clearing Empty bit) only if full
         if self.tx_queue.len() >= 4 {
             self.status &= !rr0::TX_BUFFER_EMPTY;
         }
+        self.update_ip();
+    }
+
+    /// Called by the TX thread after sending a character and the queue drains.
+    /// Sets the Tx-interrupt-pending latch so the driver is notified that the
+    /// buffer is ready for the next character.
+    pub fn notify_tx_empty(&mut self) {
+        self.tx_int_pending = true;
         self.update_ip();
     }
 }
@@ -793,11 +826,13 @@ impl Device for Z85c30 {
 
                     // Pop data to simulate moving to Shift Register
                     let val = channel.tx_queue.pop_front();
-                    
-                    // Holding register is now empty (FIFO not full)
+
+                    // Holding register is now empty (FIFO not full): update
+                    // TX_BUFFER_EMPTY so the driver can queue another char,
+                    // but do NOT fire the Tx interrupt yet — that happens only
+                    // after transmission completes (notify_tx_empty below).
                     if channel.tx_queue.len() < 4 {
                         channel.status |= rr0::TX_BUFFER_EMPTY;
-                        channel.update_ip();
                     }
 
                     // Get pre-calculated delay
@@ -823,6 +858,11 @@ impl Device for Z85c30 {
                         // Output character
                         crate::dlog_dev!(LogModule::Scc, "SCC: TX({}) '{}' ({:02x})", channel_name, if byte.is_ascii_graphic() { byte as char } else { '.' }, byte);
                         tx_backend.send_byte(byte);
+
+                        // Transmission complete: fire Tx interrupt (once) to
+                        // tell the driver the buffer is ready for the next char.
+                        let (lock, _) = &*tx_channel;
+                        lock.lock().notify_tx_empty();
                     }
                 }
             }).unwrap());
@@ -980,9 +1020,10 @@ fn channel_from_toml(v: &toml::Value, ch: &mut Channel) {
     if let Some(r) = get_field(v, "regs")    { load_u8_slice(r, &mut ch.regs); }
     if let Some(x) = get_field(v, "reg_ptr") { if let Some(n) = toml_u8(x) { ch.reg_ptr = n; } }
     if let Some(x) = get_field(v, "status")  { if let Some(n) = toml_u8(x) { ch.status = n; } }
-    // Clear RX/TX queues — transient in-flight data is lost on restore.
+    // Clear transient state — in-flight data and interrupt latches are lost on restore.
     ch.rx_queue.clear();
     ch.tx_queue.clear();
+    ch.tx_int_pending = false;
     ch.update_tx_delay();
 }
 
