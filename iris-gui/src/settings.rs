@@ -53,32 +53,56 @@ pub struct GuiSettings {
     pub bookmarks: BTreeMap<String, Vec<u8>>,
 }
 
-/// Heuristic check for whether an NVRAM file already has an Ethernet MAC set.
-/// The SGI PROM stores env *values* as ASCII, so a configured `eaddr` shows up
-/// as a literal `xx:xx:xx:xx:xx:xx` substring. A missing file (fresh machine) or
-/// no such pattern means no MAC — which is why IRIX never attaches `ec0`.
+/// Byte offset of the Indy's 6-byte Ethernet MAC inside the NVRAM. The PROM
+/// reads the MAC from these *raw bytes* — it is NOT the colon-separated ASCII
+/// you type at `setenv` (that's just the human entry form). Reverse-engineered
+/// from firmware-written NVRAMs (the SGI OUI 08:00:69 lands exactly here, with
+/// zero bytes around it and no adjacent checksum). Like the `console` byte the
+/// headless path patches, this is a fixed, PROM-specific offset.
+pub const NVRAM_MAC_OFFSET: usize = 0x13a;
+
+/// The 6 raw MAC bytes from an NVRAM file, if it holds a non-blank one.
+pub fn nvram_mac(path: &str) -> Option<[u8; 6]> {
+    let b = std::fs::read(path).ok()?;
+    let m: [u8; 6] = b.get(NVRAM_MAC_OFFSET..NVRAM_MAC_OFFSET + 6)?.try_into().ok()?;
+    let blank = m.iter().all(|&x| x == 0x00) || m.iter().all(|&x| x == 0xff);
+    (!blank).then_some(m)
+}
+
+/// Whether the NVRAM already has an Ethernet MAC (so IRIX can attach `ec0`).
 pub fn nvram_has_mac(path: &str) -> bool {
-    let Ok(bytes) = std::fs::read(path) else { return false; };
-    bytes.windows(17).any(is_mac_ascii)
+    nvram_mac(path).is_some()
 }
 
-fn is_mac_ascii(w: &[u8]) -> bool {
-    w.len() >= 17
-        && w[..17].iter().enumerate().all(|(i, &b)| {
-            if i % 3 == 2 { b == b':' } else { b.is_ascii_hexdigit() }
-        })
-}
-
-/// A deterministic SGI-OUI MAC (`08:00:69:xx:xx:xx`) derived from `seed` (the
-/// machine name), so re-prompting the same machine always shows the same
-/// address. `08:00:69` is SGI's OUI; the low 3 octets come from a stable hash.
-/// Uniqueness across instances doesn't matter — each runs on its own NAT.
-pub fn generate_mac(seed: &str) -> String {
+/// Deterministic SGI-OUI MAC bytes (`08:00:69:xx:xx:xx`) from `seed` (machine
+/// name) — stable per machine. Uniqueness across instances doesn't matter; each
+/// runs on its own isolated NAT.
+pub fn generate_mac_bytes(seed: &str) -> [u8; 6] {
     use std::hash::{Hash, Hasher};
     let mut h = std::collections::hash_map::DefaultHasher::new();
     seed.hash(&mut h);
     let v = h.finish();
-    format!("08:00:69:{:02x}:{:02x}:{:02x}", (v >> 16) as u8, (v >> 8) as u8, v as u8)
+    [0x08, 0x00, 0x69, (v >> 16) as u8, (v >> 8) as u8, v as u8]
+}
+
+/// Human form `08:00:69:xx:xx:xx` for display/logging.
+pub fn mac_to_string(m: [u8; 6]) -> String {
+    m.iter().map(|b| format!("{b:02x}")).collect::<Vec<_>>().join(":")
+}
+
+/// Write 6 MAC bytes into an existing NVRAM file at [`NVRAM_MAC_OFFSET`],
+/// touching only those 6 bytes so the boot env is preserved. Backs the file up
+/// to `<path>.bak` first. Returns Ok(false) if there's no NVRAM file yet (a
+/// bare MAC with no DS1386 structure would be useless) or it's too small.
+pub fn write_nvram_mac(path: &str, mac: [u8; 6]) -> std::io::Result<bool> {
+    let Ok(mut bytes) = std::fs::read(path) else { return Ok(false); };
+    if bytes.len() < NVRAM_MAC_OFFSET + 6 {
+        return Ok(false);
+    }
+    let _ = std::fs::copy(path, format!("{path}.bak")); // best-effort backup
+    bytes[NVRAM_MAC_OFFSET..NVRAM_MAC_OFFSET + 6].copy_from_slice(&mac);
+    std::fs::write(path, &bytes)?;
+    Ok(true)
 }
 
 /// Allowed UI-scale range, shared by the View-menu slider, the Ctrl +/-/0

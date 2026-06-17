@@ -140,15 +140,6 @@ pub fn pump(ctx: &egui::Context, fb_clicked: bool, ps2: &Ps2Controller, state: &
     }
 }
 
-/// Inject a single Escape keypress (press + release) straight to the guest's
-/// PS/2 keyboard, bypassing capture. Used to interrupt the PROM autoboot
-/// countdown so a machine with no Ethernet MAC drops to the System Maintenance
-/// Menu (for one-time `eaddr` setup) instead of booting IRIX networking-less.
-pub fn tap_escape(ps2: &Ps2Controller) {
-    ps2.push_kb(KeyCode::Escape, true);
-    ps2.push_kb(KeyCode::Escape, false);
-}
-
 /// Pick the cursor-grab mode winit actually supports on this platform/session.
 ///
 /// winit's two grab modes are not portable: `Locked` (lock the cursor in place
