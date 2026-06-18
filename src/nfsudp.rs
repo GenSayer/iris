@@ -529,6 +529,289 @@ pub fn reply(xid: u32, accept_stat: u32) -> Xdr {
     x
 }
 
+// ── NFSv3 (RFC 1813) procedures ─────────────────────────────────────────────
+//
+// Increment 3: the read-side procedures over the backend. Write-side
+// (SETATTR/WRITE/CREATE/MKDIR/REMOVE/RMDIR/RENAME/COMMIT), NFSv2, MOUNT, and the
+// NAT wiring land in later increments.
+
+/// NFS RPC program + version.
+pub const NFS_PROG: u32 = 100003;
+pub const NFS_V3: u32 = 3;
+
+// NFSv3 procedure numbers.
+const PROC3_NULL: u32 = 0;
+const PROC3_GETATTR: u32 = 1;
+const PROC3_LOOKUP: u32 = 3;
+const PROC3_ACCESS: u32 = 4;
+const PROC3_READ: u32 = 6;
+const PROC3_READDIR: u32 = 16;
+const PROC3_READDIRPLUS: u32 = 17;
+const PROC3_FSSTAT: u32 = 18;
+const PROC3_FSINFO: u32 = 19;
+const PROC3_PATHCONF: u32 = 20;
+
+// nfsstat3 values we use.
+const NFS3_OK: u32 = 0;
+const NFS3ERR_IO: u32 = 5;
+const NFS3ERR_NOENT: u32 = 2;
+const NFS3ERR_NOTDIR: u32 = 20;
+const NFS3ERR_STALE: u32 = 70;
+
+// fsinfo3 sizes. Reads can be large (the NAT fragments outbound); writes need
+// the inbound-reassembly increment before a large wtmax is safe.
+const RTMAX: u32 = 32768;
+const WTMAX: u32 = 32768;
+const DTPREF: u32 = 8192;
+const FSF3_HOMOGENEOUS: u32 = 0x8;
+const FSF3_CANSETTIME: u32 = 0x10;
+
+const FSID: u64 = 0x4952_4953; // "IRIS"
+
+fn ftype3(kind: FileKind) -> u32 {
+    match kind {
+        FileKind::Reg | FileKind::Other => 1, // NF3REG
+        FileKind::Dir => 2,                   // NF3DIR
+        FileKind::Lnk => 5,                   // NF3LNK
+    }
+}
+
+/// File handle (`nfs_fh3`): we encode the 8-byte fileid as the opaque handle.
+fn put_fh(x: &mut Xdr, fileid: u64) {
+    x.opaque(&fileid.to_be_bytes());
+}
+fn get_fh(c: &mut Cur) -> Option<u64> {
+    let h = c.opaque()?;
+    (h.len() == 8).then(|| u64::from_be_bytes(h.try_into().ok().unwrap()))
+}
+
+fn put_time(x: &mut Xdr, t: (u32, u32)) {
+    x.u32(t.0);
+    x.u32(t.1);
+}
+
+/// `fattr3`. Mode carries the full st_mode (type + perm bits) — matches knfsd and
+/// is what clients expect; `type` is the kind.
+fn put_fattr3(x: &mut Xdr, a: &Attr) {
+    x.u32(ftype3(a.kind));
+    x.u32(a.mode);
+    x.u32(a.nlink);
+    x.u32(a.uid);
+    x.u32(a.gid);
+    x.u64(a.size);
+    x.u64(a.size); // used (approximated by size)
+    x.u32(0);
+    x.u32(0); // rdev (specdata3)
+    x.u64(FSID);
+    x.u64(a.fileid);
+    put_time(x, a.atime);
+    put_time(x, a.mtime);
+    put_time(x, a.ctime);
+}
+
+/// `post_op_attr`: a present-flag + optional `fattr3`.
+fn put_post_op_attr(x: &mut Xdr, a: Option<&Attr>) {
+    match a {
+        Some(a) => {
+            x.bool(true);
+            put_fattr3(x, a);
+        }
+        None => x.bool(false),
+    }
+}
+
+fn garbage(xid: u32) -> Vec<u8> {
+    reply(xid, accept::GARBAGE_ARGS).into_bytes()
+}
+
+/// Dispatch one NFSv3 call to its handler, returning the full reply datagram.
+pub fn nfs3_call(call: &RpcCall, args: &mut Cur, b: &mut NfsBacking) -> Vec<u8> {
+    match call.proc_num {
+        PROC3_NULL => reply(call.xid, accept::SUCCESS).into_bytes(),
+        PROC3_GETATTR => nfs3_getattr(call, args, b),
+        PROC3_LOOKUP => nfs3_lookup(call, args, b),
+        PROC3_ACCESS => nfs3_access(call, args, b),
+        PROC3_READ => nfs3_read(call, args, b),
+        PROC3_READDIR => nfs3_readdir(call, args, b, false),
+        PROC3_READDIRPLUS => nfs3_readdir(call, args, b, true),
+        PROC3_FSINFO => nfs3_fsinfo(call, args, b),
+        PROC3_FSSTAT => nfs3_fsstat(call, args, b),
+        PROC3_PATHCONF => nfs3_pathconf(call, args, b),
+        // write-side procedures arrive in increment 4.
+        _ => reply(call.xid, accept::PROC_UNAVAIL).into_bytes(),
+    }
+}
+
+fn nfs3_getattr(call: &RpcCall, args: &mut Cur, b: &mut NfsBacking) -> Vec<u8> {
+    let Some(fid) = get_fh(args) else { return garbage(call.xid) };
+    let mut x = reply(call.xid, accept::SUCCESS);
+    match b.attr(fid) {
+        Some(a) => {
+            x.u32(NFS3_OK);
+            put_fattr3(&mut x, &a);
+        }
+        None => x.u32(NFS3ERR_STALE),
+    }
+    x.into_bytes()
+}
+
+fn nfs3_lookup(call: &RpcCall, args: &mut Cur, b: &mut NfsBacking) -> Vec<u8> {
+    let Some(dir) = get_fh(args) else { return garbage(call.xid) };
+    let name = match args.opaque() {
+        Some(n) => n.to_vec(),
+        None => return garbage(call.xid),
+    };
+    let mut x = reply(call.xid, accept::SUCCESS);
+    match b.lookup(dir, &name) {
+        Some(fid) => {
+            x.u32(NFS3_OK);
+            put_fh(&mut x, fid);
+            put_post_op_attr(&mut x, b.attr(fid).as_ref()); // obj attributes
+            put_post_op_attr(&mut x, b.attr(dir).as_ref()); // dir attributes
+        }
+        None => {
+            x.u32(NFS3ERR_NOENT);
+            put_post_op_attr(&mut x, b.attr(dir).as_ref());
+        }
+    }
+    x.into_bytes()
+}
+
+fn nfs3_access(call: &RpcCall, args: &mut Cur, b: &mut NfsBacking) -> Vec<u8> {
+    let Some(fid) = get_fh(args) else { return garbage(call.xid) };
+    let Some(requested) = args.u32() else { return garbage(call.xid) };
+    let mut x = reply(call.xid, accept::SUCCESS);
+    match b.attr(fid) {
+        Some(a) => {
+            x.u32(NFS3_OK);
+            put_post_op_attr(&mut x, Some(&a));
+            x.u32(requested); // grant everything asked for (no security)
+        }
+        None => {
+            x.u32(NFS3ERR_STALE);
+            put_post_op_attr(&mut x, None);
+        }
+    }
+    x.into_bytes()
+}
+
+fn nfs3_read(call: &RpcCall, args: &mut Cur, b: &mut NfsBacking) -> Vec<u8> {
+    let Some(fid) = get_fh(args) else { return garbage(call.xid) };
+    let Some(offset) = args.u64() else { return garbage(call.xid) };
+    let Some(count) = args.u32() else { return garbage(call.xid) };
+    let mut x = reply(call.xid, accept::SUCCESS);
+    match b.read(fid, offset, count.min(RTMAX)) {
+        Some((data, eof)) => {
+            x.u32(NFS3_OK);
+            put_post_op_attr(&mut x, b.attr(fid).as_ref());
+            x.u32(data.len() as u32);
+            x.bool(eof);
+            x.opaque(&data);
+        }
+        None => {
+            x.u32(NFS3ERR_IO);
+            put_post_op_attr(&mut x, b.attr(fid).as_ref());
+        }
+    }
+    x.into_bytes()
+}
+
+/// READDIR / READDIRPLUS. Entries are name-sorted so the cookie (a 1-based index)
+/// is stable across calls; we page within a byte budget and set `eof` when done.
+fn nfs3_readdir(call: &RpcCall, args: &mut Cur, b: &mut NfsBacking, plus: bool) -> Vec<u8> {
+    let Some(fid) = get_fh(args) else { return garbage(call.xid) };
+    let Some(cookie) = args.u64() else { return garbage(call.xid) };
+    if args.fixed(8).is_none() {
+        return garbage(call.xid); // cookieverf
+    }
+    let Some(mut entries) = b.readdir(fid) else {
+        let mut x = reply(call.xid, accept::SUCCESS);
+        x.u32(NFS3ERR_NOTDIR);
+        put_post_op_attr(&mut x, b.attr(fid).as_ref());
+        return x.into_bytes();
+    };
+    entries.sort_by(|p, q| p.0.cmp(&q.0));
+    let dir_attr = b.attr(fid);
+
+    let mut x = reply(call.xid, accept::SUCCESS);
+    x.u32(NFS3_OK);
+    put_post_op_attr(&mut x, dir_attr.as_ref());
+    x.fixed(&[0u8; 8]); // cookieverf
+
+    let mut i = cookie as usize;
+    let mut budget = 0usize;
+    while i < entries.len() {
+        let (name, id, attr) = &entries[i];
+        let est = 40 + name.len() + if plus { 96 } else { 0 };
+        if budget > 0 && budget + est > 16_000 {
+            break; // page is full; client resumes from this cookie
+        }
+        budget += est;
+        x.bool(true); // entry follows
+        x.u64(*id); // fileid
+        x.opaque(name);
+        x.u64((i + 1) as u64); // cookie = next index
+        if plus {
+            put_post_op_attr(&mut x, Some(attr)); // name_attributes
+            x.bool(true); // handle follows
+            put_fh(&mut x, *id);
+        }
+        i += 1;
+    }
+    x.bool(false); // no more entries in this reply
+    x.bool(i >= entries.len()); // eof
+    x.into_bytes()
+}
+
+fn nfs3_fsinfo(call: &RpcCall, args: &mut Cur, b: &mut NfsBacking) -> Vec<u8> {
+    let Some(fid) = get_fh(args) else { return garbage(call.xid) };
+    let mut x = reply(call.xid, accept::SUCCESS);
+    x.u32(NFS3_OK);
+    put_post_op_attr(&mut x, b.attr(fid).as_ref());
+    x.u32(RTMAX); // rtmax
+    x.u32(RTMAX); // rtpref
+    x.u32(4096); // rtmult
+    x.u32(WTMAX); // wtmax
+    x.u32(WTMAX); // wtpref
+    x.u32(4096); // wtmult
+    x.u32(DTPREF); // dtpref
+    x.u64(0x7fff_ffff_ffff_ffff); // maxfilesize
+    put_time(&mut x, (1, 0)); // time_delta (1s)
+    x.u32(FSF3_HOMOGENEOUS | FSF3_CANSETTIME); // properties
+    x.into_bytes()
+}
+
+fn nfs3_fsstat(call: &RpcCall, args: &mut Cur, b: &mut NfsBacking) -> Vec<u8> {
+    let Some(fid) = get_fh(args) else { return garbage(call.xid) };
+    let mut x = reply(call.xid, accept::SUCCESS);
+    x.u32(NFS3_OK);
+    put_post_op_attr(&mut x, b.attr(fid).as_ref());
+    let big = 1u64 << 40; // faked capacity
+    x.u64(big);
+    x.u64(big);
+    x.u64(big); // total / free / avail bytes
+    let files = 1u64 << 20;
+    x.u64(files);
+    x.u64(files);
+    x.u64(files); // total / free / avail files
+    x.u32(0); // invarsec
+    x.into_bytes()
+}
+
+fn nfs3_pathconf(call: &RpcCall, args: &mut Cur, b: &mut NfsBacking) -> Vec<u8> {
+    let Some(fid) = get_fh(args) else { return garbage(call.xid) };
+    let mut x = reply(call.xid, accept::SUCCESS);
+    x.u32(NFS3_OK);
+    put_post_op_attr(&mut x, b.attr(fid).as_ref());
+    x.u32(1023); // linkmax
+    x.u32(255); // name_max
+    x.bool(true); // no_trunc
+    x.bool(false); // chown_restricted
+    x.bool(false); // case_insensitive
+    x.bool(true); // case_preserving
+    x.into_bytes()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -697,5 +980,116 @@ mod tests {
         assert_eq!(c.u32(), Some(0)); // verf flavor AUTH_NULL
         assert_eq!(c.u32(), Some(0)); // verf len
         assert_eq!(c.u32(), Some(0)); // accept_stat SUCCESS
+    }
+
+    // ── NFSv3 procedures (increment 3) ──────────────────────────────────────
+
+    /// Build an NFSv3 RPC call with AUTH_NULL and pre-encoded `args`.
+    fn build_call(proc_num: u32, args: &[u8]) -> Vec<u8> {
+        let mut x = Xdr::new();
+        x.u32(0x42); // xid
+        x.u32(0); // CALL
+        x.u32(2); // rpcvers
+        x.u32(NFS_PROG);
+        x.u32(NFS_V3);
+        x.u32(proc_num);
+        x.u32(0); x.u32(0); // cred AUTH_NULL
+        x.u32(0); x.u32(0); // verf AUTH_NULL
+        x.fixed(args); // args are already 4-aligned, so no extra pad
+        x.into_bytes()
+    }
+
+    /// Run one call against a backing store, returning (accept_stat, cursor at
+    /// the procedure result).
+    fn run(b: &mut NfsBacking, proc_num: u32, args: &[u8]) -> (u32, Vec<u8>) {
+        let req = build_call(proc_num, args);
+        let (rpc, mut argcur) = parse_call(&req).unwrap();
+        let reply_bytes = nfs3_call(&rpc, &mut argcur, b);
+        // Validate + strip the 6-word accepted-reply header.
+        let mut c = Cur::new(&reply_bytes);
+        assert_eq!(c.u32(), Some(0x42)); // xid echoed
+        assert_eq!(c.u32(), Some(1)); // REPLY
+        assert_eq!(c.u32(), Some(0)); // ACCEPTED
+        c.u32(); c.u32(); // verf
+        let stat = c.u32().unwrap();
+        let off = reply_bytes.len() - c.remaining().len();
+        (stat, reply_bytes[off..].to_vec())
+    }
+
+    #[test]
+    fn getattr_root_is_dir() {
+        let root = temp_export();
+        let mut b = NfsBacking::new(&root);
+        let mut a = Xdr::new();
+        put_fh(&mut a, ROOT_ID);
+        let (stat, res) = run(&mut b, PROC3_GETATTR, &a.into_bytes());
+        assert_eq!(stat, accept::SUCCESS);
+        let mut r = Cur::new(&res);
+        assert_eq!(r.u32(), Some(NFS3_OK)); // nfsstat3
+        assert_eq!(r.u32(), Some(2)); // ftype3 == NF3DIR
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn lookup_then_read() {
+        let root = temp_export();
+        std::fs::write(root.join("hello.txt"), b"hello world").unwrap();
+        let mut b = NfsBacking::new(&root);
+
+        let mut a = Xdr::new();
+        put_fh(&mut a, ROOT_ID);
+        a.opaque(b"hello.txt");
+        let (stat, res) = run(&mut b, PROC3_LOOKUP, &a.into_bytes());
+        assert_eq!(stat, accept::SUCCESS);
+        let mut r = Cur::new(&res);
+        assert_eq!(r.u32(), Some(NFS3_OK));
+        let fid = u64::from_be_bytes(r.opaque().unwrap().try_into().unwrap()); // object fh
+
+        let mut a = Xdr::new();
+        put_fh(&mut a, fid);
+        a.u64(0); // offset
+        a.u32(5); // count
+        let (_stat, res) = run(&mut b, PROC3_READ, &a.into_bytes());
+        let mut r = Cur::new(&res);
+        assert_eq!(r.u32(), Some(NFS3_OK));
+        // The read data is carried as the final opaque; assert the first 5 bytes
+        // of the file appear in the reply.
+        assert!(res.windows(5).any(|w| w == b"hello"), "read returned the data");
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn readdir_lists_entries() {
+        let root = temp_export();
+        std::fs::write(root.join("a.txt"), b"1").unwrap();
+        std::fs::write(root.join("b.txt"), b"2").unwrap();
+        let mut b = NfsBacking::new(&root);
+        let mut a = Xdr::new();
+        put_fh(&mut a, ROOT_ID);
+        a.u64(0); // cookie
+        a.fixed(&[0u8; 8]); // cookieverf
+        a.u32(8192); // count
+        let (stat, res) = run(&mut b, PROC3_READDIR, &a.into_bytes());
+        assert_eq!(stat, accept::SUCCESS);
+        assert!(res.windows(5).any(|w| w == b"a.txt"));
+        assert!(res.windows(5).any(|w| w == b"b.txt"));
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn fsinfo_advertises_sizes() {
+        let root = temp_export();
+        let mut b = NfsBacking::new(&root);
+        let mut a = Xdr::new();
+        put_fh(&mut a, ROOT_ID);
+        let (stat, res) = run(&mut b, PROC3_FSINFO, &a.into_bytes());
+        assert_eq!(stat, accept::SUCCESS);
+        let mut r = Cur::new(&res);
+        assert_eq!(r.u32(), Some(NFS3_OK));
+        // skip post_op_attr (present + fattr3): bool + 21 words (fattr3 is 84 bytes)
+        assert_eq!(r.u32(), Some(1)); // attrs follow
+        for _ in 0..21 { r.u32(); } // fattr3 = 84 bytes = 21 words
+        assert_eq!(r.u32(), Some(RTMAX)); // rtmax
+        std::fs::remove_dir_all(&root).ok();
     }
 }
