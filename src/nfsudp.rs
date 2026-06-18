@@ -358,6 +358,177 @@ pub fn within(root: &Path, candidate: &Path) -> bool {
     candidate.starts_with(root)
 }
 
+// ── XDR (RFC 1014) + Sun RPC (RFC 1057) wire layer ──────────────────────────
+//
+// Increment 2: the transport-agnostic encode/decode used by both NFSv2 and v3.
+// One UDP datagram carries exactly one RPC message (no TCP record marking).
+
+const MSG_CALL: u32 = 0;
+const MSG_REPLY: u32 = 1;
+const RPC_VERSION: u32 = 2;
+const REPLY_ACCEPTED: u32 = 0;
+const AUTH_NULL: u32 = 0;
+
+/// RPC accept-status values (RFC 1057). We allow every host, so auth never
+/// fails; these cover protocol-level outcomes only.
+pub mod accept {
+    pub const SUCCESS: u32 = 0;
+    pub const PROG_UNAVAIL: u32 = 1;
+    pub const PROG_MISMATCH: u32 = 2;
+    pub const PROC_UNAVAIL: u32 = 3;
+    pub const GARBAGE_ARGS: u32 = 4;
+    pub const SYSTEM_ERR: u32 = 5;
+}
+
+/// Big-endian, 4-byte-aligned XDR encoder.
+#[derive(Default)]
+pub struct Xdr {
+    buf: Vec<u8>,
+}
+impl Xdr {
+    pub fn new() -> Self {
+        Self { buf: Vec::new() }
+    }
+    pub fn u32(&mut self, v: u32) {
+        self.buf.extend_from_slice(&v.to_be_bytes());
+    }
+    pub fn i32(&mut self, v: i32) {
+        self.u32(v as u32);
+    }
+    pub fn u64(&mut self, v: u64) {
+        self.buf.extend_from_slice(&v.to_be_bytes());
+    }
+    pub fn bool(&mut self, v: bool) {
+        self.u32(v as u32);
+    }
+    /// Length-prefixed opaque/string, padded to a 4-byte boundary.
+    pub fn opaque(&mut self, b: &[u8]) {
+        self.u32(b.len() as u32);
+        self.fixed(b);
+    }
+    /// Fixed-length bytes (no length prefix), padded to 4 bytes.
+    pub fn fixed(&mut self, b: &[u8]) {
+        self.buf.extend_from_slice(b);
+        let pad = (4 - (b.len() % 4)) % 4;
+        self.buf.extend(std::iter::repeat(0u8).take(pad));
+    }
+    pub fn len(&self) -> usize {
+        self.buf.len()
+    }
+    pub fn is_empty(&self) -> bool {
+        self.buf.is_empty()
+    }
+    pub fn into_bytes(self) -> Vec<u8> {
+        self.buf
+    }
+}
+
+/// Big-endian XDR decode cursor over a borrowed datagram.
+pub struct Cur<'a> {
+    b: &'a [u8],
+    pos: usize,
+}
+impl<'a> Cur<'a> {
+    pub fn new(b: &'a [u8]) -> Self {
+        Self { b, pos: 0 }
+    }
+    pub fn u32(&mut self) -> Option<u32> {
+        let e = self.pos.checked_add(4)?;
+        if e > self.b.len() {
+            return None;
+        }
+        let v = u32::from_be_bytes(self.b[self.pos..e].try_into().ok()?);
+        self.pos = e;
+        Some(v)
+    }
+    pub fn u64(&mut self) -> Option<u64> {
+        let e = self.pos.checked_add(8)?;
+        if e > self.b.len() {
+            return None;
+        }
+        let v = u64::from_be_bytes(self.b[self.pos..e].try_into().ok()?);
+        self.pos = e;
+        Some(v)
+    }
+    pub fn i32(&mut self) -> Option<i32> {
+        self.u32().map(|v| v as i32)
+    }
+    /// Length-prefixed opaque/string (returns the bytes; consumes the pad).
+    pub fn opaque(&mut self) -> Option<&'a [u8]> {
+        let len = self.u32()? as usize;
+        self.fixed(len)
+    }
+    /// Fixed-length opaque of `len` bytes, consuming the pad to a 4-byte boundary.
+    pub fn fixed(&mut self, len: usize) -> Option<&'a [u8]> {
+        let e = self.pos.checked_add(len)?;
+        if e > self.b.len() {
+            return None;
+        }
+        let s = &self.b[self.pos..e];
+        let pad = (4 - (len % 4)) % 4;
+        self.pos = (e + pad).min(self.b.len()); // tolerate a missing trailing pad
+        Some(s)
+    }
+    pub fn skip(&mut self, n: usize) -> Option<()> {
+        let e = self.pos.checked_add(n)?;
+        if e > self.b.len() {
+            return None;
+        }
+        self.pos = e;
+        Some(())
+    }
+    /// Skip one RPC opaque_auth (`flavor` + length-prefixed `body`).
+    fn skip_auth(&mut self) -> Option<()> {
+        let _flavor = self.u32()?;
+        self.opaque()?;
+        Some(())
+    }
+    pub fn remaining(&self) -> &'a [u8] {
+        &self.b[self.pos.min(self.b.len())..]
+    }
+}
+
+/// A parsed RPC CALL header. Credentials are skipped — every host is allowed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RpcCall {
+    pub xid: u32,
+    pub prog: u32,
+    pub vers: u32,
+    pub proc_num: u32,
+}
+
+/// Parse the RPC CALL header from one UDP datagram, returning the header and a
+/// cursor positioned at the procedure arguments. `None` if it isn't a v2 CALL.
+pub fn parse_call(msg: &[u8]) -> Option<(RpcCall, Cur)> {
+    let mut c = Cur::new(msg);
+    let xid = c.u32()?;
+    if c.u32()? != MSG_CALL {
+        return None;
+    }
+    if c.u32()? != RPC_VERSION {
+        return None;
+    }
+    let prog = c.u32()?;
+    let vers = c.u32()?;
+    let proc_num = c.u32()?;
+    c.skip_auth()?; // cred
+    c.skip_auth()?; // verf
+    Some((RpcCall { xid, prog, vers, proc_num }, c))
+}
+
+/// Begin an accepted RPC reply (AUTH_NULL verifier), ready for the caller to
+/// append the procedure result. `accept_stat` is one of [`accept`].
+pub fn reply(xid: u32, accept_stat: u32) -> Xdr {
+    let mut x = Xdr::new();
+    x.u32(xid);
+    x.u32(MSG_REPLY);
+    x.u32(REPLY_ACCEPTED);
+    x.u32(AUTH_NULL); // verifier flavor
+    x.u32(0); // verifier body length
+    x.u32(accept_stat);
+    x
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -468,5 +639,63 @@ mod tests {
         assert!(b.lookup(ROOT_ID, b"..").is_none());
         assert!(b.lookup(ROOT_ID, b"../etc").is_none());
         std::fs::remove_dir_all(&root).ok();
+    }
+
+    // ── wire layer (increment 2) ────────────────────────────────────────────
+
+    #[test]
+    fn xdr_roundtrip() {
+        let mut x = Xdr::new();
+        x.u32(0xdead_beef);
+        x.u64(0x0102_0304_0506_0708);
+        x.opaque(b"abc"); // 4 (len) + 3 + 1 pad = 8
+        let bytes = x.into_bytes();
+        assert_eq!(bytes.len(), 4 + 8 + 8);
+        let mut c = Cur::new(&bytes);
+        assert_eq!(c.u32(), Some(0xdead_beef));
+        assert_eq!(c.u64(), Some(0x0102_0304_0506_0708));
+        assert_eq!(c.opaque(), Some(&b"abc"[..]));
+        assert_eq!(c.u32(), None); // exhausted
+    }
+
+    #[test]
+    fn parse_rpc_call_skips_auth() {
+        let mut x = Xdr::new();
+        x.u32(0x1122_3344); // xid
+        x.u32(0); // CALL
+        x.u32(2); // rpcvers
+        x.u32(100003); // NFS program
+        x.u32(3); // v3
+        x.u32(1); // GETATTR
+        x.u32(0); x.u32(0); // cred: AUTH_NULL, len 0
+        x.u32(0); x.u32(0); // verf: AUTH_NULL, len 0
+        x.u32(0xCAFE_BABE); // one arg word
+        let msg = x.into_bytes();
+        let (call, mut args) = parse_call(&msg).unwrap();
+        assert_eq!(call, RpcCall { xid: 0x1122_3344, prog: 100003, vers: 3, proc_num: 1 });
+        assert_eq!(args.u32(), Some(0xCAFE_BABE), "cursor lands on the args");
+    }
+
+    #[test]
+    fn parse_rejects_non_call_and_bad_version() {
+        let mut reply = Xdr::new();
+        reply.u32(1); reply.u32(1); // xid, REPLY (not CALL)
+        assert!(parse_call(&reply.into_bytes()).is_none());
+
+        let mut badver = Xdr::new();
+        badver.u32(1); badver.u32(0); badver.u32(3); // CALL but rpcvers=3
+        assert!(parse_call(&badver.into_bytes()).is_none());
+    }
+
+    #[test]
+    fn reply_header_bytes() {
+        let bytes = reply(0x1122_3344, accept::SUCCESS).into_bytes();
+        let mut c = Cur::new(&bytes);
+        assert_eq!(c.u32(), Some(0x1122_3344)); // xid
+        assert_eq!(c.u32(), Some(1)); // REPLY
+        assert_eq!(c.u32(), Some(0)); // MSG_ACCEPTED
+        assert_eq!(c.u32(), Some(0)); // verf flavor AUTH_NULL
+        assert_eq!(c.u32(), Some(0)); // verf len
+        assert_eq!(c.u32(), Some(0)); // accept_stat SUCCESS
     }
 }
