@@ -763,6 +763,12 @@ impl Machine {
         self.hpc3.seeq().nat_control().set_host_nets(nets);
     }
 
+    /// Replace the running NAT's inbound port-forward rules without a reboot;
+    /// the NAT thread rebinds its host listeners on its next loop.
+    pub fn set_port_forwards(&self, rules: Vec<crate::config::PortForwardConfig>) {
+        self.hpc3.seeq().nat_control().set_port_forwards(rules);
+    }
+
     /// Step the CPU `n` instructions in-line on the calling thread, with all
     /// peripheral threads stopped so the CPU sees no external interrupts.
     /// Used by Phase 3.3 snapshot determinism validator.

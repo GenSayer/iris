@@ -496,6 +496,10 @@ pub struct NatControl {
     /// NAT refuses to plug-and-play *adopt* a subnet that overlaps one of these,
     /// so the emulator never shadows the host's real LAN / VPN / Docker network.
     pub host_nets: Mutex<Vec<(u32, u8)>>,
+    /// New port-forward rule set to bind live, latched by `apply_forwards`. Lets
+    /// an embedder add/remove forwards without a reboot.
+    pub pending_forwards: Mutex<Option<Vec<PortForwardConfig>>>,
+    pub apply_forwards:   AtomicBool,
 }
 
 impl NatControl {
@@ -515,6 +519,8 @@ impl NatControl {
             apply_netmask: AtomicU32::new(0),
             apply_subnet:  AtomicBool::new(false),
             host_nets:     Mutex::new(Vec::new()),
+            pending_forwards: Mutex::new(None),
+            apply_forwards:   AtomicBool::new(false),
         })
     }
     pub fn dbg_tcp(&self)  -> bool { self.debug_tcp.load(Ordering::Relaxed) }
@@ -551,6 +557,13 @@ impl NatControl {
     /// won't adopt a subnet that overlaps them.
     pub fn set_host_nets(&self, nets: Vec<(Ipv4Addr, u8)>) {
         *self.host_nets.lock() = nets.into_iter().map(|(n, p)| (u32::from(n), p)).collect();
+    }
+
+    /// Replace the running NAT's port-forward rules (rebound on the NAT thread's
+    /// next loop). No reboot needed.
+    pub fn set_port_forwards(&self, rules: Vec<PortForwardConfig>) {
+        *self.pending_forwards.lock() = Some(rules);
+        self.apply_forwards.store(true, Ordering::Release);
     }
 
     /// Whether `net/prefix` overlaps any recorded host network — i.e. adopting
@@ -724,6 +737,45 @@ pub struct NatEngine {
     ip_id: u16,
 }
 
+/// Bind host listeners for a set of port-forward rules. Used at construction and
+/// when forwards are reconfigured live (see `rebind_forwards`).
+fn bind_forwards(rules: &[PortForwardConfig]) -> (Vec<TcpFwdListener>, Vec<UdpFwdListener>) {
+    let mut tcp = Vec::new();
+    let mut udp = Vec::new();
+    for rule in rules {
+        let bind_addr = match rule.bind {
+            ForwardBind::Localhost => Ipv4Addr::LOCALHOST,
+            ForwardBind::Any      => Ipv4Addr::UNSPECIFIED,
+        };
+        let addr = SocketAddr::new(IpAddr::V4(bind_addr), rule.host_port);
+        match rule.proto {
+            ForwardProto::Tcp => match TcpListener::bind(addr) {
+                Ok(listener) => {
+                    let _ = listener.set_nonblocking(true);
+                    eprintln!("iris: TCP port forward {}:{} → guest:{}",
+                              bind_addr, rule.host_port, rule.guest_port);
+                    tcp.push(TcpFwdListener { listener, guest_port: rule.guest_port });
+                }
+                Err(e) => eprintln!("iris: TCP port forward {}:{} failed to bind: {}",
+                                    bind_addr, rule.host_port, e),
+            },
+            ForwardProto::Udp => match UdpSocket::bind(addr) {
+                Ok(sock) => {
+                    let _ = sock.set_nonblocking(true);
+                    eprintln!("iris: UDP port forward {}:{} → guest:{}",
+                              bind_addr, rule.host_port, rule.guest_port);
+                    udp.push(UdpFwdListener {
+                        sock, guest_port: rule.guest_port, host_port: rule.host_port, last_sender: None,
+                    });
+                }
+                Err(e) => eprintln!("iris: UDP port forward {}:{} failed to bind: {}",
+                                    bind_addr, rule.host_port, e),
+            },
+        }
+    }
+    (tcp, udp)
+}
+
 impl NatEngine {
     pub fn new(config: GatewayConfig,
                tx_cons: rtrb::Consumer<Vec<u8>>,
@@ -732,52 +784,7 @@ impl NatEngine {
                tx_wake: Arc<(Mutex<()>, Condvar)>,
                running: Arc<AtomicBool>,
                ctl:     Arc<NatControl>) -> Self {
-        let mut tcp_fwd_listeners = Vec::new();
-        let mut udp_fwd_listeners = Vec::new();
-
-        for rule in &config.port_forwards {
-            let bind_addr = match rule.bind {
-                ForwardBind::Localhost => Ipv4Addr::LOCALHOST,
-                ForwardBind::Any      => Ipv4Addr::UNSPECIFIED,
-            };
-            match rule.proto {
-                ForwardProto::Tcp => {
-                    let addr = SocketAddr::new(IpAddr::V4(bind_addr), rule.host_port);
-                    match TcpListener::bind(addr) {
-                        Ok(listener) => {
-                            let _ = listener.set_nonblocking(true);
-                            eprintln!("iris: TCP port forward {}:{} → guest:{}",
-                                      bind_addr, rule.host_port, rule.guest_port);
-                            tcp_fwd_listeners.push(TcpFwdListener {
-                                listener,
-                                guest_port: rule.guest_port,
-                            });
-                        }
-                        Err(e) => eprintln!("iris: TCP port forward {}:{} failed to bind: {}",
-                                            bind_addr, rule.host_port, e),
-                    }
-                }
-                ForwardProto::Udp => {
-                    let addr = SocketAddr::new(IpAddr::V4(bind_addr), rule.host_port);
-                    match UdpSocket::bind(addr) {
-                        Ok(sock) => {
-                            let _ = sock.set_nonblocking(true);
-                            eprintln!("iris: UDP port forward {}:{} → guest:{}",
-                                      bind_addr, rule.host_port, rule.guest_port);
-                            udp_fwd_listeners.push(UdpFwdListener {
-                                sock,
-                                guest_port:  rule.guest_port,
-                                host_port:   rule.host_port,
-                                last_sender: None,
-                            });
-                        }
-                        Err(e) => eprintln!("iris: UDP port forward {}:{} failed to bind: {}",
-                                            bind_addr, rule.host_port, e),
-                    }
-                }
-            }
-        }
-
+        let (tcp_fwd_listeners, udp_fwd_listeners) = bind_forwards(&config.port_forwards);
         let fwd_static_count = tcp_fwd_listeners.len();
         Self { config, tx_cons, rx_prod, rx_wake, tx_wake, running, ctl,
                udp_nat: HashMap::new(), tcp_nat: HashMap::new(), tcp_tw: HashMap::new(),
@@ -785,6 +792,20 @@ impl NatEngine {
                tcp_fwd_listeners, udp_fwd_listeners, fwd_static_count,
                tcp_fwd_pending: HashMap::new(), fwd_ephemeral_next: 49152,
                guest_mac: None, ip_id: 1 }
+    }
+
+    /// Rebind the static port-forward listeners from a new rule set, live (no
+    /// reboot). The old static listeners are dropped (closing their host
+    /// sockets); transient FTP-ALG data forwards and already-established
+    /// connections (in `tcp_nat`) are preserved.
+    fn rebind_forwards(&mut self, rules: &[PortForwardConfig]) {
+        let cut = self.fwd_static_count.min(self.tcp_fwd_listeners.len());
+        let transient = self.tcp_fwd_listeners.split_off(cut); // FTP-ALG data forwards
+        let (mut tcp, udp) = bind_forwards(rules);
+        self.fwd_static_count = tcp.len();
+        tcp.extend(transient);
+        self.tcp_fwd_listeners = tcp; // drops the old static listeners
+        self.udp_fwd_listeners = udp;
     }
 
     pub fn run(&mut self) {
@@ -824,6 +845,14 @@ impl NatEngine {
                 self.tcp_fwd_pending.clear();
                 self.tcp_fwd_listeners.truncate(self.fwd_static_count); // drop transient FTP data forwards
                 self.ctl.routed.store(false, Ordering::Relaxed); // re-arm adoption onto the new subnet
+            }
+
+            // Live port-forward reconfigure: rebind the static listeners.
+            if self.ctl.apply_forwards.swap(false, Ordering::AcqRel) {
+                let rules = self.ctl.pending_forwards.lock().take(); // drop the lock before rebinding
+                if let Some(rules) = rules {
+                    self.rebind_forwards(&rules);
+                }
             }
 
             // FIXME: investigate interrupt race between TX completion and RX delivery.

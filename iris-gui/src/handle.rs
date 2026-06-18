@@ -1,6 +1,6 @@
 use crate::framebuffer::{CaptureRenderer, FrameSink};
 use crossbeam_channel::{unbounded, Receiver, Sender};
-use iris::config::MachineConfig;
+use iris::config::{MachineConfig, PortForwardConfig};
 use iris::machine::Machine;
 use iris::ps2::Ps2Controller;
 use parking_lot::Mutex;
@@ -19,6 +19,9 @@ pub enum Cmd {
     /// Move the running NAT onto a new subnet live (CIDR string, e.g.
     /// `192.168.1.0/24`) — no reboot. Ignored if not running / invalid.
     SetNatSubnet(String),
+    /// Rebind the running NAT's inbound port-forward listeners from this rule
+    /// set, live — no reboot. Ignored if not running.
+    SetPortForwards(Vec<PortForwardConfig>),
     SaveState(String),
     RestoreState(String),
     Screenshot(PathBuf),
@@ -354,6 +357,9 @@ fn worker_loop(
                     },
                     None => { let _ = evt_tx.send(Evt::Error("set NAT subnet: not running".into())); }
                 }
+            }
+            Ok(Cmd::SetPortForwards(rules)) => {
+                if let Some(m) = machine.as_ref() { m.set_port_forwards(rules); }
             }
             Ok(Cmd::Stop) => {
                 if let Some(m) = machine.take() {

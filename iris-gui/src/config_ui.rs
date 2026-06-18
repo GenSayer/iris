@@ -332,6 +332,9 @@ pub struct NetSanityPrompt {
 pub struct NetworkOutcome {
     /// A networking field changed this frame → the app should mark cfg dirty.
     pub changed: bool,
+    /// A port-forward rule was added/removed/edited → the app should rebind the
+    /// running NAT's forward listeners live.
+    pub forwards_changed: bool,
     /// A soft-invalid subnet was just committed → pop the override modal.
     pub prompt: Option<NetSanityPrompt>,
 }
@@ -499,26 +502,29 @@ fn show_network(ui: &mut Ui, cfg: &mut MachineConfig, host: &[crate::netplan::Ho
     let mut drop: Option<usize> = None;
     for (i, pf) in cfg.port_forward.iter_mut().enumerate() {
         ui.horizontal(|ui| {
+            let mut c = false;
             ComboBox::from_id_salt(("proto", i))
                 .selected_text(match pf.proto { ForwardProto::Tcp => "tcp", ForwardProto::Udp => "udp" })
                 .show_ui(ui, |ui| {
-                    out.changed |= ui.selectable_value(&mut pf.proto, ForwardProto::Tcp, "tcp").changed();
-                    out.changed |= ui.selectable_value(&mut pf.proto, ForwardProto::Udp, "udp").changed();
+                    c |= ui.selectable_value(&mut pf.proto, ForwardProto::Tcp, "tcp").changed();
+                    c |= ui.selectable_value(&mut pf.proto, ForwardProto::Udp, "udp").changed();
                 });
             ui.label("host");
-            out.changed |= ui.add(DragValue::new(&mut pf.host_port).range(1..=65535)).changed();
+            c |= ui.add(DragValue::new(&mut pf.host_port).range(1..=65535)).changed();
             ui.label("to guest");
-            out.changed |= ui.add(DragValue::new(&mut pf.guest_port).range(1..=65535)).changed();
+            c |= ui.add(DragValue::new(&mut pf.guest_port).range(1..=65535)).changed();
             ComboBox::from_id_salt(("bind", i))
                 .selected_text(match pf.bind { ForwardBind::Localhost => "localhost", ForwardBind::Any => "any" })
                 .show_ui(ui, |ui| {
-                    out.changed |= ui.selectable_value(&mut pf.bind, ForwardBind::Localhost, "localhost").changed();
-                    out.changed |= ui.selectable_value(&mut pf.bind, ForwardBind::Any, "any").changed();
+                    c |= ui.selectable_value(&mut pf.bind, ForwardBind::Localhost, "localhost").changed();
+                    c |= ui.selectable_value(&mut pf.bind, ForwardBind::Any, "any").changed();
                 });
             if ui.button("Remove").clicked() { drop = Some(i); }
+            out.changed |= c;
+            out.forwards_changed |= c;
         });
     }
-    if let Some(i) = drop { cfg.port_forward.remove(i); out.changed = true; }
+    if let Some(i) = drop { cfg.port_forward.remove(i); out.changed = true; out.forwards_changed = true; }
 
     let has_port = |p: u16| cfg.port_forward.iter().any(|f| f.guest_port == p);
     let mut add: Option<PortForwardConfig> = None;
@@ -542,7 +548,7 @@ fn show_network(ui: &mut Ui, cfg: &mut MachineConfig, host: &[crate::netplan::Ho
             ui.close_menu();
         }
     });
-    if let Some(pf) = add { cfg.port_forward.push(pf); out.changed = true; }
+    if let Some(pf) = add { cfg.port_forward.push(pf); out.changed = true; out.forwards_changed = true; }
 
     ui.label(RichText::new(
         "A port forward maps a port on your computer to a port on the Indy, so host tools can reach \

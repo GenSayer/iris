@@ -1322,6 +1322,11 @@ impl App {
             ConfigAction::None => {}
         }
         if out.net.changed { self.mark_dirty(); }
+        if out.net.forwards_changed && self.emu.is_running() {
+            // Rebind the running NAT's listeners so a forward added/removed now
+            // takes effect without a restart (latest-wins coalesces in the NAT).
+            self.emu.send(Cmd::SetPortForwards(self.cfg.port_forward.clone()));
+        }
         if let Some(p) = out.net.prompt {
             self.net_sanity_modal = Some(NetSanityModal {
                 reason: p.reason, suggestion: p.suggestion, revert_to: p.revert_to,
