@@ -1251,6 +1251,58 @@ fn nfs2_statfs(call: &RpcCall, args: &mut Cur, _b: &mut NfsBacking) -> Vec<u8> {
     x.into_bytes()
 }
 
+// ── MOUNT protocol (RFC 1813 App. I / RFC 1094 App. A) ──────────────────────
+//
+// Increment 6: MNT hands the guest the root file handle. We export a single
+// directory and allow everyone, so the requested path is ignored.
+
+pub const MOUNT_PROG: u32 = 100005;
+pub const MOUNT_V1: u32 = 1; // for NFSv2
+pub const MOUNT_V3: u32 = 3; // for NFSv3
+
+const MNTPROC_NULL: u32 = 0;
+const MNTPROC_MNT: u32 = 1;
+const MNTPROC_DUMP: u32 = 2;
+const MNTPROC_UMNT: u32 = 3;
+const MNTPROC_UMNTALL: u32 = 4;
+const MNTPROC_EXPORT: u32 = 5;
+
+/// Dispatch one MOUNT call.
+pub fn mount_call(call: &RpcCall, args: &mut Cur) -> Vec<u8> {
+    match call.proc_num {
+        MNTPROC_NULL => reply(call.xid, accept::SUCCESS).into_bytes(),
+        MNTPROC_MNT => {
+            let _path = args.opaque(); // export path ignored — single export
+            let mut x = reply(call.xid, accept::SUCCESS);
+            if call.vers == MOUNT_V1 {
+                x.u32(0); // fhstatus = OK
+                put_fh2(&mut x, ROOT_ID); // v2 fhandle (fixed 32 bytes)
+            } else {
+                x.u32(0); // mountstat3 = MNT3_OK
+                put_fh(&mut x, ROOT_ID); // v3 fhandle3 (opaque)
+                x.u32(1); // one auth flavor follows
+                x.u32(AUTH_NULL);
+            }
+            x.into_bytes()
+        }
+        MNTPROC_UMNT | MNTPROC_UMNTALL => reply(call.xid, accept::SUCCESS).into_bytes(),
+        MNTPROC_DUMP => {
+            let mut x = reply(call.xid, accept::SUCCESS);
+            x.bool(false); // empty mount list
+            x.into_bytes()
+        }
+        MNTPROC_EXPORT => {
+            let mut x = reply(call.xid, accept::SUCCESS);
+            x.bool(true); // one export entry follows
+            x.opaque(b"/"); // ex_dir
+            x.bool(false); // ex_groups: none -> everyone
+            x.bool(false); // no further entries
+            x.into_bytes()
+        }
+        _ => reply(call.xid, accept::PROC_UNAVAIL).into_bytes(),
+    }
+}
+
 // ── server: program/version dispatch + duplicate-request cache ──────────────
 
 /// Which NFS version(s) to serve. `Auto` answers whatever the guest mounts with.
@@ -1321,8 +1373,10 @@ impl NfsServer {
     }
 
     fn dispatch(&mut self, call: &RpcCall, args: &mut Cur) -> Vec<u8> {
+        if call.prog == MOUNT_PROG {
+            return mount_call(call, args);
+        }
         if call.prog == NFS_PROG {
-            // MOUNT (increment 6) joins this match later.
             match call.vers {
                 NFS_V3 if self.version != NfsVersion::V2 => {
                     return nfs3_call(call, args, &mut self.backing);
@@ -1758,6 +1812,42 @@ mod tests {
         a.opaque(b"XYZW");
         s.handle(&call2(4, PROC2_WRITE, &a.into_bytes())).unwrap();
         assert_eq!(&std::fs::read(root.join("v2.txt")).unwrap()[..4], b"XYZW");
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn mount_returns_root_handle() {
+        let root = temp_export();
+        let mut s = NfsServer::new(&root, NfsVersion::Auto);
+
+        // MOUNT v3 MNT "/" -> mountstat3 OK + fhandle3(root) + auth flavors.
+        let mut req = Xdr::new();
+        req.u32(7); req.u32(0); req.u32(2);
+        req.u32(MOUNT_PROG); req.u32(MOUNT_V3); req.u32(MNTPROC_MNT);
+        req.u32(0); req.u32(0); req.u32(0); req.u32(0);
+        req.opaque(b"/");
+        let r = s.handle(&req.into_bytes()).unwrap();
+        let mut c = Cur::new(&r);
+        for _ in 0..6 { c.u32(); } // reply header
+        assert_eq!(c.u32(), Some(0)); // MNT3_OK
+        let fh = c.opaque().unwrap();
+        assert_eq!(u64::from_be_bytes(fh.try_into().unwrap()), ROOT_ID);
+        assert_eq!(c.u32(), Some(1)); // one auth flavor
+        assert_eq!(c.u32(), Some(0)); // AUTH_NULL
+
+        // MOUNT v1 MNT -> fhstatus OK + 32-byte fhandle.
+        let mut req = Xdr::new();
+        req.u32(8); req.u32(0); req.u32(2);
+        req.u32(MOUNT_PROG); req.u32(MOUNT_V1); req.u32(MNTPROC_MNT);
+        req.u32(0); req.u32(0); req.u32(0); req.u32(0);
+        req.opaque(b"/");
+        let r = s.handle(&req.into_bytes()).unwrap();
+        let mut c = Cur::new(&r);
+        for _ in 0..6 { c.u32(); }
+        assert_eq!(c.u32(), Some(0)); // fhstatus OK
+        let fh = c.fixed(32).unwrap();
+        assert_eq!(u64::from_be_bytes(fh[..8].try_into().unwrap()), ROOT_ID);
 
         std::fs::remove_dir_all(&root).ok();
     }
