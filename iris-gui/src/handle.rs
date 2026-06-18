@@ -12,6 +12,9 @@ use std::thread::JoinHandle;
 pub enum Cmd {
     Start(Box<MachineConfig>),
     Stop,
+    /// Type `halt\n` at the IRIX serial console in-process (no loopback socket)
+    /// for a clean guest shutdown.
+    HaltIrix,
     SaveState(String),
     RestoreState(String),
     Screenshot(PathBuf),
@@ -45,6 +48,10 @@ pub struct Status {
     pub dirty_cow: usize,
     /// Approximate instructions/sec (millions).
     pub mips: f32,
+    /// The CPU is not executing: either stopped (soft power-off) or idle at the
+    /// PROM after an IRIX `halt` (0 MIPS). When set, the guest has shut down and
+    /// stopping the machine can't corrupt a disk — see [`crate::safe_stop`].
+    pub cpu_halted: bool,
 }
 
 pub struct EmulatorHandle {
@@ -105,6 +112,7 @@ impl EmulatorHandle {
                 // events, so merge rather than replace to avoid clobbering them.
                 self.status.mips = s.mips;
                 self.status.dirty_cow = s.dirty_cow;
+                self.status.cpu_halted = s.cpu_halted;
             }
             match &evt {
                 Evt::Started => self.status.running = true,
@@ -174,7 +182,12 @@ fn worker_loop(
                         let mips = (dc as f64 / dt / 1_000_000.0 * 10.0).round() as f32 / 10.0;
                         prev_cycles = cur;
                         prev_tick = now;
-                        let _ = evt_tx.send(Evt::Status(Status { mips, ..Status::default() }));
+                        // The guest has shut down when the CPU thread has stopped
+                        // (soft power-off calls Machine::stop) or has retired no
+                        // instructions this window (halted/idle at the PROM, 0 MIPS).
+                        let cpu_stopped = machine.as_ref().map_or(true, |m| !m.cpu_is_running());
+                        let cpu_halted = cpu_stopped || mips == 0.0;
+                        let _ = evt_tx.send(Evt::Status(Status { mips, cpu_halted, ..Status::default() }));
                     }
                 }
                 continue;
@@ -184,6 +197,10 @@ fn worker_loop(
                     let _ = evt_tx.send(Evt::Error("emulator already running".into()));
                     continue;
                 }
+                // Clear the previous run's last frame so the restarted machine
+                // shows the "waiting for first REX3 frame" placeholder instead
+                // of the stale screen until its first frame is rendered.
+                frame_sink.reset();
                 // Wrap construction in catch_unwind: Machine::new and
                 // friends may panic on missing files, bad images, etc.
                 // We surface those as Evt::Error toasts instead of
@@ -226,6 +243,12 @@ fn worker_loop(
                         let msg = panic_msg(&panic);
                         let _ = evt_tx.send(Evt::Error(format!("start failed: {msg}")));
                     }
+                }
+            }
+            Ok(Cmd::HaltIrix) => {
+                match machine.as_ref() {
+                    Some(m) => m.inject_serial_console(b"halt\n"),
+                    None => { let _ = evt_tx.send(Evt::Error("halt: not running".into())); }
                 }
             }
             Ok(Cmd::Stop) => {

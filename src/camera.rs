@@ -15,6 +15,7 @@
 //! returns a solid black field so VINO DMA still gets coherent bytes.
 
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
 use std::time::Instant;
 
@@ -47,7 +48,11 @@ pub(crate) struct Shared {
 pub struct CameraSource {
     standard: VideoStandard,
     shared:   Arc<Mutex<Shared>>,
-    _worker:  thread::JoinHandle<()>,
+    /// Cleared on drop to stop the capture loop so the host camera is released
+    /// (its indicator light turns off) rather than the worker running until the
+    /// process exits. The backend polls this between frames.
+    running:  Arc<AtomicBool>,
+    worker:   Option<thread::JoinHandle<()>>,
 }
 
 impl CameraSource {
@@ -69,13 +74,27 @@ impl CameraSource {
             capture_res: None,
         }));
         let s2 = shared.clone();
+        let running = Arc::new(AtomicBool::new(true));
+        let r2 = running.clone();
 
         let worker = thread::Builder::new()
             .name("iris-camera".into())
-            .spawn(move || backend::capture_loop(s2, frame_w, frame_h, camera_index))
+            .spawn(move || backend::capture_loop(s2, frame_w, frame_h, camera_index, r2))
             .map_err(|e| format!("camera worker spawn failed: {}", e))?;
 
-        Ok(Self { standard, shared, _worker: worker })
+        Ok(Self { standard, shared, running, worker: Some(worker) })
+    }
+}
+
+impl Drop for CameraSource {
+    fn drop(&mut self) {
+        self.running.store(false, Ordering::Relaxed);
+        if let Some(w) = self.worker.take() {
+            // The backend exits within one frame interval of seeing `running`
+            // clear, then closes the camera stream. Join so the device is fully
+            // released before we return (e.g. before a re-open).
+            let _ = w.join();
+        }
     }
 }
 

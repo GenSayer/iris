@@ -18,11 +18,13 @@
 //! captured we forward nothing, so menu clicks and typing into the config
 //! side panel stay with egui.
 //!
-//! The framebuffer panel calls `pump(...)` each frame with the rect the REX3
-//! image occupies in screen space (used only to decide where a capturing
-//! click counts).
+//! The framebuffer panel calls `pump(...)` each frame, passing whether the REX3
+//! image widget itself was clicked this frame. Using the widget's own
+//! `Response::clicked()` (rather than a raw point-in-rect test) means egui's
+//! hit-testing already routed clicks on open menus / popups to those widgets,
+//! so navigating menus over the display never gets "eaten" into a capture.
 
-use egui::{CursorGrab, Event, Key, Modifiers, MouseWheelUnit, PointerButton, Rect, ViewportCommand};
+use egui::{CursorGrab, Event, Key, Modifiers, MouseWheelUnit, PointerButton, ViewportCommand};
 use iris::ps2::Ps2Controller;
 use winit::keyboard::KeyCode;
 
@@ -39,7 +41,7 @@ impl Default for InputState {
     }
 }
 
-pub fn pump(ctx: &egui::Context, fb_rect: Rect, ps2: &Ps2Controller, state: &mut InputState, scroll_pixels_per_line: f64) {
+pub fn pump(ctx: &egui::Context, fb_clicked: bool, ps2: &Ps2Controller, state: &mut InputState, scroll_pixels_per_line: f64) {
     // Collect everything we need inside the input borrow, then act afterwards
     // (sending viewport commands / PS2 writes outside the `input()` closure).
     let mut want_enter = false;
@@ -53,14 +55,11 @@ pub fn pump(ctx: &egui::Context, fb_rect: Rect, ps2: &Ps2Controller, state: &mut
 
     ctx.input(|i| {
         if !state.captured {
-            // Not captured: the only thing we care about is a primary click
-            // inside the framebuffer, which grabs input. Everything else is
-            // left to egui (menus, config side panel, …).
-            if i.pointer.button_pressed(PointerButton::Primary) {
-                if let Some(p) = i.pointer.interact_pos().or_else(|| i.pointer.latest_pos()) {
-                    if fb_rect.contains(p) { want_enter = true; }
-                }
-            }
+            // Not captured: capture only when the framebuffer Image widget
+            // itself was clicked. egui routes clicks on menus/popups/panels to
+            // those widgets first, so this never fires for menu navigation that
+            // happens to overlap the display. Everything else stays with egui.
+            if fb_clicked { want_enter = true; }
             return;
         }
 
@@ -250,6 +249,11 @@ fn map_key(k: Key) -> Option<KeyCode> {
         Key::OpenBracket  => KeyCode::BracketLeft,
         Key::CloseBracket => KeyCode::BracketRight,
         Key::Backtick     => KeyCode::Backquote,
+        // egui reports the *shifted* symbol as its own Key; these two share a
+        // physical key with Backslash/Slash (Shift is sent separately, so the
+        // guest forms '|' and '?'). Without them those keys send nothing.
+        Key::Pipe         => KeyCode::Backslash,
+        Key::Questionmark => KeyCode::Slash,
         // F-keys (egui has no F5; iris likely doesn't need F13+ either)
         Key::F1 => KeyCode::F1, Key::F2 => KeyCode::F2,  Key::F3  => KeyCode::F3,
         Key::F4 => KeyCode::F4, Key::F6 => KeyCode::F6,  Key::F7  => KeyCode::F7,

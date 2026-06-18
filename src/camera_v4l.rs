@@ -13,6 +13,7 @@
 //! start an mmap stream, and pull frames directly.
 
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
 use std::time::Duration;
 
@@ -81,12 +82,13 @@ fn best_yuyv_resolution(dev: &Device) -> Option<(u32, u32)> {
 }
 
 pub(super) fn capture_loop(shared: Arc<Mutex<Shared>>, frame_w: u32, frame_h: u32,
-                            camera_index: u32) {
+                            camera_index: u32, running: Arc<AtomicBool>) {
     // Outer retry loop: reopens the device from scratch after stream loss or
     // hot-plug. Re-resolves the device index each time so a swap (e.g. Logitech
     // → Huddly GO) picks up the new camera's node without restarting iris.
     let mut open_attempts = 0u32;
     'outer: loop {
+        if !running.load(Ordering::Relaxed) { return; }
         let cur_idx = match resolve_device_index(camera_index) {
             Some(i) => i,
             None => {
@@ -150,6 +152,7 @@ pub(super) fn capture_loop(shared: Arc<Mutex<Shared>>, frame_w: u32, frame_h: u3
         open_attempts = 0;
 
         loop {
+        if !running.load(Ordering::Relaxed) { return; }
         let (data, _meta) = match stream.next() {
             Ok(f) => f,
             Err(e) => {

@@ -1,7 +1,7 @@
 use eframe::egui::{self, Color32, ComboBox, Grid, RichText, TextEdit};
 use iris::config::{MachineConfig, ScsiDeviceConfig, VALID_BANK_SIZES};
 
-/// "New machine" startup dialog — analogous to snow's ModelSelectionDialog.
+/// "New machine" startup dialog.
 /// Pops up at first run (or on `File → New machine…`) to bootstrap a config.
 pub struct NewMachineDialog {
     open: bool,
@@ -32,11 +32,11 @@ impl Default for NewMachineDialog {
             name: "indy".into(),
             prom_path: "prom.bin".into(),
             use_embedded_prom: true,
-            nvram_path: "nvram.bin".into(),
+            nvram_path: crate::settings::GuiSettings::default_nvram_path(),
             ram_total_mb: 256,
             ram_advanced: false,
             ram_banks: [128, 128, 0, 0],
-            scsi1_path: "scsi1.raw".into(),
+            scsi1_path: crate::settings::GuiSettings::default_disk_path(1),
             create_blank_scsi1: false,
             cdrom4_path: String::new(),
             attach_cdrom: false,

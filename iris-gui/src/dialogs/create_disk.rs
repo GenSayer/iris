@@ -2,7 +2,6 @@ use eframe::egui::{self, Color32, Grid, RichText, Slider, TextEdit};
 use std::path::PathBuf;
 
 /// Modal that creates a blank zero-filled disk image for a chosen SCSI ID.
-/// Mirrors snow's DiskImageDialog.
 pub struct CreateDiskDialog {
     open: bool,
     scsi_id: u8,
@@ -25,7 +24,9 @@ impl Default for CreateDiskDialog {
 impl CreateDiskDialog {
     pub fn open_for(&mut self, scsi_id: u8) {
         self.scsi_id = scsi_id;
-        self.filename = format!("scsi{scsi_id}.raw");
+        // Absolute, app-managed default location (writable in the App Store
+        // sandbox too) so a new disk never lands in the working dir.
+        self.filename = crate::settings::GuiSettings::default_disk_path(scsi_id);
         self.size_mb = 1024.0;
         self.result = None;
         self.open = true;
@@ -46,11 +47,16 @@ impl CreateDiskDialog {
                     ui.horizontal(|ui| {
                         ui.add(TextEdit::singleline(&mut self.filename).desired_width(220.0));
                         if ui.button("📁").clicked() {
-                            if let Some(p) = rfd::FileDialog::new()
-                                .add_filter("Disk image", &["raw", "img"])
-                                .set_file_name(&self.filename)
-                                .save_file()
-                            {
+                            let cur = std::path::Path::new(&self.filename);
+                            let mut dlg = rfd::FileDialog::new().add_filter("Disk image", &["raw", "img"]);
+                            if let Some(dir) = cur.parent().filter(|d| !d.as_os_str().is_empty()) {
+                                let _ = std::fs::create_dir_all(dir);
+                                dlg = dlg.set_directory(dir);
+                            }
+                            if let Some(name) = cur.file_name().and_then(|s| s.to_str()) {
+                                dlg = dlg.set_file_name(name);
+                            }
+                            if let Some(p) = dlg.save_file() {
                                 self.filename = p.to_string_lossy().into_owned();
                             }
                         }
@@ -70,8 +76,12 @@ impl CreateDiskDialog {
                     if ui.add(egui::Button::new("Create")
                         .fill(Color32::from_rgb(60, 110, 60))).clicked()
                     {
-                        // Create file on disk now.
+                        // Create file on disk now (making the parent dir first,
+                        // e.g. the managed <data_dir>/disks on first use).
                         let path = PathBuf::from(&self.filename);
+                        if let Some(parent) = path.parent() {
+                            let _ = std::fs::create_dir_all(parent);
+                        }
                         let size_bytes = (self.size_mb * 1024.0 * 1024.0) as u64;
                         match std::fs::File::create(&path)
                             .and_then(|f| f.set_len(size_bytes))

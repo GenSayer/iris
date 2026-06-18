@@ -93,6 +93,10 @@ pub enum ConfigAction {
     /// and, if accepted, clear `cfg.prom` (an empty path falls back to the
     /// built-in PROM in `iris::prom::Prom::from_file_or_embedded`).
     RequestEmbeddedProm,
+    /// User clicked "Test Camera" on the Video-In tab; the app should open the
+    /// host camera and show a live preview (using the current `[vino]` standard
+    /// and camera index).
+    TestCamera,
 }
 
 pub fn show_tab(ui: &mut Ui, tab: Tab, cfg: &mut MachineConfig, jit: &mut JitEnv) -> ConfigAction {
@@ -102,7 +106,7 @@ pub fn show_tab(ui: &mut Ui, tab: Tab, cfg: &mut MachineConfig, jit: &mut JitEnv
         Tab::Network => { show_network(ui, cfg); ConfigAction::None }
         Tab::Memory  => { show_memory(ui, cfg); ConfigAction::None }
         Tab::Display => { show_display(ui, cfg); ConfigAction::None }
-        Tab::VideoIn => { show_vino(ui, cfg); ConfigAction::None }
+        Tab::VideoIn => show_vino(ui, cfg),
         Tab::Debug   => { show_debug(ui, cfg, jit); ConfigAction::None }
         Tab::Ci      => { show_ci(ui, cfg); ConfigAction::None }
     }).inner
@@ -370,7 +374,8 @@ fn show_network(ui: &mut Ui, cfg: &mut MachineConfig) {
     }
 }
 
-fn show_vino(ui: &mut Ui, cfg: &mut MachineConfig) {
+fn show_vino(ui: &mut Ui, cfg: &mut MachineConfig) -> ConfigAction {
+    let mut action = ConfigAction::None;
     ui.heading("Video-In (IndyCam)");
     Grid::new("vino_grid").num_columns(2).striped(true).show(ui, |ui| {
         ui.label("Source");
@@ -407,6 +412,42 @@ fn show_vino(ui: &mut Ui, cfg: &mut MachineConfig) {
         ui.add(DragValue::new(&mut cfg.vino.camera_index).range(0..=15));
         ui.end_row();
     });
+
+    // Live host-camera test: opens the selected camera directly (no IRIX boot
+    // needed) so the user can confirm the capture path works — and, on macOS,
+    // grant the camera permission. This exercises the same host-capture code
+    // the VINO/IndyCam source uses.
+    ui.add_space(8.0);
+    if build_features::CAMERA {
+        ui.horizontal(|ui| {
+            if ui.button("📷 Test Camera").clicked() {
+                action = ConfigAction::TestCamera;
+            }
+            ui.label(
+                RichText::new(format!(
+                    "Preview host camera #{} live ({}).",
+                    cfg.vino.camera_index,
+                    match cfg.vino.standard { VinoStandard::Ntsc => "NTSC", VinoStandard::Pal => "PAL" },
+                ))
+                .weak(),
+            );
+        });
+        ui.label(
+            RichText::new(
+                "On first use macOS will ask for camera permission. The camera \
+                 is released when you close the preview.",
+            )
+            .weak()
+            .small(),
+        );
+    } else {
+        ui.label(
+            RichText::new("Camera test unavailable — this build was compiled without --features camera.")
+                .weak(),
+        );
+    }
+
+    action
 }
 
 fn show_debug(ui: &mut Ui, cfg: &mut MachineConfig, jit: &mut JitEnv) {

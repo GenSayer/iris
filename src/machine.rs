@@ -694,11 +694,26 @@ impl Machine {
         self.ci_serial.clone()
     }
 
+    /// Type bytes at the IRIX serial console (tty1) in-process, without any
+    /// loopback TCP client. Used by the GUI to send `halt\n` for a clean
+    /// shutdown so the feature doesn't depend on the serial server socket.
+    pub fn inject_serial_console(&self, bytes: &[u8]) {
+        self.hpc3.ioc().scc().inject_b(bytes);
+    }
+
     /// CPU thread, started explicitly by the CI `start` command or by
     /// `ci_restore`. In `--ci` mode the CPU is not autostarted in `start()`
     /// — the harness drives startup via `restore`.
     pub fn cpu_start(&self) {
         self.cpu.start();
+    }
+
+    /// Whether the CPU thread is currently executing. Goes false when the CPU
+    /// is stopped — including the soft power-off path (a guest `poweroff` makes
+    /// the machine-events thread call `stop()`), so an embedder can tell the
+    /// guest has shut down without subscribing to machine events.
+    pub fn cpu_is_running(&self) -> bool {
+        self.cpu.is_running()
     }
 
     /// Step the CPU `n` instructions in-line on the calling thread, with all

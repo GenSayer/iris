@@ -1,6 +1,7 @@
 //! nokhwa-based capture loop (macOS AVFoundation, Windows MediaFoundation).
 
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
 use std::time::Duration;
 
@@ -9,7 +10,7 @@ use parking_lot::Mutex;
 use super::{Shared, downscale_yuyv_to_uyvy, split_fields};
 
 pub(super) fn capture_loop(shared: Arc<Mutex<Shared>>, frame_w: u32, frame_h: u32,
-                            camera_index: u32) {
+                            camera_index: u32, running: Arc<AtomicBool>) {
     use nokhwa::pixel_format::YuyvFormat;
     use nokhwa::utils::{
         CameraFormat, CameraIndex, FrameFormat, RequestedFormat, RequestedFormatType, Resolution,
@@ -49,7 +50,7 @@ pub(super) fn capture_loop(shared: Arc<Mutex<Shared>>, frame_w: u32, frame_h: u3
     eprintln!("camera: streaming at {}×{} → downscale to {}×{}", sw, sh, frame_w, frame_h);
     shared.lock().capture_res = Some((sw, sh));
 
-    loop {
+    while running.load(Ordering::Relaxed) {
         let buf = match cam.frame() {
             Ok(b) => b,
             Err(e) => {

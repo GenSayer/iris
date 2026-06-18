@@ -1,7 +1,7 @@
 use iris::config::MachineConfig;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 /// GUI-only persisted state. Lives at `~/.config/iris/gui.json`.
 ///
@@ -16,6 +16,12 @@ pub struct GuiSettings {
     /// egui UI scale (1.0 = default).
     #[serde(default = "default_ui_scale")]
     pub ui_scale: f32,
+    /// Emulated-display (VM screen) magnification: 1.0 = native (1 emulated
+    /// pixel : 1 logical point). Driven by the View-menu slider (0.5×–3× in 0.5
+    /// steps), **independent of `ui_scale`** — scaling the controls doesn't
+    /// resize the picture, and vice-versa.
+    #[serde(default = "default_vm_scale")]
+    pub vm_scale: f32,
     /// Was the app left in fullscreen mode at last close?
     #[serde(default)]
     pub fullscreen: bool,
@@ -47,6 +53,89 @@ pub struct GuiSettings {
     pub bookmarks: BTreeMap<String, Vec<u8>>,
 }
 
+/// Byte offset of the Indy's 6-byte Ethernet MAC inside the NVRAM. The PROM
+/// reads the MAC from these *raw bytes* — it is NOT the colon-separated ASCII
+/// you type at `setenv` (that's just the human entry form). Reverse-engineered
+/// from firmware-written NVRAMs (the SGI OUI 08:00:69 lands exactly here, with
+/// zero bytes around it and no adjacent checksum). Like the `console` byte the
+/// headless path patches, this is a fixed, PROM-specific offset.
+pub const NVRAM_MAC_OFFSET: usize = 0x13a;
+
+/// The 6 raw MAC bytes from an NVRAM file, if it holds a non-blank one.
+pub fn nvram_mac(path: &str) -> Option<[u8; 6]> {
+    let b = std::fs::read(path).ok()?;
+    let m: [u8; 6] = b.get(NVRAM_MAC_OFFSET..NVRAM_MAC_OFFSET + 6)?.try_into().ok()?;
+    let blank = m.iter().all(|&x| x == 0x00) || m.iter().all(|&x| x == 0xff);
+    (!blank).then_some(m)
+}
+
+/// Whether the NVRAM already has an Ethernet MAC (so IRIX can attach `ec0`).
+pub fn nvram_has_mac(path: &str) -> bool {
+    nvram_mac(path).is_some()
+}
+
+/// Deterministic SGI-OUI MAC bytes (`08:00:69:xx:xx:xx`) from `seed` (machine
+/// name) — stable per machine. Uniqueness across instances doesn't matter; each
+/// runs on its own isolated NAT.
+pub fn generate_mac_bytes(seed: &str) -> [u8; 6] {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    seed.hash(&mut h);
+    let v = h.finish();
+    [0x08, 0x00, 0x69, (v >> 16) as u8, (v >> 8) as u8, v as u8]
+}
+
+/// Human form `08:00:69:xx:xx:xx` for display/logging.
+pub fn mac_to_string(m: [u8; 6]) -> String {
+    m.iter().map(|b| format!("{b:02x}")).collect::<Vec<_>>().join(":")
+}
+
+/// Write 6 MAC bytes into an existing NVRAM file at [`NVRAM_MAC_OFFSET`],
+/// touching only those 6 bytes so the boot env is preserved. Backs the file up
+/// to `<path>.bak` first. Returns Ok(false) if there's no NVRAM file yet (a
+/// bare MAC with no DS1386 structure would be useless) or it's too small.
+pub fn write_nvram_mac(path: &str, mac: [u8; 6]) -> std::io::Result<bool> {
+    let Ok(mut bytes) = std::fs::read(path) else { return Ok(false); };
+    if bytes.len() < NVRAM_MAC_OFFSET + 6 {
+        return Ok(false);
+    }
+    let _ = std::fs::copy(path, format!("{path}.bak")); // best-effort backup
+    bytes[NVRAM_MAC_OFFSET..NVRAM_MAC_OFFSET + 6].copy_from_slice(&mac);
+    std::fs::write(path, &bytes)?;
+    Ok(true)
+}
+
+/// Default NVRAM image baked into the binary: the repo's known-good NVRAM (boot
+/// env present) with the MAC zeroed. Lets a fresh install — especially the
+/// bundled `.app`, which has nothing in its working dir to migrate — boot with
+/// proper PROM env, while the auto-write fills in a per-machine MAC.
+pub const DEFAULT_NVRAM: &[u8] = include_bytes!("../assets/nvram-default.bin");
+
+/// Write the embedded default NVRAM to `path` if there's no (non-empty) file
+/// there yet. Returns true if it seeded one. Creates the parent dir as needed.
+pub fn ensure_nvram_seeded(path: &str) -> bool {
+    if std::fs::metadata(path).map(|m| m.len() > 0).unwrap_or(false) {
+        return false;
+    }
+    if let Some(parent) = Path::new(path).parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    std::fs::write(path, DEFAULT_NVRAM).is_ok()
+}
+
+/// Overwrite the NVRAM at `path` with the embedded default (boot env, blank
+/// MAC) — backs the current file up to `<path>.bak` first. Used by the
+/// "Reset NVRAM / fresh PRAM" menu action.
+pub fn reset_nvram(path: &str) -> std::io::Result<()> {
+    if std::fs::metadata(path).map(|m| m.len() > 0).unwrap_or(false) {
+        let _ = std::fs::copy(path, format!("{path}.bak"));
+    }
+    if let Some(parent) = Path::new(path).parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    std::fs::write(path, DEFAULT_NVRAM)
+}
+
 /// Allowed UI-scale range, shared by the View-menu slider, the Ctrl +/-/0
 /// keyboard zoom, and the load-time clamp so a stale persisted value can never
 /// put the UI into a state the slider can't represent (which egui would then
@@ -55,11 +144,89 @@ pub const UI_SCALE_MIN: f32 = 1.0;
 pub const UI_SCALE_MAX: f32 = 3.0;
 pub const UI_SCALE_DEFAULT: f32 = 1.25;
 
+/// Allowed VM-screen scale range and step for the View-menu slider. ¼× steps
+/// (0.5, 0.75, 1.0, 1.25, …) give finer control; on a HiDPI (2×) display the
+/// half-integer steps (0.5, 1.0, 1.5, …) are pixel-crisp and the ¼ steps in
+/// between are bilinear-smoothed — the footer readout tags which is which.
+pub const VM_SCALE_MIN: f32 = 0.5;
+pub const VM_SCALE_MAX: f32 = 3.0;
+pub const VM_SCALE_STEP: f64 = 0.25;
+pub const VM_SCALE_DEFAULT: f32 = 1.0;
+
+/// First-launch window size in logical points. Sized to match the *running*
+/// window for the standard 1280×1024 display so the picture doesn't visibly
+/// jump when you press Start: with the left control column (~186 pt) and no
+/// top/bottom chrome, the running size at the default UI scale is ≈ the native
+/// 1280×1024 display plus the column width. The launcher fit (see `main`) and
+/// the on-Start snap still refine this — clamping to the monitor on smaller
+/// screens — so it's only the initial size and the fallback when the monitor
+/// size is unknown. Once a real size is persisted to `gui.json`, that's used.
+pub const WINDOW_DEFAULT_SIZE: [f32; 2] = [1512.0, 1024.0];
+
 fn default_ui_scale() -> f32 { UI_SCALE_DEFAULT }
+fn default_vm_scale() -> f32 { VM_SCALE_DEFAULT }
 
 impl GuiSettings {
     pub fn config_path() -> Option<PathBuf> {
-        dirs::config_dir().map(|d| d.join("iris").join("gui.json"))
+        Self::data_dir().map(|d| d.join("gui.json"))
+    }
+
+    /// Stable per-user directory for GUI state (gui.json, nvram.bin, …). The OS
+    /// maps this into the sandbox container automatically on the App Store
+    /// build, so the *same* code resolves the right place for `cargo run` and
+    /// the bundled app alike.
+    pub fn data_dir() -> Option<PathBuf> {
+        dirs::config_dir().map(|d| d.join("iris"))
+    }
+
+    /// Default absolute NVRAM path: `<data_dir>/nvram.bin`. Absolute on purpose
+    /// — a relative `nvram.bin` resolves against the process's working
+    /// directory, which differs between `cargo run` (repo root) and a bundled
+    /// `.app`, silently loading different (often blank, MAC-less) NVRAMs. Anchor
+    /// it once and every launch shares one NVRAM.
+    pub fn default_nvram_path() -> String {
+        Self::data_dir()
+            .map(|d| d.join("nvram.bin").to_string_lossy().into_owned())
+            .unwrap_or_else(|| "nvram.bin".to_string())
+    }
+
+    /// Managed directory for newly-created disk images: `<data_dir>/disks`.
+    /// Absolute and writable in every launch context — the OS maps it into the
+    /// sandbox container on the App Store build, so creating a disk here needs
+    /// no permission prompt. Users can still pick another location.
+    pub fn disks_dir() -> Option<PathBuf> {
+        Self::data_dir().map(|d| d.join("disks"))
+    }
+
+    /// Default absolute path for a new SCSI disk image: `<disks_dir>/scsiN.raw`.
+    pub fn default_disk_path(scsi_id: u8) -> String {
+        Self::disks_dir()
+            .map(|d| d.join(format!("scsi{scsi_id}.raw")).to_string_lossy().into_owned())
+            .unwrap_or_else(|| format!("scsi{scsi_id}.raw"))
+    }
+
+    /// Anchor a machine's NVRAM path to [`data_dir`] if it's relative (the
+    /// legacy default was a bare `"nvram.bin"`). Best-effort: if the anchored
+    /// file doesn't exist yet but the old cwd-relative one does, copy it over so
+    /// the PROM env (boot settings, any MAC) carries forward instead of starting
+    /// blank. Idempotent — absolute paths are left untouched.
+    pub fn migrate_nvram_path(nvram: &mut String) {
+        if !nvram.is_empty() && Path::new(&nvram).is_absolute() {
+            return;
+        }
+        let Some(dir) = Self::data_dir() else { return; };
+        let _ = std::fs::create_dir_all(&dir);
+        let leaf = Path::new(nvram.as_str())
+            .file_name()
+            .and_then(|s| s.to_str())
+            .filter(|s| !s.is_empty())
+            .unwrap_or("nvram.bin");
+        let dst = dir.join(leaf);
+        let src = PathBuf::from(nvram.as_str()); // relative to cwd
+        if !dst.exists() && !nvram.is_empty() && src.exists() {
+            let _ = std::fs::copy(&src, &dst);
+        }
+        *nvram = dst.to_string_lossy().into_owned();
     }
 
     pub fn load() -> Self {
@@ -76,6 +243,17 @@ impl GuiSettings {
         } else {
             s.ui_scale.min(UI_SCALE_MAX)
         };
+        s.vm_scale = if !s.vm_scale.is_finite() || s.vm_scale < VM_SCALE_MIN {
+            VM_SCALE_DEFAULT
+        } else {
+            s.vm_scale.min(VM_SCALE_MAX)
+        };
+        // Anchor every machine's NVRAM to the stable data dir so all launch
+        // methods share one file (the persisted path becomes absolute on the
+        // next save).
+        for m in s.machines.values_mut() {
+            Self::migrate_nvram_path(&mut m.nvram);
+        }
         s
     }
 
