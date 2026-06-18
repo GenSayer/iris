@@ -7,6 +7,8 @@ mod framebuffer;
 mod handle;
 mod input;
 mod macos_sandbox;
+mod netfix;
+mod netplan;
 mod safe_stop;
 mod scsi_menu;
 mod serial_console;
@@ -159,11 +161,19 @@ struct App {
     missing_modal: Option<MissingDiskModal>,
     /// Set when the user clicks "Use embedded PROM"; drives a confirmation modal.
     confirm_embedded_prom: bool,
+    /// Host interface networks (from `if-addrs`), used by the Networking tab for
+    /// first-free subnet presets and overlap warnings. Sampled once at launch.
+    net_ifaces: Vec<netplan::HostIface>,
+    /// Set when the Networking tab commits a subnet that fails the sanity checks
+    /// (non-RFC1918 or a host conflict); drives the Override/Cancel modal.
+    net_sanity_modal: Option<NetSanityModal>,
     new_machine: NewMachineDialog,
     create_disk: CreateDiskDialog,
     /// If true, central panel shows the tabbed config editor; otherwise the
     /// welcome/status summary panel (default — most config lives in menus).
     show_config_editor: bool,
+    /// Whether the "Check networking" diagnosis window is open.
+    show_net_check: bool,
     save_state_name: String,
     restore_state_name: String,
     /// egui texture holding the most recent REX3 framebuffer. Allocated
@@ -226,6 +236,14 @@ struct App {
 
 struct StopModal {
     lines: Vec<String>,
+}
+
+/// Confirmation when the Networking tab commits a sanity-failing subnet. Cancel
+/// restores `revert_to`; Override keeps the value as typed.
+struct NetSanityModal {
+    reason: String,
+    suggestion: String,
+    revert_to: Option<String>,
 }
 
 /// One SCSI device that is missing its backing file at Start time.
@@ -328,9 +346,12 @@ impl App {
             stop_modal: None,
             missing_modal: None,
             confirm_embedded_prom: false,
+            net_ifaces: netplan::gather_host_ifaces(),
+            net_sanity_modal: None,
             new_machine,
             create_disk: CreateDiskDialog::default(),
             show_config_editor: false,
+            show_net_check: false,
             save_state_name: "snap1".into(),
             restore_state_name: "snap1".into(),
             fb_tex: None,
@@ -903,9 +924,96 @@ impl App {
         }
     }
 
+    /// "Check networking" diagnosis window. Compares the guest's passively
+    /// observed IP to what IRIS's NAT expects and explains how to fix a
+    /// mismatch — no guest login required (detection is from frames the guest
+    /// already emits). The permanent auto-fix over telnet comes later.
+    fn network_check_window(&mut self, ctx: &egui::Context) {
+        if !self.show_net_check {
+            return;
+        }
+        let state = self.emu.net_state();
+        let guest = self.emu.status.net_guest_ip;
+        let gw = self.emu.status.net_guest_gateway;
+        let nat_gw = self.emu.status.net_nat_gateway;
+        // What ec0 must be for NAT to work, derived from the configured subnet
+        // (gateway = network+1, Indy = network+2).
+        let (eb, ep) = netplan::parse_cidr(self.cfg.nat_subnet.as_deref());
+        let expected_line = netplan::classify(eb, ep, &[]).derived.map(|d| format!(
+            "IRIS expects the Indy's ec0 at {} (gateway {}, mask {}).", d.client, d.gateway, d.netmask));
+        let mut open = true;
+        egui::Window::new("Check networking")
+            .collapsible(false)
+            .resizable(false)
+            .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+            .open(&mut open)
+            .show(ctx, |ui| {
+                ui.set_max_width(440.0);
+                match state {
+                    NetState::Off => {
+                        ui.label("Start the machine first, then check again.");
+                        return;
+                    }
+                    NetState::Active => {
+                        ui.label(RichText::new("Networking is up")
+                            .color(Color32::from_rgb(0x35, 0xb8, 0x4a)).strong());
+                        let who = guest.map(|i| i.to_string()).unwrap_or_else(|| "The guest".into());
+                        ui.label(format!("{who} is reaching the network through IRIS."));
+                        if let Some(g) = gw {
+                            ui.label(RichText::new(format!("Gateway in use: {g} (adopted by IRIS).")).weak());
+                        }
+                        return;
+                    }
+                    NetState::Idle => {} // running but no traffic — diagnose below
+                }
+                let Some(ip) = guest else {
+                    ui.label(RichText::new("No guest traffic seen yet").strong());
+                    ui.label("If IRIX just booted, give it a few seconds and re-check. \
+                              Otherwise ec0 may be unconfigured.");
+                    if let Some(l) = &expected_line { ui.label(RichText::new(l).weak()); }
+                    return;
+                };
+                let o = ip.octets();
+                let subnet = format!("{}.{}.{}.0/24", o[0], o[1], o[2]);
+                let sub_gw = std::net::Ipv4Addr::new(o[0], o[1], o[2], 1);
+                ui.label(RichText::new("Networking is down")
+                    .color(Color32::from_rgb(0xd9, 0x4a, 0x3d)).strong());
+                ui.label(format!("Your guest is using {ip} (network {subnet})."));
+                if let Some(l) = &expected_line { ui.label(RichText::new(l).weak()); }
+                if let Some(ng) = nat_gw {
+                    let no = ng.octets();
+                    ui.label(format!("IRIS's NAT is on {}.{}.{}.0/24 (gateway {ng}).", no[0], no[1], no[2]));
+                }
+                ui.add_space(6.0);
+                match gw {
+                    Some(g) => {
+                        ui.label(format!(
+                            "Its gateway is {g}, and IRIS adopts the guest's gateway automatically — this \
+                             should come up within a few seconds. Leave it a moment and re-check."));
+                        ui.label(RichText::new(
+                            "If it stays red, the guest's gateway may be unreachable; log in as root to \
+                             check it.").weak());
+                    }
+                    None => {
+                        ui.label("Its routing table has no default gateway, so it can reach only its own \
+                                  subnet. Give it one — IRIS then adopts it automatically:");
+                        ui.add_space(4.0);
+                        ui.label(RichText::new("Log in as root, open a winterm, and run:").strong());
+                        ui.code(format!("/usr/etc/route add default {sub_gw} 1"));
+                        ui.label(RichText::new(
+                            "Lasts until reboot; to persist it, set the default route in IRIX's network \
+                             config (5.3 and 6.5 differ).").weak());
+                    }
+                }
+            });
+        if !open {
+            self.show_net_check = false;
+        }
+    }
+
     /// Run-state line (IRIX running / PROM / halted / stopped + MIPS). Used in
     /// the control column's status footer.
-    fn run_state_label(&self, ui: &mut egui::Ui) {
+    fn run_state_label(&mut self, ui: &mut egui::Ui) {
         let running = self.emu.is_running();
         let halted = running && self.emu.status.cpu_halted;
         let status = if halted {
@@ -939,12 +1047,17 @@ impl App {
                 "Internal network: machine not running.",
             ),
         };
+        let mut want_check = false;
         ui.horizontal(|ui| {
-            ui.label(RichText::new("\u{25CF}").color(net_color));
-            ui.label("NET");
-        })
-        .response
-        .on_hover_text(net_tip);
+            ui.label(RichText::new("\u{25CF}").color(net_color)).on_hover_text(net_tip);
+            ui.label("NET").on_hover_text(net_tip);
+            if running && ui.small_button("check").on_hover_text("Diagnose guest networking").clicked() {
+                want_check = true;
+            }
+        });
+        if want_check {
+            self.show_net_check = true;
+        }
         if running && self.fb_scale > 0.0 {
             // How magnified the emulated display currently is (1× = native).
             // Round-snap the readout so a whole-number scale reads cleanly.
@@ -1139,10 +1252,17 @@ impl App {
             }
         });
         ui.separator();
-        match show_tab(ui, self.tab, &mut self.cfg, &mut self.jit) {
+        let out = show_tab(ui, self.tab, &mut self.cfg, &mut self.jit, &self.net_ifaces);
+        match out.action {
             ConfigAction::RequestEmbeddedProm => self.confirm_embedded_prom = true,
             ConfigAction::TestCamera => self.open_camera_test(),
             ConfigAction::None => {}
+        }
+        if out.net.changed { self.mark_dirty(); }
+        if let Some(p) = out.net.prompt {
+            self.net_sanity_modal = Some(NetSanityModal {
+                reason: p.reason, suggestion: p.suggestion, revert_to: p.revert_to,
+            });
         }
     }
 
@@ -1194,7 +1314,7 @@ impl App {
                         format!("Camera unavailable: {e}"));
                     ui.label(RichText::new(
                         "Check that a camera is connected and that IRIS has camera \
-                         permission (System Settings → Privacy & Security → Camera).")
+                         permission (System Settings > Privacy & Security > Camera).")
                         .weak());
                 } else if let Some(tex) = &self.camera_test_tex {
                     // The capture field is half-height (interlaced), so present
@@ -1207,7 +1327,7 @@ impl App {
                     ui.label("Starting capture…");
                     ui.label(RichText::new(
                         "If no image appears, grant camera access in System \
-                         Settings → Privacy & Security → Camera, then reopen.")
+                         Settings > Privacy & Security > Camera, then reopen.")
                         .weak().small());
                 }
                 ui.add_space(6.0);
@@ -1339,8 +1459,8 @@ impl App {
                     );
                     ui.add_space(6.0);
                     ui.label(RichText::new("How to use it").strong());
-                    ui.label("• Help → Diagnostics → Test Camera shows a live preview (start a machine first).");
-                    ui.label("• Or set Video-In → Source = camera, boot IRIX, and run an IndyCam app like vino/cam.");
+                    ui.label("• Help > Diagnostics > Test Camera shows a live preview (start a machine first).");
+                    ui.label("• Or set Video-In > Source = camera, boot IRIX, and run an IndyCam app like vino/cam.");
                     ui.label("• On first use macOS asks for camera permission. Closing the preview releases the camera.");
                     ui.add_space(6.0);
                     ui.label(RichText::new("Privacy / for App Review").strong());
@@ -1362,8 +1482,17 @@ impl App {
                     ui.label(RichText::new("How to use it").strong());
                     ui.label("• The guest serial console (ttyd1) and PROM monitor are exposed on loopback");
                     ui.label("   TCP (127.0.0.1:8881 / 8888) so you can attach a terminal.");
-                    ui.label("• Help → Diagnostics → Network test opens an in-app viewer of that console.");
+                    ui.label("• Help > Diagnostics > Network test opens an in-app viewer of that console.");
                     ui.label("• Optional inbound port-forwards (Networking tab) let you reach guest services.");
+                    ui.add_space(6.0);
+                    ui.label(RichText::new("Guest IP & subnets").strong());
+                    ui.label("• IRIS's NAT is a router on one subnet; the gateway is the .1 of that subnet");
+                    ui.label("   (default 192.168.0.0/24, gateway 192.168.0.1 — set on the Networking tab).");
+                    ui.label("• The guest must sit on that SAME subnet, with its default route = that .1 gateway.");
+                    ui.label("• If the guest's IP is on a different network, nothing routes. The NET light's");
+                    ui.label("   'check' button shows the guest's IP vs IRIS's, and how to line them up.");
+                    ui.label("• No port-forwards exist by default; '+ Add forward' maps a host port to a guest");
+                    ui.label("   port (inbound, host to guest) — e.g. to telnet into the guest.");
                     ui.add_space(6.0);
                     ui.label(RichText::new("Privacy / for App Review").strong());
                     ui.label(
@@ -1519,6 +1648,7 @@ impl eframe::App for App {
             .resizable(false)
             .exact_width(186.0)
             .show(ctx, |ui| self.control_panel(ui, ctx));
+        self.network_check_window(ctx);
 
         // Config editor lives in a collapsible side panel so the emulator
         // screen (central panel) is never hidden by it. The toolbar's
@@ -1668,6 +1798,47 @@ impl eframe::App for App {
                 self.toast("using embedded PROM");
             }
             if close { self.confirm_embedded_prom = false; }
+        }
+
+        // Networking sanity-check override modal.
+        if let Some(modal) = &self.net_sanity_modal {
+            let reason = modal.reason.clone();
+            let suggestion = modal.suggestion.clone();
+            let revert_to = modal.revert_to.clone();
+            let mut close = false;
+            let mut do_revert = false;
+            let mut do_suggest = false;
+            egui::Window::new("Check networking configuration")
+                .collapsible(false)
+                .resizable(false)
+                .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+                .show(ctx, |ui| {
+                    ui.set_max_width(420.0);
+                    ui.label(RichText::new(
+                        "This networking configuration does not appear to be valid, please double-check:")
+                        .strong());
+                    ui.label(format!("- {reason}"));
+                    ui.label(RichText::new(
+                        "The defaults are chosen to just work; an unusual subnet can leave the Indy \
+                         without internet access.").weak());
+                    ui.add_space(8.0);
+                    ui.horizontal(|ui| {
+                        if ui.button("Cancel").clicked() { do_revert = true; close = true; }
+                        if ui.add(egui::Button::new(format!("Use {suggestion}"))
+                            .fill(Color32::from_rgb(60, 90, 140))).clicked()
+                        {
+                            do_suggest = true; close = true;
+                        }
+                        if ui.add(egui::Button::new("Override Sanity Checks")
+                            .fill(Color32::from_rgb(140, 90, 40))).clicked()
+                        {
+                            close = true;
+                        }
+                    });
+                });
+            if do_revert  { self.cfg.nat_subnet = revert_to;          self.mark_dirty(); }
+            if do_suggest { self.cfg.nat_subnet = Some(suggestion);   self.mark_dirty(); }
+            if close { self.net_sanity_modal = None; }
         }
 
         // Missing-disk modal.

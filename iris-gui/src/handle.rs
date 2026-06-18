@@ -4,6 +4,7 @@ use iris::config::MachineConfig;
 use iris::machine::Machine;
 use iris::ps2::Ps2Controller;
 use parking_lot::Mutex;
+use std::net::Ipv4Addr;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::thread::JoinHandle;
@@ -56,6 +57,13 @@ pub struct Status {
     /// Monotonic within a run; the handle watches it advance to light the
     /// internal-network indicator (see [`EmulatorHandle::net_state`]).
     pub net_frames: u64,
+    /// The guest's observed source IP (None until a frame reveals one) and the
+    /// address NAT expects it to have. Drive the "Check networking" diagnosis.
+    pub net_guest_ip: Option<Ipv4Addr>,
+    /// The guest's likely default gateway (passively inferred from its ARPs).
+    pub net_guest_gateway: Option<Ipv4Addr>,
+    /// IRIS's current NAT gateway (reflects any live adoption).
+    pub net_nat_gateway: Option<Ipv4Addr>,
 }
 
 /// State of the internal-network ("NET") indicator shown next to MIPS.
@@ -152,6 +160,9 @@ impl EmulatorHandle {
                     self.net_seen_frames = s.net_frames;
                 }
                 self.status.net_frames = s.net_frames;
+                self.status.net_guest_ip = s.net_guest_ip;
+                self.status.net_guest_gateway = s.net_guest_gateway;
+                self.status.net_nat_gateway = s.net_nat_gateway;
             }
             match &evt {
                 Evt::Started => {
@@ -257,7 +268,13 @@ fn worker_loop(
                         let cpu_stopped = machine.as_ref().map_or(true, |m| !m.cpu_is_running());
                         let cpu_halted = cpu_stopped || mips == 0.0;
                         let net_frames = machine.as_ref().map_or(0, |m| m.net_guest_frames());
-                        let _ = evt_tx.send(Evt::Status(Status { mips, cpu_halted, net_frames, ..Status::default() }));
+                        let net_guest_ip = machine.as_ref().and_then(|m| m.net_observed_guest_ip());
+                        let net_guest_gateway = machine.as_ref().and_then(|m| m.net_observed_gateway());
+                        let net_nat_gateway = machine.as_ref().map(|m| m.nat_expected().1);
+                        let _ = evt_tx.send(Evt::Status(Status {
+                            mips, cpu_halted, net_frames, net_guest_ip, net_guest_gateway, net_nat_gateway,
+                            ..Status::default()
+                        }));
                     }
                 }
                 continue;

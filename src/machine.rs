@@ -701,6 +701,13 @@ impl Machine {
         self.hpc3.ioc().scc().inject_b(bytes);
     }
 
+    /// Read (and consume) IRIX serial-console (tty1) output captured in-process
+    /// since the last call. Pairs with `inject_serial_console` to drive a
+    /// request/response probe over the console without a loopback TCP client.
+    pub fn read_serial_console(&self) -> Vec<u8> {
+        self.hpc3.ioc().scc().drain_console()
+    }
+
     /// CPU thread, started explicitly by the CI `start` command or by
     /// `ci_restore`. In `--ci` mode the CPU is not autostarted in `start()`
     /// — the harness drives startup via `restore`.
@@ -721,6 +728,25 @@ impl Machine {
     /// delta to tell whether the guest's internal networking is alive.
     pub fn net_guest_frames(&self) -> u64 {
         self.hpc3.seeq().nat_control().guest_frames()
+    }
+
+    /// NAT addresses the emulator hands the guest: (ec0 client IP, gateway IP,
+    /// netmask) — the source of truth for what the guest's ec0 should be.
+    pub fn nat_expected(&self) -> (std::net::Ipv4Addr, std::net::Ipv4Addr, std::net::Ipv4Addr) {
+        self.hpc3.seeq().gateway_addrs()
+    }
+
+    /// The guest's own source IP as last seen on the wire (None if no frame has
+    /// revealed one yet). Captured passively, so it works even when the guest's
+    /// networking is misconfigured and nothing routes.
+    pub fn net_observed_guest_ip(&self) -> Option<std::net::Ipv4Addr> {
+        self.hpc3.seeq().nat_control().observed_guest_ip()
+    }
+
+    /// The guest's likely default gateway, inferred passively from the in-subnet
+    /// address it keeps ARP-ing for but can't resolve. None if none seen.
+    pub fn net_observed_gateway(&self) -> Option<std::net::Ipv4Addr> {
+        self.hpc3.seeq().nat_control().observed_gateway()
     }
 
     /// Step the CPU `n` instructions in-line on the calling thread, with all

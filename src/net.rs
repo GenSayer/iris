@@ -7,7 +7,7 @@
 use std::collections::{HashMap, VecDeque};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr, TcpListener, TcpStream, UdpSocket};
 use socket2::{Domain, Protocol, Socket, Type};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
 use crate::config::{ForwardBind, ForwardProto, NatSubnet, NfsConfig, PortForwardConfig};
 use crate::devlog::LogModule;
@@ -469,6 +469,17 @@ pub struct NatControl {
     /// IP). Monotonic for the life of the machine; the GUI samples it to light a
     /// grey/red/green "internal network" indicator.
     pub guest_frames: AtomicU64,
+    /// The guest's own source IPv4 address as last seen on the wire (ARP sender
+    /// address, or IP source) — `0` = none seen yet. Captured even when the
+    /// guest's config is wrong and nothing routes (it still ARPs for its
+    /// gateway), so the GUI can show what address the guest actually has and
+    /// compare it to what NAT expects.
+    pub observed_guest_ip: AtomicU32,
+    /// The address the guest is ARP-ing for within its own subnet but failing
+    /// to resolve (NAT doesn't own it) — almost always its configured default
+    /// gateway. `0` = none seen. Lets the GUI tell what gateway the guest
+    /// expects (and whether the host-side fix will satisfy it).
+    pub observed_gateway: AtomicU32,
 }
 
 impl NatControl {
@@ -480,11 +491,28 @@ impl NatControl {
             snapshot:   Mutex::new(NatSnapshot::default()),
             reset_nat:  AtomicBool::new(false),
             guest_frames: AtomicU64::new(0),
+            observed_guest_ip: AtomicU32::new(0),
+            observed_gateway: AtomicU32::new(0),
         })
     }
     pub fn dbg_tcp(&self)  -> bool { self.debug_tcp.load(Ordering::Relaxed) }
     pub fn dbg_udp(&self)  -> bool { self.debug_udp.load(Ordering::Relaxed) }
     pub fn dbg_icmp(&self) -> bool { self.debug_icmp.load(Ordering::Relaxed) }
+    /// The guest's likely default gateway (in-subnet ARP target it can't
+    /// resolve), or None if none seen.
+    pub fn observed_gateway(&self) -> Option<Ipv4Addr> {
+        match self.observed_gateway.load(Ordering::Relaxed) {
+            0 => None,
+            v => Some(Ipv4Addr::from(v)),
+        }
+    }
+    /// The guest's last-seen source IP, or None if no frame has revealed one.
+    pub fn observed_guest_ip(&self) -> Option<Ipv4Addr> {
+        match self.observed_guest_ip.load(Ordering::Relaxed) {
+            0 => None,
+            v => Some(Ipv4Addr::from(v)),
+        }
+    }
     /// Number of guest frames the NAT engine has seen so far.
     pub fn guest_frames(&self) -> u64 { self.guest_frames.load(Ordering::Relaxed) }
 }
@@ -749,6 +777,55 @@ impl NatEngine {
             self.guest_mac = Some(src_mac);
         }
         let etype = r16(frame, 12);
+        // Record the guest's own source address so the GUI can tell what IP it's
+        // using — even when that IP is wrong and nothing routes. ARP carries it
+        // (sender protocol address) even with zero IP traffic, since the guest
+        // ARPs for its configured gateway.
+        let src_ip = match etype {
+            ETHERTYPE_ARP if frame.len() >= 14 + 28 =>
+                Some(Ipv4Addr::new(frame[28], frame[29], frame[30], frame[31])),
+            ETHERTYPE_IP if frame.len() >= 14 + 20 =>
+                Some(Ipv4Addr::new(frame[26], frame[27], frame[28], frame[29])),
+            _ => None,
+        };
+        if let Some(ip) = src_ip {
+            if !ip.is_unspecified() {
+                self.ctl.observed_guest_ip.store(u32::from(ip), Ordering::Relaxed);
+            }
+        }
+        // Candidate default gateway: a guest ARP *request* (op=1) for an
+        // in-subnet address it can't resolve (NAT doesn't own it) is almost
+        // always the gateway it's trying — and failing — to reach. Record it so
+        // the GUI can tell what gateway the guest expects.
+        if etype == ETHERTYPE_ARP && frame.len() >= 14 + 28 && r16(frame, 14 + 6) == 1 {
+            let spa = [frame[28], frame[29], frame[30], frame[31]];
+            let tpa = Ipv4Addr::new(frame[38], frame[39], frame[40], frame[41]);
+            let t = tpa.octets();
+            // TEMP diagnostic: every guest ARP request + the adoption decision.
+            eprintln!("iris NET-DIAG: guest ARP who-has {} tell {}.{}.{}.{}  (nat gw={} client={} guest_frames={})",
+                tpa, spa[0], spa[1], spa[2], spa[3],
+                self.config.gateway_ip, self.config.client_ip,
+                self.ctl.guest_frames.load(Ordering::Relaxed));
+            if !tpa.is_unspecified() && t != spa && t[0] == spa[0] && t[1] == spa[1] && t[2] == spa[2] {
+                self.ctl.observed_gateway.store(u32::from(tpa), Ordering::Relaxed);
+                // Plug-and-play: while nothing is routing yet, adopt the gateway
+                // the guest is asking for — move NAT onto the guest's subnet so
+                // it answers that ARP and traffic starts flowing, with no config
+                // change or restart. Self-limiting: once any IP frame routes
+                // (guest_frames > 0) we stop, so a working setup is never moved.
+                if self.config.gateway_ip != tpa
+                    && self.ctl.guest_frames.load(Ordering::Relaxed) == 0
+                {
+                    eprintln!("iris NET-DIAG: ADOPTING gateway {} (was {})", tpa, self.config.gateway_ip);
+                    self.config.gateway_ip = tpa;
+                    self.config.client_ip = Ipv4Addr::new(t[0], t[1], t[2], 2);
+                    self.config.netmask = Ipv4Addr::new(255, 255, 255, 0);
+                } else {
+                    eprintln!("iris NET-DIAG: NOT adopting {} (cur gw={}, guest_frames={})",
+                        tpa, self.config.gateway_ip, self.ctl.guest_frames.load(Ordering::Relaxed));
+                }
+            }
+        }
         dlog_dev!(LogModule::Net, "NAT TX {}", eth_summary(frame));
         if self.ctl.dbg_tcp() && etype == ETHERTYPE_IP {
             dlog_dev!(LogModule::Net, "NAT RX (IRIX→NAT):");
@@ -1693,7 +1770,9 @@ impl NatEngine {
             if self.fwd_ephemeral_next < 49152 { self.fwd_ephemeral_next = 49152; }
 
             let client_isn = 0x6000_0000u32.wrapping_add(ephemeral as u32);
-            let guest_ip   = self.config.client_ip;
+            // Forward to the guest's *actual* IP (learned from its traffic), not
+            // the assumed NAT client address — a static guest can be on any host.
+            let guest_ip   = self.ctl.observed_guest_ip().unwrap_or(self.config.client_ip);
             let gw_ip      = self.config.gateway_ip;
             let gw_mac     = self.config.gateway_mac;
 
@@ -1757,7 +1836,7 @@ impl NatEngine {
             {
                 fwd.last_sender = Some(from);
             }
-            let guest_ip = self.config.client_ip;
+            let guest_ip = self.ctl.observed_guest_ip().unwrap_or(self.config.client_ip);
             let gw_ip    = self.config.gateway_ip;
             let gw_mac   = self.config.gateway_mac;
             // Inject as UDP: src=gateway_ip:host_port dst=guest_ip:guest_port
