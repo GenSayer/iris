@@ -1,7 +1,30 @@
 # Plan: in-core NFSv3-over-UDP server (`src/nfsv3udp.rs`)
 
 Status: **planning** — no code yet. Replaces the external `unfsd` with a
-synchronous, pure-Rust NFSv3/UDP server that lives inside the NAT.
+synchronous, pure-Rust NFS/UDP server that lives inside the NAT.
+
+## Decisions (locked 2026-06-18)
+
+- **Support both NFSv2 (IRIX 5.3) and NFSv3 (IRIX 6.x).** Best done by handling
+  *both at once*: the server dispatches on the RPC `vers` field, so the guest's
+  own `mount` picks the version (5.3 → v2, 6.x → v3) and we reply in kind — no
+  dropdown needed for it to work. We'll still expose an optional **NFS version:
+  Auto / v2 / v3** config (default Auto) to force/limit it for testing.
+  Implementation: MOUNT v1 (for NFSv2) + MOUNT v3, and NFS v2 + v3 procedure
+  sets, all over a **shared backend** (path↔id map, file I/O, faked attrs); only
+  the XDR/attr encoding differs per version.
+- **Full read-write in one pass** (not a read-only spike). Implies the
+  **duplicate-request cache** (Q14) is in scope from the start.
+- **Inbound IP reassembly now** (Q2): add a fragment-reassembly buffer to
+  `handle_ip` so large `wsize` works — fast writes, symmetric with reads.
+- **Simplest synthetic permissions** (Q5): fixed uid/gid 0, mode by heuristic
+  (dir 0755 / file 0644 / +x if detectable), accept-and-ignore the guest's
+  SETATTR chmod/chown.
+- **Guest side / `.rhosts` note:** NFS mounting needs **no `.rhosts`** (that file
+  is rsh/rcp trust, not NFS). The only guest-side step is the `mount` command,
+  which the GUI already emits live. The "add host to `.rhosts`" instruction
+  belongs to the *rcp/rsh* file path, which is separate — see clarification
+  request in the chat.
 
 ## Goal & hard constraints
 

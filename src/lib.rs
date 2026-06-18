@@ -43,6 +43,7 @@ pub mod monitor;
 pub mod locks;
 pub mod pit8254;
 pub mod net;
+pub mod nfsv3udp;
 pub mod seeq8003;
 pub mod cow_disk;
 #[cfg(feature = "chd")]
