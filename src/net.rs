@@ -7,7 +7,7 @@
 use std::collections::{HashMap, VecDeque};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr, TcpListener, TcpStream, UdpSocket};
 use socket2::{Domain, Protocol, Socket, Type};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use crate::config::{ForwardBind, ForwardProto, NatSubnet, NfsConfig, PortForwardConfig};
 use crate::devlog::LogModule;
@@ -464,6 +464,11 @@ pub struct NatControl {
     /// Set to true to flush all NAT tables on the next NatEngine loop iteration.
     /// The NAT thread clears the flag after flushing.
     pub reset_nat:  AtomicBool,
+    /// Count of guest-originated IP frames the NAT engine has processed (ARP and
+    /// other link-layer chatter are excluded — they happen even with no/wrong
+    /// IP). Monotonic for the life of the machine; the GUI samples it to light a
+    /// grey/red/green "internal network" indicator.
+    pub guest_frames: AtomicU64,
 }
 
 impl NatControl {
@@ -474,11 +479,14 @@ impl NatControl {
             debug_icmp: AtomicBool::new(false),
             snapshot:   Mutex::new(NatSnapshot::default()),
             reset_nat:  AtomicBool::new(false),
+            guest_frames: AtomicU64::new(0),
         })
     }
     pub fn dbg_tcp(&self)  -> bool { self.debug_tcp.load(Ordering::Relaxed) }
     pub fn dbg_udp(&self)  -> bool { self.debug_udp.load(Ordering::Relaxed) }
     pub fn dbg_icmp(&self) -> bool { self.debug_icmp.load(Ordering::Relaxed) }
+    /// Number of guest frames the NAT engine has seen so far.
+    pub fn guest_frames(&self) -> u64 { self.guest_frames.load(Ordering::Relaxed) }
 }
 
 #[derive(Default)]
@@ -748,7 +756,14 @@ impl NatEngine {
         }
         match etype {
             ETHERTYPE_ARP => self.handle_arp(frame, &src_mac),
-            ETHERTYPE_IP  => self.handle_ip(frame, &src_mac),
+            ETHERTYPE_IP  => {
+                // Count only IP traffic — the actual NAT workload — as the
+                // network-alive signal. ARP (and other link-layer chatter)
+                // happens even when the guest's IP is missing or wrong, so
+                // counting it would flash the indicator green misleadingly.
+                self.ctl.guest_frames.fetch_add(1, Ordering::Relaxed);
+                self.handle_ip(frame, &src_mac);
+            }
             _ => {}
         }
     }

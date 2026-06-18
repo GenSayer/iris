@@ -263,6 +263,12 @@ impl Seeq8003 {
         }
     }
 
+    /// Shared NAT control/stats handle (debug toggles, table reset, and the
+    /// guest-frame counter the GUI's network indicator samples).
+    pub fn nat_control(&self) -> Arc<NatControl> {
+        self.nat_ctl.clone()
+    }
+
     /// Deassert the interrupt line. Called when the driver writes CLRINT.
     /// Mark both status registers as OLD so raise_interrupt won't immediately re-raise.
     pub fn reset_interrupt(&self) {

@@ -52,6 +52,33 @@ pub struct Status {
     /// PROM after an IRIX `halt` (0 MIPS). When set, the guest has shut down and
     /// stopping the machine can't corrupt a disk — see [`crate::safe_stop`].
     pub cpu_halted: bool,
+    /// Cumulative count of guest Ethernet frames the NAT engine has processed.
+    /// Monotonic within a run; the handle watches it advance to light the
+    /// internal-network indicator (see [`EmulatorHandle::net_state`]).
+    pub net_frames: u64,
+}
+
+/// State of the internal-network ("NET") indicator shown next to MIPS.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NetState {
+    /// Guest isn't executing — stopped, halted, or idle at the PROM (grey).
+    Off,
+    /// NAT IP traffic has flowed this run — networking is up (green).
+    Active,
+    /// Running, but no NAT IP traffic seen yet this run (red).
+    Idle,
+}
+
+/// Pure decision for the NET indicator, factored out so it's unit-testable
+/// without a live machine. Grey whenever the guest isn't executing; otherwise
+/// green once NAT IP traffic has been seen this run (`net_seen > 0`) — the
+/// signal latches, since a guest that has networked doesn't become misconfigured
+/// just by going idle — else red.
+fn net_state_for(running: bool, halted: bool, net_seen: u64) -> NetState {
+    if !running || halted {
+        return NetState::Off;
+    }
+    if net_seen > 0 { NetState::Active } else { NetState::Idle }
 }
 
 pub struct EmulatorHandle {
@@ -66,6 +93,10 @@ pub struct EmulatorHandle {
     /// `None` when no machine is up.
     pub ps2: Arc<Mutex<Option<Arc<Ps2Controller>>>>,
     pub status: Status,
+    /// NAT IP-frame count observed this run (reset on Start). Non-zero once the
+    /// guest's networking has actually carried traffic; latches the NET
+    /// indicator green for the rest of the run.
+    net_seen_frames: u64,
 }
 
 impl EmulatorHandle {
@@ -95,6 +126,7 @@ impl EmulatorHandle {
             frame_sink,
             ps2,
             status: Status::default(),
+            net_seen_frames: 0,
         }
     }
 
@@ -113,9 +145,22 @@ impl EmulatorHandle {
                 self.status.mips = s.mips;
                 self.status.dirty_cow = s.dirty_cow;
                 self.status.cpu_halted = s.cpu_halted;
+                // Latch the NET light: once NAT IP traffic has flowed this run
+                // the guest's networking is up, so keep it green through idle
+                // lulls (it resets to red on the next Start).
+                if s.net_frames > self.net_seen_frames {
+                    self.net_seen_frames = s.net_frames;
+                }
+                self.status.net_frames = s.net_frames;
             }
             match &evt {
-                Evt::Started => self.status.running = true,
+                Evt::Started => {
+                    self.status.running = true;
+                    // Fresh machine → fresh NAT counter (starts at 0); reset our
+                    // tracking so the indicator starts red and only greens on
+                    // this run's first observed NAT traffic.
+                    self.net_seen_frames = 0;
+                }
                 Evt::Stopped => self.status.running = false,
                 Evt::PowerOff => self.status.power_off_seen = true,
                 _ => {}
@@ -126,6 +171,13 @@ impl EmulatorHandle {
     }
 
     pub fn is_running(&self) -> bool { self.status.running }
+
+    /// State of the internal-network indicator: grey when the guest isn't
+    /// executing (stopped/halted/PROM), green once NAT IP traffic has flowed
+    /// this run, red while a running guest has produced no NAT traffic yet.
+    pub fn net_state(&self) -> NetState {
+        net_state_for(self.status.running, self.status.cpu_halted, self.net_seen_frames)
+    }
 
     /// Stop the machine (if running) and join the worker thread. Idempotent.
     /// Call this from the GUI's `on_exit` so a running machine is cleaned up
@@ -146,6 +198,23 @@ impl Drop for EmulatorHandle {
     // path). No-op once the worker has already been joined.
     fn drop(&mut self) {
         self.shutdown();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn net_indicator_states() {
+        // Unpowered (not running) → grey, regardless of past traffic.
+        assert_eq!(net_state_for(false, false, 42), NetState::Off);
+        // Running but halted / idle at the PROM → grey.
+        assert_eq!(net_state_for(true, true, 42), NetState::Off);
+        // Running, no NAT traffic seen yet → red.
+        assert_eq!(net_state_for(true, false, 0), NetState::Idle);
+        // Running, NAT traffic has flowed → green (and latches, so it stays).
+        assert_eq!(net_state_for(true, false, 1), NetState::Active);
     }
 }
 
@@ -187,7 +256,8 @@ fn worker_loop(
                         // instructions this window (halted/idle at the PROM, 0 MIPS).
                         let cpu_stopped = machine.as_ref().map_or(true, |m| !m.cpu_is_running());
                         let cpu_halted = cpu_stopped || mips == 0.0;
-                        let _ = evt_tx.send(Evt::Status(Status { mips, cpu_halted, ..Status::default() }));
+                        let net_frames = machine.as_ref().map_or(0, |m| m.net_guest_frames());
+                        let _ = evt_tx.send(Evt::Status(Status { mips, cpu_halted, net_frames, ..Status::default() }));
                     }
                 }
                 continue;

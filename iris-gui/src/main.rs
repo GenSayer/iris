@@ -18,7 +18,7 @@ use dialogs::create_disk::CreateDiskDialog;
 use dialogs::new_machine::{distribute_ram, NewMachineDialog};
 use eframe::egui;
 use egui::{Color32, RichText, ViewportCommand};
-use handle::{Cmd, EmulatorHandle, Evt};
+use handle::{Cmd, EmulatorHandle, Evt, NetState};
 use iris::config::MachineConfig;
 use safe_stop::{evaluate, reason_lines};
 use settings::{GuiSettings, UI_SCALE_MAX, UI_SCALE_MIN, WINDOW_DEFAULT_SIZE};
@@ -898,6 +898,30 @@ impl App {
         if running && !halted {
             ui.label(format!("{:.0} MIPS", self.emu.status.mips));
         }
+        // Internal-network indicator — always shown (grey while unpowered or
+        // halted). Green once the guest is carrying NAT IP traffic; red when a
+        // running guest has produced none (a hint its IP is missing or wrong for
+        // the configured NAT subnet).
+        let (net_color, net_tip) = match self.emu.net_state() {
+            NetState::Active => (
+                Color32::from_rgb(0x35, 0xb8, 0x4a),
+                "Internal network: carrying guest NAT traffic.",
+            ),
+            NetState::Idle => (
+                Color32::from_rgb(0xd9, 0x4a, 0x3d),
+                "Internal network: no NAT traffic yet.\nThe guest may have no IP — or the wrong IP for this NAT subnet.",
+            ),
+            NetState::Off => (
+                Color32::from_gray(0x80),
+                "Internal network: machine not running.",
+            ),
+        };
+        ui.horizontal(|ui| {
+            ui.label(RichText::new("\u{25CF}").color(net_color));
+            ui.label("NET");
+        })
+        .response
+        .on_hover_text(net_tip);
         if running && self.fb_scale > 0.0 {
             // How magnified the emulated display currently is (1× = native).
             // Round-snap the readout so a whole-number scale reads cleanly.

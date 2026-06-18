@@ -716,6 +716,13 @@ impl Machine {
         self.cpu.is_running()
     }
 
+    /// Cumulative count of guest-originated Ethernet frames the NAT engine has
+    /// processed. Monotonic for the life of the machine; an embedder samples the
+    /// delta to tell whether the guest's internal networking is alive.
+    pub fn net_guest_frames(&self) -> u64 {
+        self.hpc3.seeq().nat_control().guest_frames()
+    }
+
     /// Step the CPU `n` instructions in-line on the calling thread, with all
     /// peripheral threads stopped so the CPU sees no external interrupts.
     /// Used by Phase 3.3 snapshot determinism validator.
