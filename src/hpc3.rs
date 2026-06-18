@@ -254,32 +254,30 @@ impl Hpc3Irq {
 impl ScsiCallback for Hpc3Irq {
     fn set_interrupt(&self, level: bool) {
         self.update(level);
-    }
-    fn clear_pdma_int(&self) {
-        // Called when the kernel acks the chip-side INT via SCSI_STATUS read.
-        // Drop any pending PDMA DMA-completion bit on the same SCSI line —
-        // on real HPC3 the SCSI INT3 source is shared and the chip ack settles
-        // both halves.  Without this, intstat[SCSI*_DMA] stays asserted forever
-        // when the IRIX miniroot's SCSI driver only acks via the chip path.
-        if let Some((chan, dma_bit)) = &self.pdma_paired {
-            let mut c = chan.lock();
-            if c.ctrl & PDMA_CTRL_INT != 0 {
-                c.ctrl &= !PDMA_CTRL_INT;
+        if !level {
+            // When the chip-side INT deasserts, also drop any pending PDMA
+            // DMA-completion bit on the same SCSI line — on real HPC3 the SCSI
+            // INT3 source is shared and the chip ack settles both halves.
+            // Without this, intstat[SCSI*_DMA] stays asserted forever when the
+            // IRIX miniroot's SCSI driver only acks via the chip path.
+            if let Some((chan, dma_bit)) = &self.pdma_paired {
+                let mut c = chan.lock();
+                if c.ctrl & PDMA_CTRL_INT != 0 {
+                    c.ctrl &= !PDMA_CTRL_INT;
+                }
+                drop(c);
+                let mut st = self.state.lock();
+                st.intstat &= !*dma_bit;
+                let active = (st.intstat & (HPC3_INTSTAT_SCSI0_DEV | HPC3_INTSTAT_SCSI0_DMA
+                                           | HPC3_INTSTAT_SCSI1_DEV | HPC3_INTSTAT_SCSI1_DMA))
+                             & match self.ioc_line {
+                                 IocInterrupt::Scsi0 => HPC3_INTSTAT_SCSI0_DEV | HPC3_INTSTAT_SCSI0_DMA,
+                                 IocInterrupt::Scsi1 => HPC3_INTSTAT_SCSI1_DEV | HPC3_INTSTAT_SCSI1_DMA,
+                                 _ => 0,
+                             };
+                drop(st);
+                self.ioc.set_interrupt(self.ioc_line, active != 0);
             }
-            drop(c);
-            let mut st = self.state.lock();
-            st.intstat &= !*dma_bit;
-            // Recompute IOC line: chip already deasserted via set_interrupt(false),
-            // and now the DMA half is too, so SCSI0 line drops to 0.
-            let active = (st.intstat & (HPC3_INTSTAT_SCSI0_DEV | HPC3_INTSTAT_SCSI0_DMA
-                                       | HPC3_INTSTAT_SCSI1_DEV | HPC3_INTSTAT_SCSI1_DMA))
-                         & match self.ioc_line {
-                             IocInterrupt::Scsi0 => HPC3_INTSTAT_SCSI0_DEV | HPC3_INTSTAT_SCSI0_DMA,
-                             IocInterrupt::Scsi1 => HPC3_INTSTAT_SCSI1_DEV | HPC3_INTSTAT_SCSI1_DMA,
-                             _ => 0,
-                         };
-            drop(st);
-            self.ioc.set_interrupt(self.ioc_line, active != 0);
         }
     }
 }
@@ -550,9 +548,7 @@ fn start_transaction(&mut self) {
 
     fn dma_write(&mut self, val: u32, eop: bool) -> (DmaStatus, Option<(u32, u16)>) {
         if !self.is_active() {
-            if self.id >= 10 && self.log_active() {
-                dlog_dev!(LogModule::Pdma, "PDMA[{}]: dma_write refused — channel not active", self.id);
-            }
+            dlog_dev!(LogModule::Pdma, "PDMA[{}]: dma_write refused — channel not active (CBP={:08x} BC={:08x})", self.id, self.cbp, self.bc);
             return (DmaStatus(DmaStatus::NOT_ACTIVE), None);
         }
         // RX channel (id=10): respect ROWN — only write if HPC3 owns the descriptor
@@ -628,6 +624,14 @@ fn start_transaction(&mut self) {
                 if self.log_active() { dlog_dev!(LogModule::Pdma, "PDMA[10]: RX writeback deferred crbdp={:08x}+6 ← rem_bc={:04x}", self.crbdp, rem); }
                 writeback = Some((self.crbdp + 6, rem));
             }
+            bc_done = true;
+        }
+
+        // SCSI TX (ch8/9): caller_eop means the device has finished sending all its data.
+        // Force bc_done so the descriptor completes even if fewer bytes were written than
+        // the host allocated (e.g. MODE_SENSE response shorter than allocation length).
+        // This fires EOX → set_active(false), clearing WDSC_DMA_ACTIVE for the next transfer.
+        if (self.id == 8 || self.id == 9) && caller_eop {
             bc_done = true;
         }
 
@@ -1008,15 +1012,15 @@ pub struct Hpc3 {
 }
 
 impl Hpc3 {
-    pub fn new(eeprom: Arc<Mutex<Eeprom93c56>>, ioc: Ioc, guinness: bool, heartbeat: Arc<AtomicU64>) -> Self {
-        Self::with_net(eeprom, ioc, guinness, heartbeat, NetworkConfig::default(), false, "nvram.bin".to_string())
+    pub fn new(eeprom: Arc<Mutex<Eeprom93c56>>, ioc: Ioc, guinness: bool, heartbeat: Arc<AtomicU64>, cpu_cycles: Arc<AtomicU64>) -> Self {
+        Self::with_net(eeprom, ioc, guinness, heartbeat, NetworkConfig::default(), false, "nvram.bin".to_string(), cpu_cycles)
     }
 
     /// `no_audio` skips HAL2 audio init (used by `--noaudio` and also by full
     /// `--headless`, which can't run audio in CI).
     /// `nvram_path` is the on-disk NVRAM file (loaded at startup, default save
     /// target for `iris-ci rtc-save`).
-    pub fn with_net(eeprom: Arc<Mutex<Eeprom93c56>>, ioc: Ioc, guinness: bool, heartbeat: Arc<AtomicU64>, net: NetworkConfig, no_audio: bool, nvram_path: String) -> Self {
+    pub fn with_net(eeprom: Arc<Mutex<Eeprom93c56>>, ioc: Ioc, guinness: bool, heartbeat: Arc<AtomicU64>, net: NetworkConfig, no_audio: bool, nvram_path: String, cpu_cycles: Arc<AtomicU64>) -> Self {
         let nfs = net.nfs;
         let port_forwards = net.port_forward;
         let subnet = net.nat_subnet.unwrap_or_default();
@@ -1105,7 +1109,7 @@ impl Hpc3 {
             pdma_paired: Some((pdma_channels[8].clone(), HPC3_INTSTAT_SCSI0_DMA)),
         });
 
-        let scsi_dev = Arc::new(Wd33c93a::new(Some(scsi0_dma), Some(scsi0_irq), heartbeat.clone()));
+        let scsi_dev = Arc::new(Wd33c93a::new(Some(scsi0_dma), Some(scsi0_irq), heartbeat.clone(), cpu_cycles));
         let _ = scsi_wd_lock.set(scsi_dev.clone());
 
         let hal2 = if no_audio { None } else { Some(Arc::new(Hal2::new(dma_clients[0..8].to_vec()))) };
@@ -1276,8 +1280,11 @@ impl Device for Hpc3 {
                     for (i, chan) in self.pdma_channels.iter().enumerate() {
                         let c = chan.lock();
                         let type_str = if i <= 7 { "Generic" } else if i == 8 { "SCSI0" } else if i == 9 { "SCSI1" } else if i == 10 { "ENET RX" } else { "ENET TX" };
-                        writeln!(writer, "  [{:2}] {:8}: Active={} CBP={:08x} NBDP={:08x} BC={:08x} CRBDP={:08x} Endian={}",
-                            i, type_str, c.is_active(), c.cbp, c.nbdp, c.bc, c.crbdp, if c.endian { "Little" } else { "Big" }).unwrap();
+                        let dir_str = if i == 8 || i == 9 {
+                            if (c.ctrl & SCSI_CTRL_DIR) != 0 { " DIR=OUT" } else { " DIR=IN" }
+                        } else { "" };
+                        writeln!(writer, "  [{:2}] {:8}: Active={} CBP={:08x} NBDP={:08x} BC={:08x} CRBDP={:08x} Endian={}{} CTRL={:02x}",
+                            i, type_str, c.is_active(), c.cbp, c.nbdp, c.bc, c.crbdp, if c.endian { "Little" } else { "Big" }, dir_str, c.ctrl).unwrap();
                     }
                     return Ok(());
                 }

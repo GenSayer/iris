@@ -165,6 +165,7 @@ impl DmaStatus {
     pub fn eop(self)     -> bool { self.0 & Self::EOP        != 0 }
     pub fn eox(self)     -> bool { self.0 & Self::EOX        != 0 }
     pub fn irq(self)     -> bool { self.0 & Self::IRQ        != 0 }
+    pub fn not_active(self) -> bool { self.0 & Self::NOT_ACTIVE != 0 }
     pub fn refused(self) -> bool { self.0 & (Self::NOT_ACTIVE | Self::ROWN | Self::OVERFLOW) != 0 }
 }
 

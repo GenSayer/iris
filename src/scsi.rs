@@ -603,7 +603,7 @@ impl ScsiDevice {
         }
         let block_size = self.logical_block_size as u32;
         let last_lba = (self.size / self.logical_block_size).saturating_sub(1) as u32;
-        //eprintln!("SCSI READ CAPACITY: block_size={} last_lba={}", block_size, last_lba);
+        eprintln!("SCSI READ CAPACITY: block_size={} last_lba={} data={:02x?}", block_size, last_lba, &[last_lba.to_be_bytes(), block_size.to_be_bytes()].concat());
 
         let mut data = vec![0u8; 8];
         data[0..4].copy_from_slice(&last_lba.to_be_bytes());

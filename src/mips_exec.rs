@@ -5414,7 +5414,7 @@ impl<T: Tlb + Send + 'static, C: MipsCache + Send + 'static> Device for MipsCpu<
             ("debug".to_string(), "CPU instruction trace: debug <on|off|file <path>> [DEV]".to_string()),
             ("ex".to_string(), "Alias for exception".to_string()),
             ("undo".to_string(), "Undo N instructions or control undo buffer: undo [count] | undo <on|off|clear> [DEV]".to_string()),
-            ("dt".to_string(), "Disassemble traceback: dt [count]".to_string()),
+            ("dt".to_string(), "Disassemble traceback: dt [count] | dt file <path> [count]".to_string()),
             ("idleprof".to_string(), "Locate idle/spin loops via PC sampling: idleprof <on|off|report [count]>".to_string()),
             ("u".to_string(), "Alias for undo [DEV]".to_string()),
             ("sym".to_string(), "Lookup symbol: sym <addr>".to_string()),
@@ -6276,18 +6276,41 @@ impl<T: Tlb + Send + 'static, C: MipsCache + Send + 'static> Device for MipsCpu<
                 Ok(())
             }
             "dt" | "traceback" => {
-                let count = if !actual_args.is_empty() {
-                    actual_args[0].parse().unwrap_or(10)
+                // dt [N]              — dump last N instructions to console (default 10)
+                // dt file <path> [N] — dump to file (default: entire buffer)
+                let (file_path, count) = if actual_args.first().copied() == Some("file") {
+                    let path = actual_args.get(1).copied().unwrap_or("/tmp/iris_trace.txt");
+                    let n = actual_args.get(2).and_then(|s| s.parse().ok()).unwrap_or(TRACEBACK_SIZE);
+                    (Some(path.to_string()), n)
                 } else {
-                    10
+                    let n = actual_args.first().and_then(|s| s.parse().ok()).unwrap_or(10);
+                    (None, n)
                 };
-                let exec = self.try_lock_executor()?;
+                let count = count.min(TRACEBACK_SIZE);
+                let exec = self.executor.lock();
                 let symbols = exec.symbols.lock();
                 let entries = exec.traceback.get_last(count);
-                writeln!(writer, "Execution Traceback (last {} instructions):", entries.len()).unwrap();
-                for entry in entries {
-                    let sym_str = format_pc_symbol(entry.pc, &symbols);
-                    writeln!(writer, "{:016x}{}: {:08x} {}", entry.pc, sym_str, entry.instr, mips_dis::disassemble(entry.instr, entry.pc, Some(&symbols))).unwrap();
+                let n = entries.len();
+                let do_write = |w: &mut dyn Write| {
+                    writeln!(w, "Execution Traceback (last {} instructions):", n).unwrap();
+                    for entry in &entries {
+                        let sym_str = format_pc_symbol(entry.pc, &symbols);
+                        let dis = mips_dis::disassemble(entry.instr, entry.pc, Some(&symbols));
+                        writeln!(w, "{:016x}{}: {:08x} {}", entry.pc, sym_str, entry.instr, dis).unwrap();
+                    }
+                };
+                if let Some(ref path) = file_path {
+                    match std::fs::File::create(path) {
+                        Ok(f) => {
+                            let mut bw = std::io::BufWriter::new(f);
+                            do_write(&mut bw);
+                            let _ = std::io::Write::flush(&mut bw);
+                            writeln!(writer, "Wrote {} instructions to {}", n, path).unwrap();
+                        }
+                        Err(e) => return Err(format!("Cannot open {}: {}", path, e)),
+                    }
+                } else {
+                    do_write(&mut writer);
                 }
                 Ok(())
             }
