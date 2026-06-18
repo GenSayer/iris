@@ -1,9 +1,9 @@
-# GUI mouse integration — current approach, and the Snow absolute-mouse pattern
+# GUI mouse integration — current approach, and the classic-Mac absolute-mouse pattern
 
 Status: reference / design analysis. Captures why iris-gui uses pointer
 **capture** for the framebuffer, and why the seamless absolute-mouse trick used
-by the `snow` Macintosh emulator does **not** port to IRIX without significant
-new machinery. Read this before proposing "make the mouse seamless like snow."
+by some classic Macintosh emulators does **not** port to IRIX without
+significant new machinery. Read this before proposing "make the mouse seamless."
 
 ## Current iris-gui approach: capture (grab + hide)
 
@@ -36,25 +36,22 @@ host cursor can't get stuck hidden.
 > warp-to-center + relative deltas (`src/ui.rs:532`), *not* absolute
 > positioning. There is no hidden absolute backend to tap.
 
-## What `snow` does (the absolute pattern)
+## The absolute pattern (classic Mac OS)
 
-`snow` (sibling repo `../snow`, a classic Macintosh emulator) gets seamless,
-capture-free, 1:1 mouse alignment via an **absolute** mode that bypasses the
-emulated mouse hardware entirely:
+Some classic Macintosh emulators get seamless, capture-free, 1:1 mouse
+alignment via an **absolute** mode that bypasses the emulated mouse hardware
+entirely. It works because **classic Mac OS exposes a stable, documented,
+memory-mapped cursor position you may overwrite, and cooperatively re-reads
+it**:
 
-- `mouse_update_abs(x, y)` writes the host cursor position directly into classic
-  Mac OS **low-memory globals**: `MTemp` (MouseTemp) and `RawMouse`, then sets
-  the `CrsrNew` flag. See `core/src/mac/compact/bus.rs:476` (and the Mac II
-  variant in `core/src/mac/macii/bus.rs`).
+- The host cursor position is written directly into classic Mac OS **low-memory
+  globals** — `MTemp` (MouseTemp) and `RawMouse` — and the `CrsrNew` flag is
+  set.
 - Mac OS polls those globals every tick and "jumps" its cursor to the new
-  position. The ADB mouse (`core/src/mac/adb/mouse.rs`) stays relative but is
-  sidestepped in absolute mode.
+  position. The emulated ADB mouse stays relative but is sidestepped in
+  absolute mode.
 - The frontend exposes a `MouseMode { Absolute, RelativeHw, Disabled }` seam and
-  calls `update_mouse(abs_p, rel_p)` (`frontend_egui/src/emulator.rs:434`),
-  dispatching `MouseUpdateAbsolute { x, y }` vs `MouseUpdateRelative { .. }`.
-
-It works because **classic Mac OS exposes a stable, documented, memory-mapped
-cursor position you may overwrite, and cooperatively re-reads it.**
+  dispatches an absolute vs. relative update per event.
 
 ## Why it does not port to IRIS/IRIX cheaply
 
@@ -70,7 +67,7 @@ IRIX has no equivalent of that mechanism:
   paths are the input protocol (absolute valuators / XInput) or
   `XWarpPointer`/XTEST — none of which the emulated SGI PS/2-style mouse exposes.
 
-## What a Snow-like absolute mode would actually require here
+## What an absolute mode would actually require here
 
 One of:
 
@@ -88,8 +85,9 @@ None of these is a small port.
 ## Recommendation
 
 Capture is the correct, standard approach for an X11 guest — it is what
-SGI/Unix emulators do, and what snow itself falls back to (`RelativeHw`). The
-one piece genuinely worth borrowing from snow is its clean frontend seam: a
-`MouseMode` enum + `update_mouse(abs, rel)`. Adopting that abstraction now
-(even with only relative/capture wired up) would make options 1 or 2 drop-in
-later, without committing to the absolute backend today.
+SGI/Unix emulators do, and what the classic-Mac absolute approach itself falls
+back to (a relative-hardware mode) when absolute isn't available. The one piece
+genuinely worth borrowing is the clean frontend seam: a `MouseMode` enum +
+`update_mouse(abs, rel)`. Adopting that abstraction now (even with only
+relative/capture wired up) would make options 1 or 2 drop-in later, without
+committing to the absolute backend today.

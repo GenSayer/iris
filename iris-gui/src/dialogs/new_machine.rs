@@ -1,7 +1,7 @@
 use eframe::egui::{self, Color32, ComboBox, Grid, RichText, TextEdit};
 use iris::config::{MachineConfig, ScsiDeviceConfig, VALID_BANK_SIZES};
 
-/// "New machine" startup dialog — analogous to snow's ModelSelectionDialog.
+/// "New machine" startup dialog.
 /// Pops up at first run (or on `File → New machine…`) to bootstrap a config.
 pub struct NewMachineDialog {
     open: bool,

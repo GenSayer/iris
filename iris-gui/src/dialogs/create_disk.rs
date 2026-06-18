@@ -2,7 +2,6 @@ use eframe::egui::{self, Color32, Grid, RichText, Slider, TextEdit};
 use std::path::PathBuf;
 
 /// Modal that creates a blank zero-filled disk image for a chosen SCSI ID.
-/// Mirrors snow's DiskImageDialog.
 pub struct CreateDiskDialog {
     open: bool,
     scsi_id: u8,
