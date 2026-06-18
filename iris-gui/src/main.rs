@@ -1007,10 +1007,13 @@ impl App {
         // ¼× steps, so we don't snap here — when we must clamp to the monitor we
         // use the full fitting size (the footer readout reports the actual scale
         // and tags non-crisp ones) rather than dropping a whole step.
+        // Largest scale that fits, never exceeding the requested target, floored
+        // at a sane minimum — but the floor must not exceed target, or clamp()
+        // panics (min > max) on a degenerate target from a zeroed/garbage scale.
         let scale = target
             .min((avail_w.max(64.0)) / fb_px.x)
             .min((avail_h.max(64.0)) / fb_px.y)
-            .clamp(0.05, target);
+            .clamp(0.05_f32.min(target), target);
         let inner = egui::vec2(fb_px.x * scale + chrome_w, fb_px.y * scale + chrome_h);
         ctx.send_viewport_cmd(ViewportCommand::InnerSize(inner));
     }

@@ -151,7 +151,11 @@ pub const UI_SCALE_DEFAULT: f32 = 1.25;
 pub const VM_SCALE_MIN: f32 = 0.5;
 pub const VM_SCALE_MAX: f32 = 3.0;
 pub const VM_SCALE_STEP: f64 = 0.25;
-pub const VM_SCALE_DEFAULT: f32 = 1.0;
+/// Default windowed VM scale. 0.75 (not native 1.0) so a from-scratch window
+/// opens *target-bound* on a typical laptop — sized to the picture exactly,
+/// rather than "as big as the monitor allows" which clamps to a fractional
+/// scale and leaves letterbox slack around the 5:4 display.
+pub const VM_SCALE_DEFAULT: f32 = 0.75;
 
 /// First-launch window size in logical points. Sized to match the *running*
 /// window for the standard 1280×1024 display so the picture doesn't visibly
@@ -230,9 +234,16 @@ impl GuiSettings {
     }
 
     pub fn load() -> Self {
-        let Some(path) = Self::config_path() else { return Self::default(); };
-        let Ok(text) = std::fs::read_to_string(&path) else { return Self::default(); };
-        let mut s: Self = serde_json::from_str(&text).unwrap_or_default();
+        // Load from disk when present, else start from defaults — but ALWAYS
+        // fall through to the sanitizer below. A missing or unreadable file used
+        // to early-return `Self::default()`, which leaves `vm_scale`/`ui_scale`
+        // at the struct's zero `Default` (0.0, not the serde field defaults).
+        // A 0.0 vm_scale then panics the window-fit math (`clamp` min > max), so
+        // a first-ever run with no gui.json crashed instead of using defaults.
+        let mut s: Self = Self::config_path()
+            .and_then(|path| std::fs::read_to_string(&path).ok())
+            .and_then(|text| serde_json::from_str::<Self>(&text).ok())
+            .unwrap_or_default();
         // Sanitize a stale/out-of-range persisted scale. A value below the
         // minimum is junk left by an older build whose keyboard zoom floored
         // at 0.5 (the UI can no longer produce sub-minimum values), so reset
