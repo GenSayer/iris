@@ -183,9 +183,11 @@ struct App {
     /// the status footer next to MIPS. Crispness (NEAREST vs LINEAR) tracks the
     /// *device-pixel* scale via `fb_nearest`, which this can differ from on HiDPI.
     fb_scale: f32,
-    /// Set on Start (and on a VM/UI scale change); consumed on the next real
+    /// Set on a VM-scale slider or UI-zoom change; consumed on the next real
     /// REX3 frame to resize the window so the display lands at the chosen VM
     /// scale (clamped + ½×-snapped to fit the monitor; see `framebuffer_panel`).
+    /// Not set on Start — the window size is latched at app load, so launching
+    /// the VM never resizes the window.
     pending_fb_snap: bool,
     /// True on a first-ever launch (no persisted window size). Consumed on the
     /// first frame that knows the monitor size, to fit the window to a 1280×1024
@@ -442,11 +444,10 @@ impl App {
         }
         self.jit.export();
         self.emu.send(Cmd::Start(Box::new(self.cfg.clone())));
-        // Snap the window to the emulated display once its first frame arrives
-        // (we don't know the guest resolution until then). The on-Start snap
-        // supersedes any pending first-launch fit.
-        self.pending_fb_snap = true;
-        self.pending_launcher_fit = false;
+        // Don't resize the window when the VM launches — its size is latched at
+        // app load (the saved window size, or the first-launch fit to vm_scale)
+        // and the guest display is letterboxed into it. Only the VM-scale slider
+        // and UI zoom re-snap the window after that.
         // Drop the previous run's cached texture so we never flash its last
         // frame before the new run renders (the shared FrameSink is reset
         // worker-side on Start; this clears the GUI's mirror of it).
