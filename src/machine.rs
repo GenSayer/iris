@@ -749,6 +749,20 @@ impl Machine {
         self.hpc3.seeq().nat_control().observed_gateway()
     }
 
+    /// Move the running NAT onto a new subnet without a reboot: the NAT thread
+    /// swaps its `(gateway, client, netmask)` and flushes connection state on
+    /// its next loop. Typically gateway = network+1, client = network+2.
+    pub fn set_nat_subnet(&self, gateway: std::net::Ipv4Addr, client: std::net::Ipv4Addr, netmask: std::net::Ipv4Addr) {
+        self.hpc3.seeq().nat_control().request_subnet(gateway, client, netmask);
+    }
+
+    /// Tell the NAT engine the host's own IPv4 networks `(network, prefix)` so it
+    /// won't adopt a guest subnet that overlaps them (which would shadow the
+    /// host's real LAN). The embedder gathers these from the host interfaces.
+    pub fn set_host_nets(&self, nets: Vec<(std::net::Ipv4Addr, u8)>) {
+        self.hpc3.seeq().nat_control().set_host_nets(nets);
+    }
+
     /// Step the CPU `n` instructions in-line on the calling thread, with all
     /// peripheral threads stopped so the CPU sees no external interrupts.
     /// Used by Phase 3.3 snapshot determinism validator.

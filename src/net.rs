@@ -480,6 +480,17 @@ pub struct NatControl {
     /// gateway. `0` = none seen. Lets the GUI tell what gateway the guest
     /// expects (and whether the host-side fix will satisfy it).
     pub observed_gateway: AtomicU32,
+    /// Pending live subnet change (gateway / client / netmask as u32), latched
+    /// by `apply_subnet`. Lets an embedder move the running NAT onto a new
+    /// subnet without a reboot; applied on the NAT thread's next loop.
+    pub apply_gateway: AtomicU32,
+    pub apply_client:  AtomicU32,
+    pub apply_netmask: AtomicU32,
+    pub apply_subnet:  AtomicBool,
+    /// The host's own IPv4 networks `(network, prefix)`, set by the embedder.
+    /// NAT refuses to plug-and-play *adopt* a subnet that overlaps one of these,
+    /// so the emulator never shadows the host's real LAN / VPN / Docker network.
+    pub host_nets: Mutex<Vec<(u32, u8)>>,
 }
 
 impl NatControl {
@@ -493,6 +504,11 @@ impl NatControl {
             guest_frames: AtomicU64::new(0),
             observed_guest_ip: AtomicU32::new(0),
             observed_gateway: AtomicU32::new(0),
+            apply_gateway: AtomicU32::new(0),
+            apply_client:  AtomicU32::new(0),
+            apply_netmask: AtomicU32::new(0),
+            apply_subnet:  AtomicBool::new(false),
+            host_nets:     Mutex::new(Vec::new()),
         })
     }
     pub fn dbg_tcp(&self)  -> bool { self.debug_tcp.load(Ordering::Relaxed) }
@@ -515,6 +531,32 @@ impl NatControl {
     }
     /// Number of guest frames the NAT engine has seen so far.
     pub fn guest_frames(&self) -> u64 { self.guest_frames.load(Ordering::Relaxed) }
+
+    /// Ask the running NAT to move to a new subnet (applied on the NAT thread's
+    /// next loop: config swapped + connection tables flushed). No reboot needed.
+    pub fn request_subnet(&self, gateway: Ipv4Addr, client: Ipv4Addr, netmask: Ipv4Addr) {
+        self.apply_gateway.store(u32::from(gateway), Ordering::Relaxed);
+        self.apply_client.store(u32::from(client), Ordering::Relaxed);
+        self.apply_netmask.store(u32::from(netmask), Ordering::Relaxed);
+        self.apply_subnet.store(true, Ordering::Release);
+    }
+
+    /// Record the host's own IPv4 networks (network address + prefix) so NAT
+    /// won't adopt a subnet that overlaps them.
+    pub fn set_host_nets(&self, nets: Vec<(Ipv4Addr, u8)>) {
+        *self.host_nets.lock() = nets.into_iter().map(|(n, p)| (u32::from(n), p)).collect();
+    }
+
+    /// Whether `net/prefix` overlaps any recorded host network — i.e. adopting
+    /// or moving onto it would shadow a network the host already uses.
+    pub fn host_conflict(&self, net: Ipv4Addr, prefix: u8) -> bool {
+        let a = u32::from(net);
+        self.host_nets.lock().iter().any(|&(b, hp)| {
+            let p = prefix.min(hp);
+            let mask = if p == 0 { 0 } else { u32::MAX << (32 - p) };
+            (a & mask) == (b & mask)
+        })
+    }
 }
 
 #[derive(Default)]
@@ -692,6 +734,22 @@ impl NatEngine {
                 self.tcp_fwd_pending.clear();
             }
 
+            // Live subnet change requested by an embedder: swap the gateway /
+            // client / netmask and flush connection state so nothing lingers on
+            // the old subnet. The guest then reaches the new gateway as soon as
+            // it ARPs for it (or routes to it) — no reboot. Adoption still
+            // applies if the guest is on a different subnet again.
+            if self.ctl.apply_subnet.swap(false, Ordering::AcqRel) {
+                self.config.gateway_ip = Ipv4Addr::from(self.ctl.apply_gateway.load(Ordering::Relaxed));
+                self.config.client_ip  = Ipv4Addr::from(self.ctl.apply_client.load(Ordering::Relaxed));
+                self.config.netmask    = Ipv4Addr::from(self.ctl.apply_netmask.load(Ordering::Relaxed));
+                self.tcp_nat.clear();
+                self.tcp_tw.clear();
+                self.udp_nat.clear();
+                self.icmp_nat.clear();
+                self.tcp_fwd_pending.clear();
+            }
+
             // FIXME: investigate interrupt race between TX completion and RX delivery.
             // When a gateway reply (e.g. ICMP echo) is generated synchronously while
             // draining TX frames, it can arrive at IRIX while the TX completion interrupt
@@ -801,28 +859,32 @@ impl NatEngine {
             let spa = [frame[28], frame[29], frame[30], frame[31]];
             let tpa = Ipv4Addr::new(frame[38], frame[39], frame[40], frame[41]);
             let t = tpa.octets();
-            // TEMP diagnostic: every guest ARP request + the adoption decision.
-            eprintln!("iris NET-DIAG: guest ARP who-has {} tell {}.{}.{}.{}  (nat gw={} client={} guest_frames={})",
+            dlog_dev!(LogModule::Net, "NAT guest ARP who-has {} tell {}.{}.{}.{} (nat gw={} client={} guest_frames={})",
                 tpa, spa[0], spa[1], spa[2], spa[3],
                 self.config.gateway_ip, self.config.client_ip,
                 self.ctl.guest_frames.load(Ordering::Relaxed));
             if !tpa.is_unspecified() && t != spa && t[0] == spa[0] && t[1] == spa[1] && t[2] == spa[2] {
                 self.ctl.observed_gateway.store(u32::from(tpa), Ordering::Relaxed);
+                let adopt_net = Ipv4Addr::new(t[0], t[1], t[2], 0);
+                let conflicts = self.ctl.host_conflict(adopt_net, 24);
                 // Plug-and-play: while nothing is routing yet, adopt the gateway
-                // the guest is asking for — move NAT onto the guest's subnet so
-                // it answers that ARP and traffic starts flowing, with no config
-                // change or restart. Self-limiting: once any IP frame routes
-                // (guest_frames > 0) we stop, so a working setup is never moved.
+                // the guest is asking for so NAT answers that ARP and traffic
+                // flows — no config change or restart. Self-limiting: once any IP
+                // frame routes (guest_frames > 0) we stop, so a working setup is
+                // never moved. Refused when the guest's subnet overlaps a host
+                // network: adopting it would shadow the host's real LAN, so we
+                // leave the guest unrouted and the GUI asks the user to change the
+                // guest's ec0 to a non-overlapping subnet instead.
                 if self.config.gateway_ip != tpa
                     && self.ctl.guest_frames.load(Ordering::Relaxed) == 0
+                    && !conflicts
                 {
-                    eprintln!("iris NET-DIAG: ADOPTING gateway {} (was {})", tpa, self.config.gateway_ip);
+                    dlog_dev!(LogModule::Net, "NAT adopting gateway {} (was {})", tpa, self.config.gateway_ip);
                     self.config.gateway_ip = tpa;
                     self.config.client_ip = Ipv4Addr::new(t[0], t[1], t[2], 2);
                     self.config.netmask = Ipv4Addr::new(255, 255, 255, 0);
-                } else {
-                    eprintln!("iris NET-DIAG: NOT adopting {} (cur gw={}, guest_frames={})",
-                        tpa, self.config.gateway_ip, self.ctl.guest_frames.load(Ordering::Relaxed));
+                } else if conflicts {
+                    dlog_dev!(LogModule::Net, "NAT refusing to adopt {}: subnet {}/24 overlaps a host network", tpa, adopt_net);
                 }
             }
         }

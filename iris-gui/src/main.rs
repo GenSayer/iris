@@ -935,12 +935,16 @@ impl App {
         let state = self.emu.net_state();
         let guest = self.emu.status.net_guest_ip;
         let gw = self.emu.status.net_guest_gateway;
-        let nat_gw = self.emu.status.net_nat_gateway;
-        // What ec0 must be for NAT to work, derived from the configured subnet
-        // (gateway = network+1, Indy = network+2).
+        // The configured NAT subnet, for fresh-guest guidance and the
+        // "match the guest" action. IRIS is plug-and-play: it ADOPTS whatever
+        // gateway the guest ARPs for (src/net.rs), so the guest's own subnet is
+        // fine — there is no fixed address it must use once ec0 is configured.
         let (eb, ep) = netplan::parse_cidr(self.cfg.nat_subnet.as_deref());
-        let expected_line = netplan::classify(eb, ep, &[]).derived.map(|d| format!(
-            "IRIS expects the Indy's ec0 at {} (gateway {}, mask {}).", d.client, d.gateway, d.netmask));
+        let cfg_net = netplan::classify(eb, ep, &[]).derived;
+        let fresh_hint = cfg_net.as_ref().map(|d| format!(
+            "If ec0 is unconfigured, the simplest setup is IRIS's defaults: ec0 {}, gateway {}, mask {}.",
+            d.client, d.gateway, d.netmask));
+        let mut switch_to: Option<String> = None;
         let mut open = true;
         egui::Window::new("Check networking")
             .collapsible(false)
@@ -970,25 +974,20 @@ impl App {
                     ui.label(RichText::new("No guest traffic seen yet").strong());
                     ui.label("If IRIX just booted, give it a few seconds and re-check. \
                               Otherwise ec0 may be unconfigured.");
-                    if let Some(l) = &expected_line { ui.label(RichText::new(l).weak()); }
+                    if let Some(l) = &fresh_hint { ui.label(RichText::new(l).weak()); }
                     return;
                 };
                 let o = ip.octets();
-                let subnet = format!("{}.{}.{}.0/24", o[0], o[1], o[2]);
+                let guest_net = std::net::Ipv4Addr::new(o[0], o[1], o[2], 0);
                 let sub_gw = std::net::Ipv4Addr::new(o[0], o[1], o[2], 1);
                 ui.label(RichText::new("Networking is down")
                     .color(Color32::from_rgb(0xd9, 0x4a, 0x3d)).strong());
-                ui.label(format!("Your guest is using {ip} (network {subnet})."));
-                if let Some(l) = &expected_line { ui.label(RichText::new(l).weak()); }
-                if let Some(ng) = nat_gw {
-                    let no = ng.octets();
-                    ui.label(format!("IRIS's NAT is on {}.{}.{}.0/24 (gateway {ng}).", no[0], no[1], no[2]));
-                }
+                ui.label(format!("Your guest is using {ip} (network {guest_net}/24)."));
                 ui.add_space(6.0);
                 match gw {
                     Some(g) => {
                         ui.label(format!(
-                            "Its gateway is {g}, and IRIS adopts the guest's gateway automatically — this \
+                            "Its gateway is {g}, and IRIS adopts the guest's gateway automatically, so this \
                              should come up within a few seconds. Leave it a moment and re-check."));
                         ui.label(RichText::new(
                             "If it stays red, the guest's gateway may be unreachable; log in as root to \
@@ -996,16 +995,72 @@ impl App {
                     }
                     None => {
                         ui.label("Its routing table has no default gateway, so it can reach only its own \
-                                  subnet. Give it one — IRIS then adopts it automatically:");
+                                  subnet. IRIS adopts whatever gateway you point it at, so the fix is just \
+                                  to give the guest a default route (no need to match subnets by hand):");
                         ui.add_space(4.0);
-                        ui.label(RichText::new("Log in as root, open a winterm, and run:").strong());
+                        ui.label(RichText::new("Log in as root (serial console or a winterm) and run:").strong());
                         ui.code(format!("/usr/etc/route add default {sub_gw} 1"));
                         ui.label(RichText::new(
                             "Lasts until reboot; to persist it, set the default route in IRIX's network \
                              config (5.3 and 6.5 differ).").weak());
                     }
                 }
+                // Optional: align IRIS's configured subnet to the guest's, for a
+                // guest kept permanently on a fixed subnet. IRIS adopts live
+                // regardless; this just makes IRIS's default match on next boot.
+                let cfg_base = cfg_net.as_ref().map(|d| d.network);
+                if cfg_base != Some(guest_net) {
+                    ui.add_space(6.0);
+                    ui.separator();
+                    match netplan::conflict(guest_net, 24, &self.net_ifaces) {
+                        Some(h) => {
+                            // The guest's subnet is one the host itself uses.
+                            // Refuse to move IRIS there (it would shadow the
+                            // host's real network); tell the user to renumber the
+                            // guest onto IRIS's own subnet instead.
+                            ui.label(RichText::new(format!(
+                                "The guest's subnet {guest_net}/24 overlaps your host network ({} {}). \
+                                 IRIS won't move its NAT onto your real network, so change the Indy's \
+                                 address instead — put ec0 on IRIS's own subnet:", h.name, h.addr))
+                                .color(Color32::from_rgb(0xd9, 0x4a, 0x3d)));
+                            if let Some(d) = cfg_net.as_ref() {
+                                ui.add_space(4.0);
+                                ui.label(RichText::new("Log in as root (serial console or a winterm) and run:").strong());
+                                let e = netfix::ExpectedNet { ip: d.client, gateway: d.gateway, netmask: d.netmask };
+                                for cmd in netfix::runtime_fix_commands(&e) {
+                                    ui.code(cmd);
+                                }
+                                ui.label(RichText::new(format!(
+                                    "That puts ec0 on {} (gateway {}), which doesn't clash with your \
+                                     network. Re-check after.", d.client, d.gateway)).weak());
+                            }
+                        }
+                        None => {
+                            let where_ = cfg_net.as_ref()
+                                .map(|d| format!("{}/{}", d.network, d.prefix))
+                                .unwrap_or_else(|| "a different subnet".into());
+                            ui.label(RichText::new(format!(
+                                "IRIS's NAT defaults to {where_}. You can make IRIS default to the guest's \
+                                 subnet instead:")).weak());
+                            if ui.button(format!("Set IRIS's NAT subnet to {guest_net}/24")).clicked() {
+                                switch_to = Some(format!("{guest_net}/24"));
+                            }
+                        }
+                    }
+                }
             });
+        if let Some(s) = switch_to {
+            self.cfg.nat_subnet = Some(s.clone());
+            self.mark_dirty();
+            if self.emu.is_running() {
+                // Apply to the running NAT so the guest can route immediately,
+                // and persist for next launch.
+                self.emu.send(Cmd::SetNatSubnet(s.clone()));
+                self.toast(format!("NAT subnet set to {s} (applied live)"));
+            } else {
+                self.toast(format!("NAT subnet set to {s} (applies on next launch)"));
+            }
+        }
         if !open {
             self.show_net_check = false;
         }

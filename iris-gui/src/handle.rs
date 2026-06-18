@@ -16,6 +16,9 @@ pub enum Cmd {
     /// Type `halt\n` at the IRIX serial console in-process (no loopback socket)
     /// for a clean guest shutdown.
     HaltIrix,
+    /// Move the running NAT onto a new subnet live (CIDR string, e.g.
+    /// `192.168.1.0/24`) — no reboot. Ignored if not running / invalid.
+    SetNatSubnet(String),
     SaveState(String),
     RestoreState(String),
     Screenshot(PathBuf),
@@ -315,6 +318,11 @@ fn worker_loop(
                 }));
                 match result {
                     Ok(m) => {
+                        // Tell the NAT the host's own networks so it won't adopt a
+                        // guest subnet that overlaps the host's real LAN/VPN/Docker.
+                        m.set_host_nets(
+                            crate::netplan::gather_host_ifaces()
+                                .into_iter().map(|h| (h.network, h.prefix)).collect());
                         *ps2_slot.lock() = Some(m.get_ps2());
                         // Latch REX3's cycle counter for the live MIPS estimate.
                         cycles = m.get_rex3().map(|r| r.cycles.clone());
@@ -336,6 +344,15 @@ fn worker_loop(
                 match machine.as_ref() {
                     Some(m) => m.inject_serial_console(b"halt\n"),
                     None => { let _ = evt_tx.send(Evt::Error("halt: not running".into())); }
+                }
+            }
+            Ok(Cmd::SetNatSubnet(cidr)) => {
+                match machine.as_ref() {
+                    Some(m) => match iris::config::parse_nat_subnet(&cidr) {
+                        Ok((gateway, client, netmask)) => m.set_nat_subnet(gateway, client, netmask),
+                        Err(e) => { let _ = evt_tx.send(Evt::Error(format!("set NAT subnet '{cidr}': {e}"))); }
+                    },
+                    None => { let _ = evt_tx.send(Evt::Error("set NAT subnet: not running".into())); }
                 }
             }
             Ok(Cmd::Stop) => {
