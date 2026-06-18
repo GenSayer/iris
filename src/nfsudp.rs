@@ -194,6 +194,16 @@ impl NfsBacking {
         self.attr(id)
     }
 
+    /// Truncate (or extend) file `id` to `size` bytes. Used by SETATTR.
+    pub fn truncate(&mut self, id: u64, size: u64) -> bool {
+        let Some(abs) = self.abs_of(id) else { return false };
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&abs)
+            .and_then(|f| f.set_len(size))
+            .is_ok()
+    }
+
     /// Create an empty regular file `name` in `dirid`; returns its fileid.
     pub fn create(&mut self, dirid: u64, name: &[u8]) -> Option<u64> {
         let comp = valid_component(name)?;
@@ -542,14 +552,22 @@ pub const NFS_V3: u32 = 3;
 // NFSv3 procedure numbers.
 const PROC3_NULL: u32 = 0;
 const PROC3_GETATTR: u32 = 1;
+const PROC3_SETATTR: u32 = 2;
 const PROC3_LOOKUP: u32 = 3;
 const PROC3_ACCESS: u32 = 4;
 const PROC3_READ: u32 = 6;
+const PROC3_WRITE: u32 = 7;
+const PROC3_CREATE: u32 = 8;
+const PROC3_MKDIR: u32 = 9;
+const PROC3_REMOVE: u32 = 12;
+const PROC3_RMDIR: u32 = 13;
+const PROC3_RENAME: u32 = 14;
 const PROC3_READDIR: u32 = 16;
 const PROC3_READDIRPLUS: u32 = 17;
 const PROC3_FSSTAT: u32 = 18;
 const PROC3_FSINFO: u32 = 19;
 const PROC3_PATHCONF: u32 = 20;
+const PROC3_COMMIT: u32 = 21;
 
 // nfsstat3 values we use.
 const NFS3_OK: u32 = 0;
@@ -557,6 +575,7 @@ const NFS3ERR_IO: u32 = 5;
 const NFS3ERR_NOENT: u32 = 2;
 const NFS3ERR_NOTDIR: u32 = 20;
 const NFS3ERR_STALE: u32 = 70;
+const NFS3ERR_NOTEMPTY: u32 = 66;
 
 // fsinfo3 sizes. Reads can be large (the NAT fragments outbound); writes need
 // the inbound-reassembly increment before a large wtmax is safe.
@@ -637,7 +656,14 @@ pub fn nfs3_call(call: &RpcCall, args: &mut Cur, b: &mut NfsBacking) -> Vec<u8> 
         PROC3_FSINFO => nfs3_fsinfo(call, args, b),
         PROC3_FSSTAT => nfs3_fsstat(call, args, b),
         PROC3_PATHCONF => nfs3_pathconf(call, args, b),
-        // write-side procedures arrive in increment 4.
+        PROC3_SETATTR => nfs3_setattr(call, args, b),
+        PROC3_WRITE => nfs3_write(call, args, b),
+        PROC3_CREATE => nfs3_create(call, args, b, false),
+        PROC3_MKDIR => nfs3_create(call, args, b, true),
+        PROC3_REMOVE => nfs3_remove(call, args, b, false),
+        PROC3_RMDIR => nfs3_remove(call, args, b, true),
+        PROC3_RENAME => nfs3_rename(call, args, b),
+        PROC3_COMMIT => nfs3_commit(call, args, b),
         _ => reply(call.xid, accept::PROC_UNAVAIL).into_bytes(),
     }
 }
@@ -810,6 +836,248 @@ fn nfs3_pathconf(call: &RpcCall, args: &mut Cur, b: &mut NfsBacking) -> Vec<u8> 
     x.bool(false); // case_insensitive
     x.bool(true); // case_preserving
     x.into_bytes()
+}
+
+// ── NFSv3 write-side procedures (increment 4) ───────────────────────────────
+
+/// `wcc_data`: a (omitted) pre-op attr followed by the post-op attr.
+fn put_wcc_data(x: &mut Xdr, post: Option<&Attr>) {
+    x.bool(false); // pre_op_attr omitted
+    put_post_op_attr(x, post);
+}
+
+/// Parse `sattr3`, returning the requested size if `set_size` is true (we honor
+/// truncation; mode/uid/gid/atime/mtime are accepted-and-ignored). Outer `None`
+/// means the structure was malformed.
+fn parse_sattr3(c: &mut Cur) -> Option<Option<u64>> {
+    if c.u32()? != 0 { c.u32()?; } // set_mode
+    if c.u32()? != 0 { c.u32()?; } // set_uid
+    if c.u32()? != 0 { c.u32()?; } // set_gid
+    let size = if c.u32()? != 0 { Some(c.u64()?) } else { None };
+    if c.u32()? == 2 { c.u32()?; c.u32()?; } // set_atime = SET_TO_CLIENT_TIME
+    if c.u32()? == 2 { c.u32()?; c.u32()?; } // set_mtime = SET_TO_CLIENT_TIME
+    Some(size)
+}
+
+fn nfs3_setattr(call: &RpcCall, args: &mut Cur, b: &mut NfsBacking) -> Vec<u8> {
+    let Some(fid) = get_fh(args) else { return garbage(call.xid) };
+    let Some(size) = parse_sattr3(args) else { return garbage(call.xid) };
+    if let Some(sz) = size {
+        b.truncate(fid, sz);
+    }
+    let mut x = reply(call.xid, accept::SUCCESS);
+    match b.attr(fid) {
+        Some(a) => {
+            x.u32(NFS3_OK);
+            put_wcc_data(&mut x, Some(&a));
+        }
+        None => {
+            x.u32(NFS3ERR_STALE);
+            put_wcc_data(&mut x, None);
+        }
+    }
+    x.into_bytes()
+}
+
+fn nfs3_write(call: &RpcCall, args: &mut Cur, b: &mut NfsBacking) -> Vec<u8> {
+    let Some(fid) = get_fh(args) else { return garbage(call.xid) };
+    let Some(offset) = args.u64() else { return garbage(call.xid) };
+    let Some(_count) = args.u32() else { return garbage(call.xid) };
+    let Some(_stable) = args.u32() else { return garbage(call.xid) };
+    let Some(data) = args.opaque() else { return garbage(call.xid) };
+    let mut x = reply(call.xid, accept::SUCCESS);
+    match b.write(fid, offset, data) {
+        Some(a) => {
+            x.u32(NFS3_OK);
+            put_wcc_data(&mut x, Some(&a));
+            x.u32(data.len() as u32); // count written
+            x.u32(2); // committed = FILE_SYNC
+            x.fixed(&[0u8; 8]); // write verifier
+        }
+        None => {
+            x.u32(NFS3ERR_IO);
+            put_wcc_data(&mut x, b.attr(fid).as_ref());
+        }
+    }
+    x.into_bytes()
+}
+
+/// CREATE/MKDIR share a shape: diropargs3 then attrs we ignore. `dir` true =
+/// MKDIR. On success returns post_op fh + attrs + dir wcc.
+fn nfs3_create(call: &RpcCall, args: &mut Cur, b: &mut NfsBacking, dir: bool) -> Vec<u8> {
+    let Some(parent) = get_fh(args) else { return garbage(call.xid) };
+    let name = match args.opaque() {
+        Some(n) => n.to_vec(),
+        None => return garbage(call.xid),
+    };
+    // The remaining args (createmode3 + sattr3, or MKDIR's sattr3) are ignored.
+    let made = if dir { b.mkdir(parent, &name) } else { b.create(parent, &name) };
+    let mut x = reply(call.xid, accept::SUCCESS);
+    match made {
+        Some(fid) => {
+            x.u32(NFS3_OK);
+            x.bool(true); // post_op_fh3: handle follows
+            put_fh(&mut x, fid);
+            put_post_op_attr(&mut x, b.attr(fid).as_ref());
+            put_wcc_data(&mut x, b.attr(parent).as_ref());
+        }
+        None => {
+            x.u32(NFS3ERR_IO);
+            x.bool(false); // no handle
+            put_post_op_attr(&mut x, None);
+            put_wcc_data(&mut x, b.attr(parent).as_ref());
+        }
+    }
+    x.into_bytes()
+}
+
+/// REMOVE/RMDIR: diropargs3 → dir wcc. `dir` true = RMDIR.
+fn nfs3_remove(call: &RpcCall, args: &mut Cur, b: &mut NfsBacking, dir: bool) -> Vec<u8> {
+    let Some(parent) = get_fh(args) else { return garbage(call.xid) };
+    let name = match args.opaque() {
+        Some(n) => n.to_vec(),
+        None => return garbage(call.xid),
+    };
+    let ok = if dir { b.rmdir(parent, &name) } else { b.remove(parent, &name) };
+    let mut x = reply(call.xid, accept::SUCCESS);
+    x.u32(if ok {
+        NFS3_OK
+    } else if dir {
+        NFS3ERR_NOTEMPTY
+    } else {
+        NFS3ERR_NOENT
+    });
+    put_wcc_data(&mut x, b.attr(parent).as_ref());
+    x.into_bytes()
+}
+
+fn nfs3_rename(call: &RpcCall, args: &mut Cur, b: &mut NfsBacking) -> Vec<u8> {
+    let Some(from_dir) = get_fh(args) else { return garbage(call.xid) };
+    let from_name = match args.opaque() {
+        Some(n) => n.to_vec(),
+        None => return garbage(call.xid),
+    };
+    let Some(to_dir) = get_fh(args) else { return garbage(call.xid) };
+    let to_name = match args.opaque() {
+        Some(n) => n.to_vec(),
+        None => return garbage(call.xid),
+    };
+    let ok = b.rename(from_dir, &from_name, to_dir, &to_name);
+    let mut x = reply(call.xid, accept::SUCCESS);
+    x.u32(if ok { NFS3_OK } else { NFS3ERR_IO });
+    put_wcc_data(&mut x, b.attr(from_dir).as_ref()); // fromdir wcc
+    put_wcc_data(&mut x, b.attr(to_dir).as_ref()); // todir wcc
+    x.into_bytes()
+}
+
+fn nfs3_commit(call: &RpcCall, args: &mut Cur, b: &mut NfsBacking) -> Vec<u8> {
+    let Some(fid) = get_fh(args) else { return garbage(call.xid) };
+    let _ = args.u64(); // offset
+    let _ = args.u32(); // count
+    let mut x = reply(call.xid, accept::SUCCESS);
+    x.u32(NFS3_OK); // writes are synchronous, so COMMIT is a no-op success
+    put_wcc_data(&mut x, b.attr(fid).as_ref());
+    x.fixed(&[0u8; 8]); // write verifier
+    x.into_bytes()
+}
+
+// ── server: program/version dispatch + duplicate-request cache ──────────────
+
+/// Which NFS version(s) to serve. `Auto` answers whatever the guest mounts with.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NfsVersion {
+    Auto,
+    V2,
+    V3,
+}
+
+/// Duplicate-request cache: NFS-over-UDP clients retransmit on timeout, so
+/// non-idempotent ops (WRITE/CREATE/REMOVE/...) must not be re-applied. We cache
+/// recent replies by xid and replay them. Bounded, FIFO-evicted.
+struct Drc {
+    cap: usize,
+    order: std::collections::VecDeque<u32>,
+    map: HashMap<u32, Vec<u8>>,
+}
+impl Drc {
+    fn new(cap: usize) -> Self {
+        Self { cap, order: std::collections::VecDeque::new(), map: HashMap::new() }
+    }
+    fn get(&self, xid: u32) -> Option<&Vec<u8>> {
+        self.map.get(&xid)
+    }
+    fn put(&mut self, xid: u32, reply: Vec<u8>) {
+        if self.map.contains_key(&xid) {
+            return;
+        }
+        while self.order.len() >= self.cap {
+            if let Some(old) = self.order.pop_front() {
+                self.map.remove(&old);
+            }
+        }
+        self.order.push_back(xid);
+        self.map.insert(xid, reply);
+    }
+}
+
+/// The in-core NFS server: one export + the dedup cache. The NAT calls
+/// [`handle`](Self::handle) with each guest MOUNT/NFS RPC datagram.
+pub struct NfsServer {
+    backing: NfsBacking,
+    drc: Drc,
+    version: NfsVersion,
+}
+
+impl NfsServer {
+    pub fn new(root: impl Into<PathBuf>, version: NfsVersion) -> Self {
+        Self { backing: NfsBacking::new(root), drc: Drc::new(256), version }
+    }
+
+    /// Process one RPC call datagram, returning the reply datagram (or `None` if
+    /// it isn't a parseable RPC call to ignore).
+    pub fn handle(&mut self, msg: &[u8]) -> Option<Vec<u8>> {
+        let (call, mut args) = parse_call(msg)?;
+        let idem = is_idempotent(call.prog, call.proc_num);
+        if !idem {
+            if let Some(cached) = self.drc.get(call.xid) {
+                return Some(cached.clone());
+            }
+        }
+        let out = self.dispatch(&call, &mut args);
+        if !idem {
+            self.drc.put(call.xid, out.clone());
+        }
+        Some(out)
+    }
+
+    fn dispatch(&mut self, call: &RpcCall, args: &mut Cur) -> Vec<u8> {
+        if call.prog == NFS_PROG {
+            // MOUNT (increment 6) and NFSv2 (increment 5) join this match later.
+            let want_v3 = self.version != NfsVersion::V2;
+            if call.vers == NFS_V3 && want_v3 {
+                return nfs3_call(call, args, &mut self.backing);
+            }
+            return reply(call.xid, accept::PROG_MISMATCH).into_bytes();
+        }
+        reply(call.xid, accept::PROG_UNAVAIL).into_bytes()
+    }
+}
+
+/// Whether a procedure is safe to re-run (so it skips the dedup cache).
+fn is_idempotent(prog: u32, proc_num: u32) -> bool {
+    if prog != NFS_PROG {
+        return true;
+    }
+    !matches!(
+        proc_num,
+        PROC3_SETATTR
+            | PROC3_WRITE
+            | PROC3_CREATE
+            | PROC3_MKDIR
+            | PROC3_REMOVE
+            | PROC3_RMDIR
+            | PROC3_RENAME
+    )
 }
 
 #[cfg(test)]
@@ -1090,6 +1358,86 @@ mod tests {
         assert_eq!(r.u32(), Some(1)); // attrs follow
         for _ in 0..21 { r.u32(); } // fattr3 = 84 bytes = 21 words
         assert_eq!(r.u32(), Some(RTMAX)); // rtmax
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    // ── write procedures + DRC (increment 4) ────────────────────────────────
+
+    /// Build an NFSv3 call with a chosen xid.
+    fn call_xid(xid: u32, proc_num: u32, args: &[u8]) -> Vec<u8> {
+        let mut x = Xdr::new();
+        x.u32(xid); x.u32(0); x.u32(2);
+        x.u32(NFS_PROG); x.u32(NFS_V3); x.u32(proc_num);
+        x.u32(0); x.u32(0); x.u32(0); x.u32(0); // AUTH_NULL cred+verf
+        x.fixed(args);
+        x.into_bytes()
+    }
+
+    fn lookup_fh(s: &mut NfsServer, name: &[u8]) -> u64 {
+        let mut a = Xdr::new();
+        put_fh(&mut a, ROOT_ID);
+        a.opaque(name);
+        let r = s.handle(&call_xid(1, PROC3_LOOKUP, &a.into_bytes())).unwrap();
+        let mut c = Cur::new(&r);
+        for _ in 0..6 { c.u32(); } // reply header
+        assert_eq!(c.u32(), Some(NFS3_OK));
+        u64::from_be_bytes(c.opaque().unwrap().try_into().unwrap())
+    }
+
+    #[test]
+    fn write_through_server_and_drc_dedup() {
+        let root = temp_export();
+        std::fs::write(root.join("f.bin"), b"").unwrap();
+        let mut s = NfsServer::new(&root, NfsVersion::Auto);
+        let fid = lookup_fh(&mut s, b"f.bin");
+
+        let write_args = |data: &[u8]| {
+            let mut w = Xdr::new();
+            put_fh(&mut w, fid);
+            w.u64(0); // offset
+            w.u32(data.len() as u32); // count
+            w.u32(2); // stable = FILE_SYNC
+            w.opaque(data);
+            w.into_bytes()
+        };
+
+        s.handle(&call_xid(100, PROC3_WRITE, &write_args(b"AAAA"))).unwrap();
+        assert_eq!(std::fs::read(root.join("f.bin")).unwrap(), b"AAAA");
+
+        // Same xid, different data: the DRC must replay, NOT re-apply.
+        s.handle(&call_xid(100, PROC3_WRITE, &write_args(b"BBBB"))).unwrap();
+        assert_eq!(std::fs::read(root.join("f.bin")).unwrap(), b"AAAA", "retransmit deduped");
+
+        // A fresh xid does apply.
+        s.handle(&call_xid(101, PROC3_WRITE, &write_args(b"BBBB"))).unwrap();
+        assert_eq!(std::fs::read(root.join("f.bin")).unwrap(), b"BBBB");
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn create_and_remove_via_server() {
+        let root = temp_export();
+        let mut s = NfsServer::new(&root, NfsVersion::Auto);
+
+        let mut a = Xdr::new();
+        put_fh(&mut a, ROOT_ID);
+        a.opaque(b"new.txt"); // diropargs3 (createmode/sattr3 are ignored by the handler)
+        let r = s.handle(&call_xid(1, PROC3_CREATE, &a.into_bytes())).unwrap();
+        let mut c = Cur::new(&r);
+        for _ in 0..6 { c.u32(); }
+        assert_eq!(c.u32(), Some(NFS3_OK));
+        assert!(root.join("new.txt").exists());
+
+        let mut rm = Xdr::new();
+        put_fh(&mut rm, ROOT_ID);
+        rm.opaque(b"new.txt");
+        let r = s.handle(&call_xid(2, PROC3_REMOVE, &rm.into_bytes())).unwrap();
+        let mut c = Cur::new(&r);
+        for _ in 0..6 { c.u32(); }
+        assert_eq!(c.u32(), Some(NFS3_OK));
+        assert!(!root.join("new.txt").exists());
+
         std::fs::remove_dir_all(&root).ok();
     }
 }
