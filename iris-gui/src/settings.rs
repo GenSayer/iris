@@ -10,9 +10,6 @@ use std::path::{Path, PathBuf};
 /// only, for compatibility with the standalone `iris` CLI.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct GuiSettings {
-    /// Window width / height at last close.
-    #[serde(default)]
-    pub window_size: Option<[f32; 2]>,
     /// egui UI scale (1.0 = default).
     #[serde(default = "default_ui_scale")]
     pub ui_scale: f32,
@@ -22,9 +19,6 @@ pub struct GuiSettings {
     /// resize the picture, and vice-versa.
     #[serde(default = "default_vm_scale")]
     pub vm_scale: f32,
-    /// Was the app left in fullscreen mode at last close?
-    #[serde(default)]
-    pub fullscreen: bool,
 
     /// All saved machines keyed by user-visible name. BTreeMap so menus
     /// list them in stable alphabetical order.

@@ -117,7 +117,7 @@ fn main() -> eframe::Result<()> {
         // Open large enough for the 1280×1024 display + chrome so it looks right
         // immediately; clamp to the monitor so it can't overflow a smaller
         // screen. Persisted size (once saved) takes precedence over the default.
-        .with_inner_size(prefs.window_size.unwrap_or(WINDOW_DEFAULT_SIZE))
+        .with_inner_size(WINDOW_DEFAULT_SIZE)
         .with_clamp_size_to_monitor_size(true)
         // Start hidden so the first frame can fit the window to the monitor
         // (see the reveal logic in `update`) before it's shown — the window
@@ -189,10 +189,10 @@ struct App {
     /// Not set on Start — the window size is latched at app load, so launching
     /// the VM never resizes the window.
     pending_fb_snap: bool,
-    /// True on a first-ever launch (no persisted window size). Consumed on the
-    /// first frame that knows the monitor size, to fit the window to a 1280×1024
-    /// display at the chosen VM scale so it opens at a sensible, windowed size
-    /// before the first Start. Returning users just reopen at their saved size.
+    /// Set at every launch. Consumed on the first frame that knows the monitor
+    /// size, to fit the window to a 1280×1024 display at the chosen VM scale.
+    /// Window size is no longer persisted — each launch re-derives it from
+    /// `vm_scale`, so the window opens at a consistent scale every time.
     pending_launcher_fit: bool,
     /// The window starts hidden (`with_visible(false)`) so the first frame can
     /// fit it to the monitor before it's shown. Set true once we've revealed it.
@@ -313,7 +313,7 @@ impl App {
             fullscreen: false,
             // First-ever launch (no saved size) → fit the window to the monitor
             // on the first frame instead of using the static default verbatim.
-            pending_launcher_fit: prefs.window_size.is_none(),
+            pending_launcher_fit: true,
             revealed: false,
             startup_frame: 0,
             prefs,
@@ -1493,17 +1493,6 @@ impl eframe::App for App {
         self.handle_events(ctx);
         self.maybe_autosave();
 
-        // Remember the current window size so the next launch reopens at it.
-        // inner_rect is in logical points — the same unit ViewportBuilder's
-        // with_inner_size() takes — so this round-trips regardless of UI zoom.
-        // Stored in-memory here; on_exit() (and other save() calls) persist it.
-        if let Some(r) = ctx.input(|i| i.viewport().inner_rect) {
-            let sz = r.size();
-            if sz.x.is_finite() && sz.y.is_finite() && sz.x >= 480.0 && sz.y >= 360.0 {
-                self.prefs.window_size = Some([sz.x.round(), sz.y.round()]);
-            }
-        }
-
         // F11 toggles fullscreen.
         if ctx.input(|i| i.key_pressed(egui::Key::F11)) {
             self.fullscreen = !self.fullscreen;
@@ -1565,10 +1554,11 @@ impl eframe::App for App {
             if self.emu.is_running() {
                 self.framebuffer_panel(ui);
             } else {
-                // First-ever launch: size the window to the monitor for the
-                // standard 1280×1024 display before the user sees it (the
-                // on-Start snap later re-fits to the actual guest resolution).
-                // Wait for the monitor size to be known before consuming the flag.
+                // Size the window for the standard 1280×1024 display at the
+                // chosen VM scale before the user sees it. Runs on every launch
+                // (window size isn't persisted), so the window always opens at
+                // the configured scale. Wait until the monitor size is known
+                // before consuming the flag.
                 if self.pending_launcher_fit
                     && ui.ctx().input(|i| i.viewport().monitor_size).is_some()
                 {
@@ -1759,7 +1749,6 @@ impl eframe::App for App {
     }
 
     fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
-        self.prefs.fullscreen = self.fullscreen;
         // Make sure the latest cfg lands in `machines` before save().
         if self.cfg_dirty { self.flush_machine(); } else { let _ = self.prefs.save(); }
         // Synchronously stop the machine and join the worker, so a running
