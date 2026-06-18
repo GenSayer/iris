@@ -880,6 +880,29 @@ impl App {
         }
     }
 
+    /// Mouse/keyboard capture state for the control column, sitting between the
+    /// config controls and the status footer. Only the *capture* action is a
+    /// button — releasing stays the Ctrl+Alt+Esc hotkey, because while captured
+    /// the host pointer is grabbed by the guest and can't click anything.
+    /// Caller renders this only while the machine is running.
+    fn capture_controls(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
+        if self.input_state.captured {
+            ui.label(RichText::new("Mouse/Keyboard Captured").color(Color32::LIGHT_GREEN));
+            ui.label(RichText::new("To disable: Ctrl+Alt+Esc").weak());
+        } else {
+            ui.label(RichText::new("Mouse/Keyboard Capture Disabled").weak());
+            if ui
+                .add_sized(
+                    egui::vec2(ui.available_width(), 0.0),
+                    egui::Button::new("Capture mouse/keyboard"),
+                )
+                .clicked()
+            {
+                input::engage_capture(ctx, &mut self.input_state);
+            }
+        }
+    }
+
     /// Run-state line (IRIX running / PROM / halted / stopped + MIPS). Used in
     /// the control column's status footer.
     fn run_state_label(&self, ui: &mut egui::Ui) {
@@ -1052,7 +1075,6 @@ impl App {
         // Consume the snap request before the immutable borrow of self.fb_tex.
         let do_snap = std::mem::take(&mut self.pending_fb_snap);
 
-        let mut fb_rect = egui::Rect::NOTHING;
         let mut fb_clicked = false;
         let mut new_fb_scale = 0.0;
         if let Some(tex) = &self.fb_tex {
@@ -1076,7 +1098,6 @@ impl App {
                 let response = ui.add(
                     egui::Image::new((tex.id(), size)).fit_to_exact_size(size).sense(egui::Sense::click())
                 );
-                fb_rect = response.rect;
                 // Take keyboard focus so that egui delivers Key events
                 // to us instead of routing them to other widgets when
                 // the user clicks into the FB.
@@ -1106,21 +1127,6 @@ impl App {
             input::pump(ui.ctx(), fb_clicked, &ps2, &mut self.input_state, self.cfg.mouse_scroll_pixels_per_line);
         }
 
-        // Capture hint, drawn over the framebuffer.
-        if fb_rect.is_positive() {
-            let hint = if self.input_state.captured {
-                "Ctrl+Alt+Esc to release mouse"
-            } else {
-                "Click to capture mouse / keyboard"
-            };
-            ui.painter().text(
-                fb_rect.center_bottom() + egui::vec2(0.0, -6.0),
-                egui::Align2::CENTER_BOTTOM,
-                hint,
-                egui::FontId::proportional(12.0),
-                Color32::from_white_alpha(140),
-            );
-        }
     }
 
     fn central_tabs(&mut self, ui: &mut egui::Ui) {
@@ -1469,6 +1475,12 @@ impl App {
             self.menu_list(ui, ctx);
             ui.separator();
             self.config_quick_buttons(ui);
+            // Capture status + "Capture" button — only while a machine is up
+            // (it's meaningless at the stopped state shown in the footer).
+            if self.emu.is_running() {
+                ui.separator();
+                self.capture_controls(ui, ctx);
+            }
         });
     }
 }

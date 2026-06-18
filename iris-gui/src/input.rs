@@ -102,13 +102,7 @@ pub fn pump(ctx: &egui::Context, fb_clicked: bool, ps2: &Ps2Controller, state: &
     });
 
     if want_enter {
-        state.captured = true;
-        // Anchor modifier/button state so we don't synth a spurious press for
-        // a key/button already held at capture time.
-        state.last_mods = ctx.input(|i| i.modifiers);
-        state.last_buttons = 0;
-        ctx.send_viewport_cmd(ViewportCommand::CursorVisible(false));
-        ctx.send_viewport_cmd(ViewportCommand::CursorGrab(grab_mode()));
+        engage_capture(ctx, state);
         return;
     }
 
@@ -166,6 +160,20 @@ fn grab_mode() -> CursorGrab {
     {
         CursorGrab::Locked
     }
+}
+
+/// Engage capture: grab + hide the host cursor and route input to the guest,
+/// exactly as a click on the framebuffer does. Driven both by that click (via
+/// `pump`) and by the side-panel "Capture" button. No-op if already captured.
+pub fn engage_capture(ctx: &egui::Context, state: &mut InputState) {
+    if state.captured { return; }
+    state.captured = true;
+    // Anchor modifier/button state so we don't synth a spurious press for a
+    // key/button already held at capture time.
+    state.last_mods = ctx.input(|i| i.modifiers);
+    state.last_buttons = 0;
+    ctx.send_viewport_cmd(ViewportCommand::CursorVisible(false));
+    ctx.send_viewport_cmd(ViewportCommand::CursorGrab(grab_mode()));
 }
 
 /// Release a capture: show + ungrab the host cursor and lift any modifiers
