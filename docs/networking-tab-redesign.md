@@ -103,7 +103,29 @@ sandbox (no new entitlements; no reliance on spawning external binaries).
 | **0** | Pure subnet/conflict logic (`iris-gui/src/netplan.rs`) + `if-addrs`: parse/compose CIDR, mask presets, first-free, conflict, sanity tiers, snap, derived addrs — 15 unit tests. No UI. | low | **done** |
 | **1** | Networking tab UI on Phase 0: network preset combo, mask combo (8/12/16/22/24/25/26 + custom bits), CIDR field, derived line + conflict ✓/⚠, override modal (Cancel / Use suggested / Override), Add-forward menu (Telnet/FTP/Custom), NFS blurb + live mount cmd, troubleshooting-window Indy address. Network edits now mark cfg dirty. | low | **done** |
 | **2** | FTP ALG in `net.rs`: rewrite passive-mode `227` replies on an inbound FTP control forward, bind a localhost data listener, register a transient (FIFO-bounded) data forward. Pure parse/rewrite unit-tested. | med | **done** |
-| **3** | In-app file bridge (TCP-peer seam → FTP-passive client → UI → guest auto-provision; rcp later). | high | pending |
+| **3** | In-app file bridge — see decision below. | high | pending |
+
+### Phase 3 plan (decided 2026-06-18)
+Architecture **B** (pure NAT-side client, no host sockets). FTP reuses suppaftp's
+protocol code via a **transport-generic fork** rather than a hand-rolled client —
+spec in `docs/suppaftp-emu-fork-prompt.md` (make suppaftp's sync client generic
+over an `FtpConnector` trait; default `TcpConnector` preserves behavior; passive
+first; TLS only on the TCP path). With a virtual-net connector **no ALG/PASV
+rewrite is needed** for the bridge (we reach the guest's PASV address directly on
+the virtual net; the Phase 2 ALG stays only for the external-client forward).
+
+Two tracks:
+- **suppaftp-emu fork** — separate crate/repo, driven by the prompt (user kicks
+  this off). IRIS links it by path/git.
+- **IRIS foundation** (resumes once the crate API exists): (1) `NatEngine`
+  in-process TCP-peer seam — generalize `TcpFwdPending`/`NatTcpEntry`'s
+  `stream: TcpStream` to `{ HostSocket(TcpStream), InProc(..) }`; (2)
+  `VirtualTcpStream: Read+Write` + a `VirtualConnector` impl of the crate's
+  `FtpConnector`; (3) **dual-pane** UI (rfd Browse + MRU local, FTP `LIST`/`CWD`
+  for the Indy); (4) rcp (hand-rolled — no crate exists); (5) guest daemon
+  auto-provision via the `netfix` serial path.
+
+Status: paused after delivering the fork prompt; IRIS side not started.
 
 ### Phase 2 implementation notes / limits
 - Works because the NAT *relays application bytes* between an OS host socket and
