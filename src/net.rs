@@ -622,6 +622,68 @@ struct TcpFwdPending {
     client_isn: u32,        // ISN we put in the synthetic SYN to the guest
 }
 
+/// FTP application-layer gateway (passive mode). If `payload` — server→client
+/// bytes on an FTP control connection — contains a `227 Entering Passive Mode
+/// (h1,h2,h3,h4,p1,p2)` reply, rewrite the address tuple to advertise
+/// `host`:`host_port` and return `(rewritten_payload, guest_data_port)`. Returns
+/// `None` when there's no PASV reply to rewrite.
+///
+/// The length-changing rewrite is safe here because the NAT relays the byte
+/// stream between two independent TCP connections (a host OS socket and the
+/// userspace guest-side TCP), so the host stack re-sequences on its own — no
+/// seq/ack surgery. The non-FTP / no-match path is left untouched.
+fn ftp_pasv_rewrite(payload: &[u8], host: Ipv4Addr, host_port: u16) -> Option<(Vec<u8>, u16)> {
+    // The "227" reply code at the start of a line (start of buffer or after \n).
+    let pos = (0..payload.len().saturating_sub(2))
+        .find(|&i| &payload[i..i + 3] == b"227" && (i == 0 || payload[i - 1] == b'\n'))?;
+    let open  = pos + payload[pos..].iter().position(|&b| b == b'(')?;
+    let close = open + payload[open..].iter().position(|&b| b == b')')?;
+    // Exactly six 0..=255 numbers between the parentheses.
+    let nums = payload[open + 1..close]
+        .split(|&b| b == b',')
+        .map(|s| std::str::from_utf8(s).ok().and_then(|t| t.trim().parse::<u16>().ok()))
+        .collect::<Option<Vec<u16>>>()?;
+    if nums.len() != 6 || nums.iter().any(|&n| n > 255) {
+        return None;
+    }
+    let data_port = (nums[4] << 8) | nums[5];
+    let o = host.octets();
+    let replacement = format!("({},{},{},{},{},{})",
+        o[0], o[1], o[2], o[3], host_port >> 8, host_port & 0xff);
+    let mut out = Vec::with_capacity(payload.len() + replacement.len());
+    out.extend_from_slice(&payload[..open]);
+    out.extend_from_slice(replacement.as_bytes());
+    out.extend_from_slice(&payload[close + 1..]);
+    Some((out, data_port))
+}
+
+#[cfg(test)]
+mod ftp_alg_tests {
+    use super::*;
+
+    #[test]
+    fn rewrites_pasv_reply() {
+        let p = b"227 Entering Passive Mode (192,168,0,2,200,21).\r\n";
+        let (out, port) = ftp_pasv_rewrite(p, Ipv4Addr::new(127, 0, 0, 1), 50000).unwrap();
+        assert_eq!(port, 200 * 256 + 21);
+        let s = std::str::from_utf8(&out).unwrap();
+        assert!(s.contains("(127,0,0,1,195,80)"), "got: {s}"); // 50000 = 195*256+80
+        assert!(s.starts_with("227 Entering Passive Mode"));
+        assert!(s.ends_with(".\r\n"));
+    }
+
+    #[test]
+    fn ignores_non_pasv() {
+        assert!(ftp_pasv_rewrite(b"USER anonymous\r\n", Ipv4Addr::LOCALHOST, 1).is_none());
+        assert!(ftp_pasv_rewrite(b"200 PORT command successful.\r\n", Ipv4Addr::LOCALHOST, 1).is_none());
+        // "227" not at a line start must not match.
+        assert!(ftp_pasv_rewrite(b"x227 (1,2,3,4,5,6)\r\n", Ipv4Addr::LOCALHOST, 1).is_none());
+        // Malformed tuple (not six bytes) is rejected.
+        assert!(ftp_pasv_rewrite(b"227 (1,2,3,4,5)\r\n", Ipv4Addr::LOCALHOST, 1).is_none());
+        assert!(ftp_pasv_rewrite(b"227 (1,2,3,4,5,999)\r\n", Ipv4Addr::LOCALHOST, 1).is_none());
+    }
+}
+
 // ── NAT engine ────────────────────────────────────────────────────────────────
 pub struct NatEngine {
     config:  GatewayConfig,
@@ -647,6 +709,9 @@ pub struct NatEngine {
     tcp_fwd_pending: HashMap<(u32, u16, u16), TcpFwdPending>,
     // Monotonically increasing counter for generating ephemeral ports for inbound forwards.
     fwd_ephemeral_next: u16,
+    // Number of configured (static) forwards at the front of `tcp_fwd_listeners`;
+    // anything past this index is a transient FTP-ALG data forward (bounded, FIFO).
+    fwd_static_count: usize,
     // Guest MAC learned from any outbound frame (ARP SHA or Ethernet src).
     guest_mac: Option<[u8; 6]>,
     // Monotonically increasing IP identification counter for fragmented datagrams.
@@ -707,10 +772,11 @@ impl NatEngine {
             }
         }
 
+        let fwd_static_count = tcp_fwd_listeners.len();
         Self { config, tx_cons, rx_prod, rx_wake, tx_wake, running, ctl,
                udp_nat: HashMap::new(), tcp_nat: HashMap::new(), tcp_tw: HashMap::new(),
                icmp_nat: HashMap::new(), icmp_unavailable: false, deferred_rx: Vec::new(),
-               tcp_fwd_listeners, udp_fwd_listeners,
+               tcp_fwd_listeners, udp_fwd_listeners, fwd_static_count,
                tcp_fwd_pending: HashMap::new(), fwd_ephemeral_next: 49152,
                guest_mac: None, ip_id: 1 }
     }
@@ -732,6 +798,7 @@ impl NatEngine {
                 self.udp_nat.clear();  // drops all UdpSockets
                 self.icmp_nat.clear(); // drops all ICMP raw sockets
                 self.tcp_fwd_pending.clear();
+                self.tcp_fwd_listeners.truncate(self.fwd_static_count); // drop transient FTP data forwards
             }
 
             // Live subnet change requested by an embedder: swap the gateway /
@@ -748,6 +815,7 @@ impl NatEngine {
                 self.udp_nat.clear();
                 self.icmp_nat.clear();
                 self.tcp_fwd_pending.clear();
+                self.tcp_fwd_listeners.truncate(self.fwd_static_count); // drop transient FTP data forwards
             }
 
             // FIXME: investigate interrupt race between TX completion and RX delivery.
@@ -1623,6 +1691,10 @@ impl NatEngine {
             self.tcp_nat.remove(&key); return;
         }
 
+        // FTP ALG: a rewritten PASV reply binds a host data listener here and
+        // defers registering its forward until the `entry` borrow ends below.
+        let mut new_data_fwd: Option<(TcpListener, u16)> = None;
+        let gateway_ip = self.config.gateway_ip;
         let entry = match self.tcp_nat.get_mut(&key) {
             Some(e) => e,
             None => {
@@ -1675,7 +1747,34 @@ impl NatEngine {
                                 && seq != entry.client_seq;
             if !already_acked {
                 use std::io::Write as _;
-                let _ = entry.stream.write_all(payload);
+                // FTP ALG: on an inbound port-forward to the guest's ftpd
+                // (server = gateway, guest control port 21), rewrite a passive
+                // 227 reply so the host client reaches the data connection via a
+                // freshly-bound host forward. client_seq still advances by the
+                // *original* length (that's what the guest sent and we ACK).
+                let is_ftp_ctrl = entry.server_ip == gateway_ip && entry.client_port == 21;
+                let mut handled = false;
+                if is_ftp_ctrl && ftp_pasv_rewrite(payload, Ipv4Addr::LOCALHOST, 0).is_some() {
+                    if let Ok(listener) = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)) {
+                        if let Ok(addr) = listener.local_addr() {
+                            let host_port = addr.port();
+                            let _ = listener.set_nonblocking(true);
+                            if let Some((rewritten, data_port)) =
+                                ftp_pasv_rewrite(payload, Ipv4Addr::LOCALHOST, host_port)
+                            {
+                                dlog_dev!(LogModule::Net,
+                                    "NAT FTP ALG: PASV guest data port {} -> host 127.0.0.1:{}",
+                                    data_port, host_port);
+                                let _ = entry.stream.write_all(&rewritten);
+                                new_data_fwd = Some((listener, data_port));
+                                handled = true;
+                            }
+                        }
+                    }
+                }
+                if !handled {
+                    let _ = entry.stream.write_all(payload);
+                }
                 entry.client_seq = seq.wrapping_add(payload.len() as u32);
             }
             let sip  = entry.server_ip;
@@ -1709,6 +1808,19 @@ impl NatEngine {
             use std::net::Shutdown;
             let _ = entry.stream.shutdown(Shutdown::Write);
             entry.fin_wait = true;
+        }
+
+        // Register the FTP-ALG data forward now that the `entry` borrow is gone.
+        // Transient and FIFO-bounded so a long session's PASV transfers don't
+        // leak host listeners; the oldest is dropped once the cap is hit.
+        if let Some((listener, data_port)) = new_data_fwd {
+            const MAX_FTP_DATA_FWD: usize = 16;
+            while self.tcp_fwd_listeners.len() >= self.fwd_static_count + MAX_FTP_DATA_FWD
+                && self.tcp_fwd_listeners.len() > self.fwd_static_count
+            {
+                self.tcp_fwd_listeners.remove(self.fwd_static_count); // drop oldest dynamic
+            }
+            self.tcp_fwd_listeners.push(TcpFwdListener { listener, guest_port: data_port });
         }
     }
 

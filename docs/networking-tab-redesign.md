@@ -102,8 +102,21 @@ sandbox (no new entitlements; no reliance on spawning external binaries).
 |---|---|---|---|
 | **0** | Pure subnet/conflict logic (`iris-gui/src/netplan.rs`) + `if-addrs`: parse/compose CIDR, mask presets, first-free, conflict, sanity tiers, snap, derived addrs — 15 unit tests. No UI. | low | **done** |
 | **1** | Networking tab UI on Phase 0: network preset combo, mask combo (8/12/16/22/24/25/26 + custom bits), CIDR field, derived line + conflict ✓/⚠, override modal (Cancel / Use suggested / Override), Add-forward menu (Telnet/FTP/Custom), NFS blurb + live mount cmd, troubleshooting-window Indy address. Network edits now mark cfg dirty. | low | **done** |
-| **2** | FTP ALG in `net.rs`. | med | pending |
+| **2** | FTP ALG in `net.rs`: rewrite passive-mode `227` replies on an inbound FTP control forward, bind a localhost data listener, register a transient (FIFO-bounded) data forward. Pure parse/rewrite unit-tested. | med | **done** |
 | **3** | In-app file bridge (TCP-peer seam → FTP-passive client → UI → guest auto-provision; rcp later). | high | pending |
+
+### Phase 2 implementation notes / limits
+- Works because the NAT *relays application bytes* between an OS host socket and
+  the userspace guest-side TCP, so the length-changing `227` rewrite needs no
+  seq/ack surgery (the host stack re-sequences). `client_seq` still advances by
+  the original payload length.
+- Inbound FTP control connection identified by `server_ip == gateway && client_port == 21`.
+- **Handles classic passive mode only** (`PASV` → `227`). Not handled yet:
+  active mode (`PORT`), extended passive (`EPSV`/`229`), or a `227` split across
+  TCP segments (no control-stream reassembly — fine for IRIX ftpd, which sends it
+  in one segment).
+- Data forwards are transient, FIFO-capped at 16, and truncated on reset /
+  live-subnet-apply. **Unverified on a real boot** — needs a manual FTP transfer.
 
 ### Phase 1 implementation notes
 - `cfg.nat_subnet` stays the raw-CIDR source of truth; preset/mask controls
