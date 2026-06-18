@@ -1,4 +1,4 @@
-# Plan: in-core NFSv3-over-UDP server (`src/nfsv3udp.rs`)
+# Plan: in-core NFSv3-over-UDP server (`src/nfsudp.rs`)
 
 Status: **planning** — no code yet. Replaces the external `unfsd` with a
 synchronous, pure-Rust NFS/UDP server that lives inside the NAT.
@@ -28,7 +28,7 @@ synchronous, pure-Rust NFS/UDP server that lives inside the NAT.
 
 ## Goal & hard constraints
 
-- A minimal **NFSv3 server, UDP only**, in `src/nfsv3udp.rs` (the `iris` core
+- A minimal **NFSv3 server, UDP only**, in `src/nfsudp.rs` (the `iris` core
   crate). No TLS, no NLM/locking, no real auth (allow every host, ignore RPC
   credentials), **faked/synthesized unix permissions** for cross-platform
   parity (esp. Windows, which has no unix uid/gid/mode).
@@ -181,7 +181,7 @@ async-trait, which we don't want in-core).
 12. **MOUNT export path.** Accept any path in MNT → the single export root, or
     honor sub-path mounts?
 13. **Vendor vs depend.** Confirm: vendor nfsserve's XDR/NFS/MOUNT structs into
-    `nfsv3udp.rs` (sync, no tokio), with BSD-3 attribution — rather than depend
+    `nfsudp.rs` (sync, no tokio), with BSD-3 attribution — rather than depend
     on the crate.
 14. **Duplicate-request cache (DRC).** NFS-over-UDP retransmits on timeout; non-
     idempotent ops (WRITE/CREATE/REMOVE/RENAME) need a small DRC keyed by
