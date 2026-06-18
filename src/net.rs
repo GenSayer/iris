@@ -469,6 +469,11 @@ pub struct NatControl {
     /// IP). Monotonic for the life of the machine; the GUI samples it to light a
     /// grey/red/green "internal network" indicator.
     pub guest_frames: AtomicU64,
+    /// Set once the guest sends an IP frame *to the gateway's MAC* — i.e. it is
+    /// actually routing off-subnet through NAT. Gates plug-and-play adoption:
+    /// adoption locks only once the guest is really using the gateway, so local
+    /// or broadcast IP chatter (e.g. a ping to x.x.x.255) no longer disarms it.
+    pub routed: AtomicBool,
     /// The guest's own source IPv4 address as last seen on the wire (ARP sender
     /// address, or IP source) — `0` = none seen yet. Captured even when the
     /// guest's config is wrong and nothing routes (it still ARPs for its
@@ -502,6 +507,7 @@ impl NatControl {
             snapshot:   Mutex::new(NatSnapshot::default()),
             reset_nat:  AtomicBool::new(false),
             guest_frames: AtomicU64::new(0),
+            routed: AtomicBool::new(false),
             observed_guest_ip: AtomicU32::new(0),
             observed_gateway: AtomicU32::new(0),
             apply_gateway: AtomicU32::new(0),
@@ -799,6 +805,7 @@ impl NatEngine {
                 self.icmp_nat.clear(); // drops all ICMP raw sockets
                 self.tcp_fwd_pending.clear();
                 self.tcp_fwd_listeners.truncate(self.fwd_static_count); // drop transient FTP data forwards
+                self.ctl.routed.store(false, Ordering::Relaxed); // re-arm plug-and-play adoption
             }
 
             // Live subnet change requested by an embedder: swap the gateway /
@@ -816,6 +823,7 @@ impl NatEngine {
                 self.icmp_nat.clear();
                 self.tcp_fwd_pending.clear();
                 self.tcp_fwd_listeners.truncate(self.fwd_static_count); // drop transient FTP data forwards
+                self.ctl.routed.store(false, Ordering::Relaxed); // re-arm adoption onto the new subnet
             }
 
             // FIXME: investigate interrupt race between TX completion and RX delivery.
@@ -944,7 +952,7 @@ impl NatEngine {
                 // leave the guest unrouted and the GUI asks the user to change the
                 // guest's ec0 to a non-overlapping subnet instead.
                 if self.config.gateway_ip != tpa
-                    && self.ctl.guest_frames.load(Ordering::Relaxed) == 0
+                    && !self.ctl.routed.load(Ordering::Relaxed)
                     && !conflicts
                 {
                     dlog_dev!(LogModule::Net, "NAT adopting gateway {} (was {})", tpa, self.config.gateway_ip);
@@ -969,6 +977,12 @@ impl NatEngine {
                 // happens even when the guest's IP is missing or wrong, so
                 // counting it would flash the indicator green misleadingly.
                 self.ctl.guest_frames.fetch_add(1, Ordering::Relaxed);
+                // A frame addressed to the gateway's MAC is off-subnet traffic
+                // the guest is routing through us — that, not local/broadcast IP
+                // chatter, is what locks adoption to the current gateway.
+                if frame[0..6] == self.config.gateway_mac {
+                    self.ctl.routed.store(true, Ordering::Relaxed);
+                }
                 self.handle_ip(frame, &src_mac);
             }
             _ => {}

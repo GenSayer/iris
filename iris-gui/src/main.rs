@@ -973,7 +973,15 @@ impl App {
                 let Some(ip) = guest else {
                     ui.label(RichText::new("No guest traffic seen yet").strong());
                     ui.label("If IRIX just booted, give it a few seconds and re-check. \
-                              Otherwise ec0 may be unconfigured.");
+                              Otherwise ec0 may be unconfigured, or networking may be turned \
+                              off in IRIX.");
+                    ui.add_space(4.0);
+                    ui.label(RichText::new("Make sure networking is enabled (as root):").strong());
+                    ui.code("chkconfig network on");
+                    ui.label(RichText::new(
+                        "Networking is off in some IRIX setups (the /etc/config/network flag); \
+                         with it off the guest sends no traffic at all. After enabling, reboot \
+                         (or run /etc/init.d/network start).").weak());
                     if let Some(l) = &fresh_hint { ui.label(RichText::new(l).weak()); }
                     return;
                 };
