@@ -735,6 +735,42 @@ pub struct NatEngine {
     guest_mac: Option<[u8; 6]>,
     // Monotonically increasing IP identification counter for fragmented datagrams.
     ip_id: u16,
+    // In-core NFS/UDP server (replaces external unfsd). Some when an NFS export
+    // is configured; the NAT dispatches guest MOUNT/NFS RPC straight to it.
+    nfs: Option<crate::nfsudp::NfsServer>,
+    // Inbound IP-fragment reassembly buffers, keyed by (src_ip, ip_id, proto).
+    // NFS writes arrive fragmented when wsize > MTU.
+    frag_reasm: HashMap<(u32, u16, u8), FragReasm>,
+}
+
+/// Reassembly state for one fragmented inbound IP datagram.
+struct FragReasm {
+    frags: std::collections::BTreeMap<usize, Vec<u8>>, // offset -> bytes (deduped)
+    total: Option<usize>,                              // known once the last fragment arrives
+    last: Instant,
+}
+impl FragReasm {
+    fn new() -> Self {
+        Self { frags: std::collections::BTreeMap::new(), total: None, last: Instant::now() }
+    }
+    /// Add a fragment; return the reassembled payload once it's contiguous +
+    /// complete.
+    fn add(&mut self, offset: usize, data: &[u8], more: bool) -> Option<Vec<u8>> {
+        self.frags.insert(offset, data.to_vec());
+        self.last = Instant::now();
+        if !more {
+            self.total = Some(offset + data.len());
+        }
+        let total = self.total?;
+        let mut out = Vec::with_capacity(total);
+        for (&off, d) in &self.frags {
+            if off != out.len() {
+                return None; // gap — still waiting on a fragment
+            }
+            out.extend_from_slice(d);
+        }
+        (out.len() == total).then_some(out)
+    }
 }
 
 /// Bind host listeners for a set of port-forward rules. Used at construction and
@@ -786,12 +822,17 @@ impl NatEngine {
                ctl:     Arc<NatControl>) -> Self {
         let (tcp_fwd_listeners, udp_fwd_listeners) = bind_forwards(&config.port_forwards);
         let fwd_static_count = tcp_fwd_listeners.len();
+        // Spin up the in-core NFS server if an export is configured.
+        let nfs = config.nfs.as_ref().map(|c| {
+            eprintln!("iris: in-core NFS server exporting {}", c.shared_dir);
+            crate::nfsudp::NfsServer::new(c.shared_dir.clone(), crate::nfsudp::NfsVersion::Auto)
+        });
         Self { config, tx_cons, rx_prod, rx_wake, tx_wake, running, ctl,
                udp_nat: HashMap::new(), tcp_nat: HashMap::new(), tcp_tw: HashMap::new(),
                icmp_nat: HashMap::new(), icmp_unavailable: false, deferred_rx: Vec::new(),
                tcp_fwd_listeners, udp_fwd_listeners, fwd_static_count,
                tcp_fwd_pending: HashMap::new(), fwd_ephemeral_next: 49152,
-               guest_mac: None, ip_id: 1 }
+               guest_mac: None, ip_id: 1, nfs, frag_reasm: HashMap::new() }
     }
 
     /// Rebind the static port-forward listeners from a new rule set, live (no
@@ -1064,6 +1105,31 @@ impl NatEngine {
         // Clamp to actual frame size in case ip_total > frame bytes available.
         let ip_end = ip_total.min(frame.len() - 14);
         let payload = &ip[ihl..ip_end];
+
+        // Inbound IP-fragment reassembly: a guest NFS WRITE with a large wsize
+        // arrives fragmented. Buffer fragments keyed by (src, id, proto) and
+        // dispatch the whole datagram once it's contiguous.
+        let flags_frag = r16(ip, 6);
+        let more_frags = flags_frag & 0x2000 != 0;
+        let frag_off = ((flags_frag & 0x1fff) as usize) * 8;
+        if more_frags || frag_off != 0 {
+            let id = r16(ip, 4);
+            let key = (u32::from(src_ip), id, proto);
+            self.frag_reasm.retain(|_, v| v.last.elapsed() < Duration::from_secs(5));
+            let assembled = self
+                .frag_reasm
+                .entry(key)
+                .or_insert_with(FragReasm::new)
+                .add(frag_off, payload, more_frags);
+            if let Some(full) = assembled {
+                self.frag_reasm.remove(&key);
+                if proto == IP_PROTO_UDP {
+                    self.handle_udp(src_mac, src_ip, dst_ip, &full);
+                }
+            }
+            return;
+        }
+
         match proto {
             IP_PROTO_ICMP => self.handle_icmp(src_mac, src_ip, dst_ip, ttl, payload),
             IP_PROTO_UDP  => self.handle_udp(src_mac, src_ip, dst_ip, payload),
@@ -1247,6 +1313,8 @@ impl NatEngine {
             UDP_PORT_DNS          => self.forward_dns(src_mac, src_ip, sport, payload),
             UDP_PORT_PORTMAP if self.config.nfs.is_some()
                               => self.handle_portmap_udp(src_mac, src_ip, sport, payload),
+            NFS_VM_PORT | MOUNTD_VM_PORT if self.nfs.is_some() && dst_ip == self.config.gateway_ip
+                              => self.handle_nfs_udp(src_mac, src_ip, sport, dport, payload),
             UDP_PORT_TIME if dst_ip == self.config.gateway_ip
                               => self.handle_time_udp(src_mac, src_ip, sport),
             UDP_PORT_NTP  if dst_ip == self.config.gateway_ip
@@ -1257,6 +1325,24 @@ impl NatEngine {
                 self.nat_udp(src_mac, src_ip, real_dst.0, sport, real_dst.1, payload);
             }
         }
+    }
+
+    // ── in-core NFS ─────────────────────────────────────────────────────────
+    /// Dispatch a guest MOUNT/NFS RPC datagram to the in-core server and inject
+    /// the reply (auto-fragmented). `server_port` is the port the guest sent to
+    /// (NFS 2049 or mountd 1234), which becomes the reply's source port.
+    fn handle_nfs_udp(&mut self, client_mac: &[u8; 6], client_ip: Ipv4Addr,
+                      client_port: u16, server_port: u16, payload: &[u8]) {
+        let reply = match self.nfs.as_mut() {
+            Some(server) => server.handle(payload),
+            None => return,
+        };
+        let Some(reply) = reply else { return };
+        let udp = udp_packet(self.config.gateway_ip, client_ip, server_port, client_port, &reply);
+        let id = self.ip_id;
+        self.ip_id = self.ip_id.wrapping_add(1);
+        self.deferred_rx.extend(ip_frames_udp(
+            client_mac, &self.config.gateway_mac, self.config.gateway_ip, client_ip, id, &udp));
     }
 
     // ── BOOTP / DHCP ──────────────────────────────────────────────────────────
