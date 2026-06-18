@@ -981,6 +981,276 @@ fn nfs3_commit(call: &RpcCall, args: &mut Cur, b: &mut NfsBacking) -> Vec<u8> {
     x.into_bytes()
 }
 
+// ── NFSv2 (RFC 1094) procedures ─────────────────────────────────────────────
+//
+// Increment 5: the parallel v2 encoding — 32-bit attrs, fixed 32-byte handles,
+// v2 procedure numbers — over the same backend. Served when the guest mounts
+// NFSv2 (IRIX 5.3).
+
+pub const NFS_V2: u32 = 2;
+
+// v2 procedure numbers (these differ from v3).
+const PROC2_NULL: u32 = 0;
+const PROC2_GETATTR: u32 = 1;
+const PROC2_SETATTR: u32 = 2;
+const PROC2_LOOKUP: u32 = 4;
+const PROC2_READ: u32 = 6;
+const PROC2_WRITE: u32 = 8;
+const PROC2_CREATE: u32 = 9;
+const PROC2_REMOVE: u32 = 10;
+const PROC2_RENAME: u32 = 11;
+const PROC2_MKDIR: u32 = 14;
+const PROC2_RMDIR: u32 = 15;
+const PROC2_READDIR: u32 = 16;
+const PROC2_STATFS: u32 = 17;
+
+const NFS2_OK: u32 = 0; // v2 nfsstat shares numeric values with v3 for our cases
+
+fn ftype2(kind: FileKind) -> u32 {
+    match kind {
+        FileKind::Reg | FileKind::Other => 1,
+        FileKind::Dir => 2,
+        FileKind::Lnk => 5,
+    }
+}
+
+/// v2 file handle: a fixed 32-byte opaque — we store the 8-byte fileid + zeros.
+fn put_fh2(x: &mut Xdr, fileid: u64) {
+    let mut h = [0u8; 32];
+    h[..8].copy_from_slice(&fileid.to_be_bytes());
+    x.fixed(&h);
+}
+fn get_fh2(c: &mut Cur) -> Option<u64> {
+    let h = c.fixed(32)?;
+    Some(u64::from_be_bytes(h[..8].try_into().ok()?))
+}
+
+/// v2 timeval is (seconds, *micro*seconds); convert our nanoseconds.
+fn put_time2(x: &mut Xdr, t: (u32, u32)) {
+    x.u32(t.0);
+    x.u32(t.1 / 1000);
+}
+
+/// v2 `fattr` (all 32-bit).
+fn put_fattr2(x: &mut Xdr, a: &Attr) {
+    x.u32(ftype2(a.kind));
+    x.u32(a.mode);
+    x.u32(a.nlink);
+    x.u32(a.uid);
+    x.u32(a.gid);
+    x.u32(a.size as u32); // v2 size is 32-bit (>4 GiB unsupported)
+    x.u32(4096); // blocksize
+    x.u32(0); // rdev
+    x.u32(((a.size + 511) / 512) as u32); // blocks
+    x.u32(FSID as u32);
+    x.u32(a.fileid as u32);
+    put_time2(x, a.atime);
+    put_time2(x, a.mtime);
+    put_time2(x, a.ctime);
+}
+
+/// Parse a v2 `sattr`, returning the size if set (`0xFFFFFFFF` = don't set).
+fn parse_sattr2(c: &mut Cur) -> Option<Option<u64>> {
+    c.u32()?; // mode
+    c.u32()?; // uid
+    c.u32()?; // gid
+    let size = c.u32()?;
+    c.u64()?; // atime (sec + usec)
+    c.u64()?; // mtime
+    Some((size != 0xFFFF_FFFF).then_some(size as u64))
+}
+
+/// Dispatch one NFSv2 call.
+pub fn nfs2_call(call: &RpcCall, args: &mut Cur, b: &mut NfsBacking) -> Vec<u8> {
+    match call.proc_num {
+        PROC2_NULL => reply(call.xid, accept::SUCCESS).into_bytes(),
+        PROC2_GETATTR => nfs2_getattr(call, args, b),
+        PROC2_SETATTR => nfs2_setattr(call, args, b),
+        PROC2_LOOKUP => nfs2_lookup(call, args, b),
+        PROC2_READ => nfs2_read(call, args, b),
+        PROC2_WRITE => nfs2_write(call, args, b),
+        PROC2_CREATE => nfs2_create(call, args, b, false),
+        PROC2_MKDIR => nfs2_create(call, args, b, true),
+        PROC2_REMOVE => nfs2_remove(call, args, b, false),
+        PROC2_RMDIR => nfs2_remove(call, args, b, true),
+        PROC2_RENAME => nfs2_rename(call, args, b),
+        PROC2_READDIR => nfs2_readdir(call, args, b),
+        PROC2_STATFS => nfs2_statfs(call, args, b),
+        _ => reply(call.xid, accept::PROC_UNAVAIL).into_bytes(),
+    }
+}
+
+fn nfs2_attr_reply(call: &RpcCall, b: &mut NfsBacking, fid: u64) -> Vec<u8> {
+    let mut x = reply(call.xid, accept::SUCCESS);
+    match b.attr(fid) {
+        Some(a) => {
+            x.u32(NFS2_OK);
+            put_fattr2(&mut x, &a);
+        }
+        None => x.u32(NFS3ERR_STALE),
+    }
+    x.into_bytes()
+}
+
+fn nfs2_getattr(call: &RpcCall, args: &mut Cur, b: &mut NfsBacking) -> Vec<u8> {
+    let Some(fid) = get_fh2(args) else { return garbage(call.xid) };
+    nfs2_attr_reply(call, b, fid)
+}
+
+fn nfs2_setattr(call: &RpcCall, args: &mut Cur, b: &mut NfsBacking) -> Vec<u8> {
+    let Some(fid) = get_fh2(args) else { return garbage(call.xid) };
+    let Some(size) = parse_sattr2(args) else { return garbage(call.xid) };
+    if let Some(sz) = size {
+        b.truncate(fid, sz);
+    }
+    nfs2_attr_reply(call, b, fid)
+}
+
+fn nfs2_lookup(call: &RpcCall, args: &mut Cur, b: &mut NfsBacking) -> Vec<u8> {
+    let Some(dir) = get_fh2(args) else { return garbage(call.xid) };
+    let name = match args.opaque() {
+        Some(n) => n.to_vec(),
+        None => return garbage(call.xid),
+    };
+    let mut x = reply(call.xid, accept::SUCCESS);
+    match b.lookup(dir, &name) {
+        Some(fid) => {
+            x.u32(NFS2_OK);
+            put_fh2(&mut x, fid);
+            if let Some(a) = b.attr(fid) {
+                put_fattr2(&mut x, &a);
+            }
+        }
+        None => x.u32(NFS3ERR_NOENT),
+    }
+    x.into_bytes()
+}
+
+fn nfs2_read(call: &RpcCall, args: &mut Cur, b: &mut NfsBacking) -> Vec<u8> {
+    let Some(fid) = get_fh2(args) else { return garbage(call.xid) };
+    let Some(offset) = args.u32() else { return garbage(call.xid) };
+    let Some(count) = args.u32() else { return garbage(call.xid) };
+    let _total = args.u32();
+    let mut x = reply(call.xid, accept::SUCCESS);
+    match b.read(fid, offset as u64, count.min(8192)) {
+        Some((data, _eof)) => {
+            x.u32(NFS2_OK);
+            if let Some(a) = b.attr(fid) {
+                put_fattr2(&mut x, &a);
+            }
+            x.opaque(&data);
+        }
+        None => x.u32(NFS3ERR_IO),
+    }
+    x.into_bytes()
+}
+
+fn nfs2_write(call: &RpcCall, args: &mut Cur, b: &mut NfsBacking) -> Vec<u8> {
+    let Some(fid) = get_fh2(args) else { return garbage(call.xid) };
+    let _begin = args.u32();
+    let Some(offset) = args.u32() else { return garbage(call.xid) };
+    let _total = args.u32();
+    let Some(data) = args.opaque() else { return garbage(call.xid) };
+    b.write(fid, offset as u64, data);
+    nfs2_attr_reply(call, b, fid)
+}
+
+fn nfs2_create(call: &RpcCall, args: &mut Cur, b: &mut NfsBacking, dir: bool) -> Vec<u8> {
+    let Some(parent) = get_fh2(args) else { return garbage(call.xid) };
+    let name = match args.opaque() {
+        Some(n) => n.to_vec(),
+        None => return garbage(call.xid),
+    };
+    // sattr ignored.
+    let made = if dir { b.mkdir(parent, &name) } else { b.create(parent, &name) };
+    let mut x = reply(call.xid, accept::SUCCESS);
+    match made {
+        Some(fid) => {
+            x.u32(NFS2_OK);
+            put_fh2(&mut x, fid);
+            if let Some(a) = b.attr(fid) {
+                put_fattr2(&mut x, &a);
+            }
+        }
+        None => x.u32(NFS3ERR_IO),
+    }
+    x.into_bytes()
+}
+
+fn nfs2_remove(call: &RpcCall, args: &mut Cur, b: &mut NfsBacking, dir: bool) -> Vec<u8> {
+    let Some(parent) = get_fh2(args) else { return garbage(call.xid) };
+    let name = match args.opaque() {
+        Some(n) => n.to_vec(),
+        None => return garbage(call.xid),
+    };
+    let ok = if dir { b.rmdir(parent, &name) } else { b.remove(parent, &name) };
+    let mut x = reply(call.xid, accept::SUCCESS);
+    x.u32(if ok { NFS2_OK } else { NFS3ERR_NOENT });
+    x.into_bytes()
+}
+
+fn nfs2_rename(call: &RpcCall, args: &mut Cur, b: &mut NfsBacking) -> Vec<u8> {
+    let Some(fd) = get_fh2(args) else { return garbage(call.xid) };
+    let fname = match args.opaque() {
+        Some(n) => n.to_vec(),
+        None => return garbage(call.xid),
+    };
+    let Some(td) = get_fh2(args) else { return garbage(call.xid) };
+    let tname = match args.opaque() {
+        Some(n) => n.to_vec(),
+        None => return garbage(call.xid),
+    };
+    let ok = b.rename(fd, &fname, td, &tname);
+    let mut x = reply(call.xid, accept::SUCCESS);
+    x.u32(if ok { NFS2_OK } else { NFS3ERR_IO });
+    x.into_bytes()
+}
+
+fn nfs2_readdir(call: &RpcCall, args: &mut Cur, b: &mut NfsBacking) -> Vec<u8> {
+    let Some(fid) = get_fh2(args) else { return garbage(call.xid) };
+    let Some(cookie_bytes) = args.fixed(4) else { return garbage(call.xid) };
+    let cookie = u32::from_be_bytes(cookie_bytes.try_into().unwrap()) as usize;
+    let _count = args.u32();
+    let mut x = reply(call.xid, accept::SUCCESS);
+    let Some(mut entries) = b.readdir(fid) else {
+        x.u32(NFS3ERR_NOTDIR);
+        return x.into_bytes();
+    };
+    entries.sort_by(|p, q| p.0.cmp(&q.0));
+    x.u32(NFS2_OK);
+    let mut i = cookie;
+    let mut budget = 0usize;
+    while i < entries.len() {
+        let (name, id, _attr) = &entries[i];
+        let est = 24 + name.len();
+        if budget > 0 && budget + est > 8000 {
+            break;
+        }
+        budget += est;
+        x.bool(true); // entry follows
+        x.u32(*id as u32); // fileid
+        x.opaque(name);
+        x.fixed(&((i as u32) + 1).to_be_bytes()); // nfscookie (opaque[4])
+        i += 1;
+    }
+    x.bool(false); // end of entries
+    x.bool(i >= entries.len()); // eof
+    x.into_bytes()
+}
+
+fn nfs2_statfs(call: &RpcCall, args: &mut Cur, _b: &mut NfsBacking) -> Vec<u8> {
+    let Some(_fid) = get_fh2(args) else { return garbage(call.xid) };
+    let mut x = reply(call.xid, accept::SUCCESS);
+    x.u32(NFS2_OK);
+    x.u32(8192); // tsize (optimum transfer size)
+    x.u32(4096); // bsize
+    let big = 1u32 << 20;
+    x.u32(big); // blocks
+    x.u32(big); // bfree
+    x.u32(big); // bavail
+    x.into_bytes()
+}
+
 // ── server: program/version dispatch + duplicate-request cache ──────────────
 
 /// Which NFS version(s) to serve. `Auto` answers whatever the guest mounts with.
@@ -1037,7 +1307,7 @@ impl NfsServer {
     /// it isn't a parseable RPC call to ignore).
     pub fn handle(&mut self, msg: &[u8]) -> Option<Vec<u8>> {
         let (call, mut args) = parse_call(msg)?;
-        let idem = is_idempotent(call.prog, call.proc_num);
+        let idem = is_idempotent(&call);
         if !idem {
             if let Some(cached) = self.drc.get(call.xid) {
                 return Some(cached.clone());
@@ -1052,32 +1322,33 @@ impl NfsServer {
 
     fn dispatch(&mut self, call: &RpcCall, args: &mut Cur) -> Vec<u8> {
         if call.prog == NFS_PROG {
-            // MOUNT (increment 6) and NFSv2 (increment 5) join this match later.
-            let want_v3 = self.version != NfsVersion::V2;
-            if call.vers == NFS_V3 && want_v3 {
-                return nfs3_call(call, args, &mut self.backing);
+            // MOUNT (increment 6) joins this match later.
+            match call.vers {
+                NFS_V3 if self.version != NfsVersion::V2 => {
+                    return nfs3_call(call, args, &mut self.backing);
+                }
+                NFS_V2 if self.version != NfsVersion::V3 => {
+                    return nfs2_call(call, args, &mut self.backing);
+                }
+                _ => return reply(call.xid, accept::PROG_MISMATCH).into_bytes(),
             }
-            return reply(call.xid, accept::PROG_MISMATCH).into_bytes();
         }
         reply(call.xid, accept::PROG_UNAVAIL).into_bytes()
     }
 }
 
-/// Whether a procedure is safe to re-run (so it skips the dedup cache).
-fn is_idempotent(prog: u32, proc_num: u32) -> bool {
-    if prog != NFS_PROG {
+/// Whether a procedure is safe to re-run (so it skips the dedup cache). Version-
+/// aware because v2 and v3 number their procedures differently.
+fn is_idempotent(call: &RpcCall) -> bool {
+    if call.prog != NFS_PROG {
         return true;
     }
-    !matches!(
-        proc_num,
-        PROC3_SETATTR
-            | PROC3_WRITE
-            | PROC3_CREATE
-            | PROC3_MKDIR
-            | PROC3_REMOVE
-            | PROC3_RMDIR
-            | PROC3_RENAME
-    )
+    let non_idempotent: &[u32] = if call.vers == NFS_V2 {
+        &[PROC2_SETATTR, PROC2_WRITE, PROC2_CREATE, PROC2_REMOVE, PROC2_RENAME, PROC2_MKDIR, PROC2_RMDIR]
+    } else {
+        &[PROC3_SETATTR, PROC3_WRITE, PROC3_CREATE, PROC3_MKDIR, PROC3_REMOVE, PROC3_RMDIR, PROC3_RENAME]
+    };
+    !non_idempotent.contains(&call.proc_num)
 }
 
 #[cfg(test)]
@@ -1438,6 +1709,70 @@ mod tests {
         assert_eq!(c.u32(), Some(NFS3_OK));
         assert!(!root.join("new.txt").exists());
 
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    // ── NFSv2 (increment 5) ─────────────────────────────────────────────────
+
+    fn call2(xid: u32, proc_num: u32, args: &[u8]) -> Vec<u8> {
+        let mut x = Xdr::new();
+        x.u32(xid); x.u32(0); x.u32(2);
+        x.u32(NFS_PROG); x.u32(NFS_V2); x.u32(proc_num);
+        x.u32(0); x.u32(0); x.u32(0); x.u32(0);
+        x.fixed(args);
+        x.into_bytes()
+    }
+
+    #[test]
+    fn v2_getattr_lookup_read_write() {
+        let root = temp_export();
+        std::fs::write(root.join("v2.txt"), b"hello v2").unwrap();
+        let mut s = NfsServer::new(&root, NfsVersion::Auto);
+
+        let mut a = Xdr::new();
+        put_fh2(&mut a, ROOT_ID);
+        let r = s.handle(&call2(1, PROC2_GETATTR, &a.into_bytes())).unwrap();
+        let mut c = Cur::new(&r);
+        for _ in 0..6 { c.u32(); }
+        assert_eq!(c.u32(), Some(NFS2_OK));
+        assert_eq!(c.u32(), Some(2)); // ftype2 == NFDIR
+
+        let mut a = Xdr::new();
+        put_fh2(&mut a, ROOT_ID);
+        a.opaque(b"v2.txt");
+        let r = s.handle(&call2(2, PROC2_LOOKUP, &a.into_bytes())).unwrap();
+        let mut c = Cur::new(&r);
+        for _ in 0..6 { c.u32(); }
+        assert_eq!(c.u32(), Some(NFS2_OK));
+        let fid = u64::from_be_bytes(c.fixed(32).unwrap()[..8].try_into().unwrap());
+
+        let mut a = Xdr::new();
+        put_fh2(&mut a, fid);
+        a.u32(0); a.u32(5); a.u32(0); // offset, count, totalcount
+        let r = s.handle(&call2(3, PROC2_READ, &a.into_bytes())).unwrap();
+        assert!(r.windows(5).any(|w| w == b"hello"));
+
+        let mut a = Xdr::new();
+        put_fh2(&mut a, fid);
+        a.u32(0); a.u32(0); a.u32(4); // beginoffset, offset, totalcount
+        a.opaque(b"XYZW");
+        s.handle(&call2(4, PROC2_WRITE, &a.into_bytes())).unwrap();
+        assert_eq!(&std::fs::read(root.join("v2.txt")).unwrap()[..4], b"XYZW");
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn version_gating() {
+        // A V3-only server rejects a v2 call with PROG_MISMATCH.
+        let root = temp_export();
+        let mut s = NfsServer::new(&root, NfsVersion::V3);
+        let mut a = Xdr::new();
+        put_fh2(&mut a, ROOT_ID);
+        let r = s.handle(&call2(1, PROC2_GETATTR, &a.into_bytes())).unwrap();
+        let mut c = Cur::new(&r);
+        c.u32(); c.u32(); c.u32(); c.u32(); c.u32(); // xid, REPLY, ACCEPTED, verf x2
+        assert_eq!(c.u32(), Some(accept::PROG_MISMATCH));
         std::fs::remove_dir_all(&root).ok();
     }
 }
