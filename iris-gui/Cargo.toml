@@ -66,6 +66,11 @@ toml = "0.8"
 dirs = "5"
 log = "0.4"
 env_logger = "0.10"
+# Read the host's own interface addresses (Networking tab: first-free subnet
+# presets + overlap warnings). Reads addresses via getifaddrs — no entitlement,
+# and it does not trigger the macOS 15 Local Network prompt (that's for talking
+# *to* LAN peers, not enumerating your own NICs).
+if-addrs = "0.13"
 
 # macOS App Sandbox: NSURL security-scoped bookmarks let the App Store build
 # reopen user-selected disk images / PROMs / ISOs across launches. These crates

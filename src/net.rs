@@ -7,7 +7,7 @@
 use std::collections::{HashMap, VecDeque};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr, TcpListener, TcpStream, UdpSocket};
 use socket2::{Domain, Protocol, Socket, Type};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
 use crate::config::{ForwardBind, ForwardProto, NatSubnet, NfsConfig, PortForwardConfig};
 use crate::devlog::LogModule;
@@ -464,6 +464,42 @@ pub struct NatControl {
     /// Set to true to flush all NAT tables on the next NatEngine loop iteration.
     /// The NAT thread clears the flag after flushing.
     pub reset_nat:  AtomicBool,
+    /// Count of guest-originated IP frames the NAT engine has processed (ARP and
+    /// other link-layer chatter are excluded — they happen even with no/wrong
+    /// IP). Monotonic for the life of the machine; the GUI samples it to light a
+    /// grey/red/green "internal network" indicator.
+    pub guest_frames: AtomicU64,
+    /// Set once the guest sends an IP frame *to the gateway's MAC* — i.e. it is
+    /// actually routing off-subnet through NAT. Gates plug-and-play adoption:
+    /// adoption locks only once the guest is really using the gateway, so local
+    /// or broadcast IP chatter (e.g. a ping to x.x.x.255) no longer disarms it.
+    pub routed: AtomicBool,
+    /// The guest's own source IPv4 address as last seen on the wire (ARP sender
+    /// address, or IP source) — `0` = none seen yet. Captured even when the
+    /// guest's config is wrong and nothing routes (it still ARPs for its
+    /// gateway), so the GUI can show what address the guest actually has and
+    /// compare it to what NAT expects.
+    pub observed_guest_ip: AtomicU32,
+    /// The address the guest is ARP-ing for within its own subnet but failing
+    /// to resolve (NAT doesn't own it) — almost always its configured default
+    /// gateway. `0` = none seen. Lets the GUI tell what gateway the guest
+    /// expects (and whether the host-side fix will satisfy it).
+    pub observed_gateway: AtomicU32,
+    /// Pending live subnet change (gateway / client / netmask as u32), latched
+    /// by `apply_subnet`. Lets an embedder move the running NAT onto a new
+    /// subnet without a reboot; applied on the NAT thread's next loop.
+    pub apply_gateway: AtomicU32,
+    pub apply_client:  AtomicU32,
+    pub apply_netmask: AtomicU32,
+    pub apply_subnet:  AtomicBool,
+    /// The host's own IPv4 networks `(network, prefix)`, set by the embedder.
+    /// NAT refuses to plug-and-play *adopt* a subnet that overlaps one of these,
+    /// so the emulator never shadows the host's real LAN / VPN / Docker network.
+    pub host_nets: Mutex<Vec<(u32, u8)>>,
+    /// New port-forward rule set to bind live, latched by `apply_forwards`. Lets
+    /// an embedder add/remove forwards without a reboot.
+    pub pending_forwards: Mutex<Option<Vec<PortForwardConfig>>>,
+    pub apply_forwards:   AtomicBool,
 }
 
 impl NatControl {
@@ -474,11 +510,72 @@ impl NatControl {
             debug_icmp: AtomicBool::new(false),
             snapshot:   Mutex::new(NatSnapshot::default()),
             reset_nat:  AtomicBool::new(false),
+            guest_frames: AtomicU64::new(0),
+            routed: AtomicBool::new(false),
+            observed_guest_ip: AtomicU32::new(0),
+            observed_gateway: AtomicU32::new(0),
+            apply_gateway: AtomicU32::new(0),
+            apply_client:  AtomicU32::new(0),
+            apply_netmask: AtomicU32::new(0),
+            apply_subnet:  AtomicBool::new(false),
+            host_nets:     Mutex::new(Vec::new()),
+            pending_forwards: Mutex::new(None),
+            apply_forwards:   AtomicBool::new(false),
         })
     }
     pub fn dbg_tcp(&self)  -> bool { self.debug_tcp.load(Ordering::Relaxed) }
     pub fn dbg_udp(&self)  -> bool { self.debug_udp.load(Ordering::Relaxed) }
     pub fn dbg_icmp(&self) -> bool { self.debug_icmp.load(Ordering::Relaxed) }
+    /// The guest's likely default gateway (in-subnet ARP target it can't
+    /// resolve), or None if none seen.
+    pub fn observed_gateway(&self) -> Option<Ipv4Addr> {
+        match self.observed_gateway.load(Ordering::Relaxed) {
+            0 => None,
+            v => Some(Ipv4Addr::from(v)),
+        }
+    }
+    /// The guest's last-seen source IP, or None if no frame has revealed one.
+    pub fn observed_guest_ip(&self) -> Option<Ipv4Addr> {
+        match self.observed_guest_ip.load(Ordering::Relaxed) {
+            0 => None,
+            v => Some(Ipv4Addr::from(v)),
+        }
+    }
+    /// Number of guest frames the NAT engine has seen so far.
+    pub fn guest_frames(&self) -> u64 { self.guest_frames.load(Ordering::Relaxed) }
+
+    /// Ask the running NAT to move to a new subnet (applied on the NAT thread's
+    /// next loop: config swapped + connection tables flushed). No reboot needed.
+    pub fn request_subnet(&self, gateway: Ipv4Addr, client: Ipv4Addr, netmask: Ipv4Addr) {
+        self.apply_gateway.store(u32::from(gateway), Ordering::Relaxed);
+        self.apply_client.store(u32::from(client), Ordering::Relaxed);
+        self.apply_netmask.store(u32::from(netmask), Ordering::Relaxed);
+        self.apply_subnet.store(true, Ordering::Release);
+    }
+
+    /// Record the host's own IPv4 networks (network address + prefix) so NAT
+    /// won't adopt a subnet that overlaps them.
+    pub fn set_host_nets(&self, nets: Vec<(Ipv4Addr, u8)>) {
+        *self.host_nets.lock() = nets.into_iter().map(|(n, p)| (u32::from(n), p)).collect();
+    }
+
+    /// Replace the running NAT's port-forward rules (rebound on the NAT thread's
+    /// next loop). No reboot needed.
+    pub fn set_port_forwards(&self, rules: Vec<PortForwardConfig>) {
+        *self.pending_forwards.lock() = Some(rules);
+        self.apply_forwards.store(true, Ordering::Release);
+    }
+
+    /// Whether `net/prefix` overlaps any recorded host network — i.e. adopting
+    /// or moving onto it would shadow a network the host already uses.
+    pub fn host_conflict(&self, net: Ipv4Addr, prefix: u8) -> bool {
+        let a = u32::from(net);
+        self.host_nets.lock().iter().any(|&(b, hp)| {
+            let p = prefix.min(hp);
+            let mask = if p == 0 { 0 } else { u32::MAX << (32 - p) };
+            (a & mask) == (b & mask)
+        })
+    }
 }
 
 #[derive(Default)]
@@ -544,6 +641,68 @@ struct TcpFwdPending {
     client_isn: u32,        // ISN we put in the synthetic SYN to the guest
 }
 
+/// FTP application-layer gateway (passive mode). If `payload` — server→client
+/// bytes on an FTP control connection — contains a `227 Entering Passive Mode
+/// (h1,h2,h3,h4,p1,p2)` reply, rewrite the address tuple to advertise
+/// `host`:`host_port` and return `(rewritten_payload, guest_data_port)`. Returns
+/// `None` when there's no PASV reply to rewrite.
+///
+/// The length-changing rewrite is safe here because the NAT relays the byte
+/// stream between two independent TCP connections (a host OS socket and the
+/// userspace guest-side TCP), so the host stack re-sequences on its own — no
+/// seq/ack surgery. The non-FTP / no-match path is left untouched.
+fn ftp_pasv_rewrite(payload: &[u8], host: Ipv4Addr, host_port: u16) -> Option<(Vec<u8>, u16)> {
+    // The "227" reply code at the start of a line (start of buffer or after \n).
+    let pos = (0..payload.len().saturating_sub(2))
+        .find(|&i| &payload[i..i + 3] == b"227" && (i == 0 || payload[i - 1] == b'\n'))?;
+    let open  = pos + payload[pos..].iter().position(|&b| b == b'(')?;
+    let close = open + payload[open..].iter().position(|&b| b == b')')?;
+    // Exactly six 0..=255 numbers between the parentheses.
+    let nums = payload[open + 1..close]
+        .split(|&b| b == b',')
+        .map(|s| std::str::from_utf8(s).ok().and_then(|t| t.trim().parse::<u16>().ok()))
+        .collect::<Option<Vec<u16>>>()?;
+    if nums.len() != 6 || nums.iter().any(|&n| n > 255) {
+        return None;
+    }
+    let data_port = (nums[4] << 8) | nums[5];
+    let o = host.octets();
+    let replacement = format!("({},{},{},{},{},{})",
+        o[0], o[1], o[2], o[3], host_port >> 8, host_port & 0xff);
+    let mut out = Vec::with_capacity(payload.len() + replacement.len());
+    out.extend_from_slice(&payload[..open]);
+    out.extend_from_slice(replacement.as_bytes());
+    out.extend_from_slice(&payload[close + 1..]);
+    Some((out, data_port))
+}
+
+#[cfg(test)]
+mod ftp_alg_tests {
+    use super::*;
+
+    #[test]
+    fn rewrites_pasv_reply() {
+        let p = b"227 Entering Passive Mode (192,168,0,2,200,21).\r\n";
+        let (out, port) = ftp_pasv_rewrite(p, Ipv4Addr::new(127, 0, 0, 1), 50000).unwrap();
+        assert_eq!(port, 200 * 256 + 21);
+        let s = std::str::from_utf8(&out).unwrap();
+        assert!(s.contains("(127,0,0,1,195,80)"), "got: {s}"); // 50000 = 195*256+80
+        assert!(s.starts_with("227 Entering Passive Mode"));
+        assert!(s.ends_with(".\r\n"));
+    }
+
+    #[test]
+    fn ignores_non_pasv() {
+        assert!(ftp_pasv_rewrite(b"USER anonymous\r\n", Ipv4Addr::LOCALHOST, 1).is_none());
+        assert!(ftp_pasv_rewrite(b"200 PORT command successful.\r\n", Ipv4Addr::LOCALHOST, 1).is_none());
+        // "227" not at a line start must not match.
+        assert!(ftp_pasv_rewrite(b"x227 (1,2,3,4,5,6)\r\n", Ipv4Addr::LOCALHOST, 1).is_none());
+        // Malformed tuple (not six bytes) is rejected.
+        assert!(ftp_pasv_rewrite(b"227 (1,2,3,4,5)\r\n", Ipv4Addr::LOCALHOST, 1).is_none());
+        assert!(ftp_pasv_rewrite(b"227 (1,2,3,4,5,999)\r\n", Ipv4Addr::LOCALHOST, 1).is_none());
+    }
+}
+
 // ── NAT engine ────────────────────────────────────────────────────────────────
 pub struct NatEngine {
     config:  GatewayConfig,
@@ -569,10 +728,88 @@ pub struct NatEngine {
     tcp_fwd_pending: HashMap<(u32, u16, u16), TcpFwdPending>,
     // Monotonically increasing counter for generating ephemeral ports for inbound forwards.
     fwd_ephemeral_next: u16,
+    // Number of configured (static) forwards at the front of `tcp_fwd_listeners`;
+    // anything past this index is a transient FTP-ALG data forward (bounded, FIFO).
+    fwd_static_count: usize,
     // Guest MAC learned from any outbound frame (ARP SHA or Ethernet src).
     guest_mac: Option<[u8; 6]>,
     // Monotonically increasing IP identification counter for fragmented datagrams.
     ip_id: u16,
+    // In-core NFS/UDP server (replaces external unfsd). Some when an NFS export
+    // is configured; the NAT dispatches guest MOUNT/NFS RPC straight to it.
+    nfs: Option<crate::nfsudp::NfsServer>,
+    // Inbound IP-fragment reassembly buffers, keyed by (src_ip, ip_id, proto).
+    // NFS writes arrive fragmented when wsize > MTU.
+    frag_reasm: HashMap<(u32, u16, u8), FragReasm>,
+}
+
+/// Reassembly state for one fragmented inbound IP datagram.
+struct FragReasm {
+    frags: std::collections::BTreeMap<usize, Vec<u8>>, // offset -> bytes (deduped)
+    total: Option<usize>,                              // known once the last fragment arrives
+    last: Instant,
+}
+impl FragReasm {
+    fn new() -> Self {
+        Self { frags: std::collections::BTreeMap::new(), total: None, last: Instant::now() }
+    }
+    /// Add a fragment; return the reassembled payload once it's contiguous +
+    /// complete.
+    fn add(&mut self, offset: usize, data: &[u8], more: bool) -> Option<Vec<u8>> {
+        self.frags.insert(offset, data.to_vec());
+        self.last = Instant::now();
+        if !more {
+            self.total = Some(offset + data.len());
+        }
+        let total = self.total?;
+        let mut out = Vec::with_capacity(total);
+        for (&off, d) in &self.frags {
+            if off != out.len() {
+                return None; // gap — still waiting on a fragment
+            }
+            out.extend_from_slice(d);
+        }
+        (out.len() == total).then_some(out)
+    }
+}
+
+/// Bind host listeners for a set of port-forward rules. Used at construction and
+/// when forwards are reconfigured live (see `rebind_forwards`).
+fn bind_forwards(rules: &[PortForwardConfig]) -> (Vec<TcpFwdListener>, Vec<UdpFwdListener>) {
+    let mut tcp = Vec::new();
+    let mut udp = Vec::new();
+    for rule in rules {
+        let bind_addr = match rule.bind {
+            ForwardBind::Localhost => Ipv4Addr::LOCALHOST,
+            ForwardBind::Any      => Ipv4Addr::UNSPECIFIED,
+        };
+        let addr = SocketAddr::new(IpAddr::V4(bind_addr), rule.host_port);
+        match rule.proto {
+            ForwardProto::Tcp => match TcpListener::bind(addr) {
+                Ok(listener) => {
+                    let _ = listener.set_nonblocking(true);
+                    eprintln!("iris: TCP port forward {}:{} → guest:{}",
+                              bind_addr, rule.host_port, rule.guest_port);
+                    tcp.push(TcpFwdListener { listener, guest_port: rule.guest_port });
+                }
+                Err(e) => eprintln!("iris: TCP port forward {}:{} failed to bind: {}",
+                                    bind_addr, rule.host_port, e),
+            },
+            ForwardProto::Udp => match UdpSocket::bind(addr) {
+                Ok(sock) => {
+                    let _ = sock.set_nonblocking(true);
+                    eprintln!("iris: UDP port forward {}:{} → guest:{}",
+                              bind_addr, rule.host_port, rule.guest_port);
+                    udp.push(UdpFwdListener {
+                        sock, guest_port: rule.guest_port, host_port: rule.host_port, last_sender: None,
+                    });
+                }
+                Err(e) => eprintln!("iris: UDP port forward {}:{} failed to bind: {}",
+                                    bind_addr, rule.host_port, e),
+            },
+        }
+    }
+    (tcp, udp)
 }
 
 impl NatEngine {
@@ -583,58 +820,33 @@ impl NatEngine {
                tx_wake: Arc<(Mutex<()>, Condvar)>,
                running: Arc<AtomicBool>,
                ctl:     Arc<NatControl>) -> Self {
-        let mut tcp_fwd_listeners = Vec::new();
-        let mut udp_fwd_listeners = Vec::new();
-
-        for rule in &config.port_forwards {
-            let bind_addr = match rule.bind {
-                ForwardBind::Localhost => Ipv4Addr::LOCALHOST,
-                ForwardBind::Any      => Ipv4Addr::UNSPECIFIED,
-            };
-            match rule.proto {
-                ForwardProto::Tcp => {
-                    let addr = SocketAddr::new(IpAddr::V4(bind_addr), rule.host_port);
-                    match TcpListener::bind(addr) {
-                        Ok(listener) => {
-                            let _ = listener.set_nonblocking(true);
-                            eprintln!("iris: TCP port forward {}:{} → guest:{}",
-                                      bind_addr, rule.host_port, rule.guest_port);
-                            tcp_fwd_listeners.push(TcpFwdListener {
-                                listener,
-                                guest_port: rule.guest_port,
-                            });
-                        }
-                        Err(e) => eprintln!("iris: TCP port forward {}:{} failed to bind: {}",
-                                            bind_addr, rule.host_port, e),
-                    }
-                }
-                ForwardProto::Udp => {
-                    let addr = SocketAddr::new(IpAddr::V4(bind_addr), rule.host_port);
-                    match UdpSocket::bind(addr) {
-                        Ok(sock) => {
-                            let _ = sock.set_nonblocking(true);
-                            eprintln!("iris: UDP port forward {}:{} → guest:{}",
-                                      bind_addr, rule.host_port, rule.guest_port);
-                            udp_fwd_listeners.push(UdpFwdListener {
-                                sock,
-                                guest_port:  rule.guest_port,
-                                host_port:   rule.host_port,
-                                last_sender: None,
-                            });
-                        }
-                        Err(e) => eprintln!("iris: UDP port forward {}:{} failed to bind: {}",
-                                            bind_addr, rule.host_port, e),
-                    }
-                }
-            }
-        }
-
+        let (tcp_fwd_listeners, udp_fwd_listeners) = bind_forwards(&config.port_forwards);
+        let fwd_static_count = tcp_fwd_listeners.len();
+        // Spin up the in-core NFS server if an export is configured.
+        let nfs = config.nfs.as_ref().map(|c| {
+            eprintln!("iris: in-core NFS server exporting {}", c.shared_dir);
+            crate::nfsudp::NfsServer::new(c.shared_dir.clone(), c.version)
+        });
         Self { config, tx_cons, rx_prod, rx_wake, tx_wake, running, ctl,
                udp_nat: HashMap::new(), tcp_nat: HashMap::new(), tcp_tw: HashMap::new(),
                icmp_nat: HashMap::new(), icmp_unavailable: false, deferred_rx: Vec::new(),
-               tcp_fwd_listeners, udp_fwd_listeners,
+               tcp_fwd_listeners, udp_fwd_listeners, fwd_static_count,
                tcp_fwd_pending: HashMap::new(), fwd_ephemeral_next: 49152,
-               guest_mac: None, ip_id: 1 }
+               guest_mac: None, ip_id: 1, nfs, frag_reasm: HashMap::new() }
+    }
+
+    /// Rebind the static port-forward listeners from a new rule set, live (no
+    /// reboot). The old static listeners are dropped (closing their host
+    /// sockets); transient FTP-ALG data forwards and already-established
+    /// connections (in `tcp_nat`) are preserved.
+    fn rebind_forwards(&mut self, rules: &[PortForwardConfig]) {
+        let cut = self.fwd_static_count.min(self.tcp_fwd_listeners.len());
+        let transient = self.tcp_fwd_listeners.split_off(cut); // FTP-ALG data forwards
+        let (mut tcp, udp) = bind_forwards(rules);
+        self.fwd_static_count = tcp.len();
+        tcp.extend(transient);
+        self.tcp_fwd_listeners = tcp; // drops the old static listeners
+        self.udp_fwd_listeners = udp;
     }
 
     pub fn run(&mut self) {
@@ -654,6 +866,34 @@ impl NatEngine {
                 self.udp_nat.clear();  // drops all UdpSockets
                 self.icmp_nat.clear(); // drops all ICMP raw sockets
                 self.tcp_fwd_pending.clear();
+                self.tcp_fwd_listeners.truncate(self.fwd_static_count); // drop transient FTP data forwards
+                self.ctl.routed.store(false, Ordering::Relaxed); // re-arm plug-and-play adoption
+            }
+
+            // Live subnet change requested by an embedder: swap the gateway /
+            // client / netmask and flush connection state so nothing lingers on
+            // the old subnet. The guest then reaches the new gateway as soon as
+            // it ARPs for it (or routes to it) — no reboot. Adoption still
+            // applies if the guest is on a different subnet again.
+            if self.ctl.apply_subnet.swap(false, Ordering::AcqRel) {
+                self.config.gateway_ip = Ipv4Addr::from(self.ctl.apply_gateway.load(Ordering::Relaxed));
+                self.config.client_ip  = Ipv4Addr::from(self.ctl.apply_client.load(Ordering::Relaxed));
+                self.config.netmask    = Ipv4Addr::from(self.ctl.apply_netmask.load(Ordering::Relaxed));
+                self.tcp_nat.clear();
+                self.tcp_tw.clear();
+                self.udp_nat.clear();
+                self.icmp_nat.clear();
+                self.tcp_fwd_pending.clear();
+                self.tcp_fwd_listeners.truncate(self.fwd_static_count); // drop transient FTP data forwards
+                self.ctl.routed.store(false, Ordering::Relaxed); // re-arm adoption onto the new subnet
+            }
+
+            // Live port-forward reconfigure: rebind the static listeners.
+            if self.ctl.apply_forwards.swap(false, Ordering::AcqRel) {
+                let rules = self.ctl.pending_forwards.lock().take(); // drop the lock before rebinding
+                if let Some(rules) = rules {
+                    self.rebind_forwards(&rules);
+                }
             }
 
             // FIXME: investigate interrupt race between TX completion and RX delivery.
@@ -741,6 +981,59 @@ impl NatEngine {
             self.guest_mac = Some(src_mac);
         }
         let etype = r16(frame, 12);
+        // Record the guest's own source address so the GUI can tell what IP it's
+        // using — even when that IP is wrong and nothing routes. ARP carries it
+        // (sender protocol address) even with zero IP traffic, since the guest
+        // ARPs for its configured gateway.
+        let src_ip = match etype {
+            ETHERTYPE_ARP if frame.len() >= 14 + 28 =>
+                Some(Ipv4Addr::new(frame[28], frame[29], frame[30], frame[31])),
+            ETHERTYPE_IP if frame.len() >= 14 + 20 =>
+                Some(Ipv4Addr::new(frame[26], frame[27], frame[28], frame[29])),
+            _ => None,
+        };
+        if let Some(ip) = src_ip {
+            if !ip.is_unspecified() {
+                self.ctl.observed_guest_ip.store(u32::from(ip), Ordering::Relaxed);
+            }
+        }
+        // Candidate default gateway: a guest ARP *request* (op=1) for an
+        // in-subnet address it can't resolve (NAT doesn't own it) is almost
+        // always the gateway it's trying — and failing — to reach. Record it so
+        // the GUI can tell what gateway the guest expects.
+        if etype == ETHERTYPE_ARP && frame.len() >= 14 + 28 && r16(frame, 14 + 6) == 1 {
+            let spa = [frame[28], frame[29], frame[30], frame[31]];
+            let tpa = Ipv4Addr::new(frame[38], frame[39], frame[40], frame[41]);
+            let t = tpa.octets();
+            dlog_dev!(LogModule::Net, "NAT guest ARP who-has {} tell {}.{}.{}.{} (nat gw={} client={} guest_frames={})",
+                tpa, spa[0], spa[1], spa[2], spa[3],
+                self.config.gateway_ip, self.config.client_ip,
+                self.ctl.guest_frames.load(Ordering::Relaxed));
+            if !tpa.is_unspecified() && t != spa && t[0] == spa[0] && t[1] == spa[1] && t[2] == spa[2] {
+                self.ctl.observed_gateway.store(u32::from(tpa), Ordering::Relaxed);
+                let adopt_net = Ipv4Addr::new(t[0], t[1], t[2], 0);
+                let conflicts = self.ctl.host_conflict(adopt_net, 24);
+                // Plug-and-play: while nothing is routing yet, adopt the gateway
+                // the guest is asking for so NAT answers that ARP and traffic
+                // flows — no config change or restart. Self-limiting: once any IP
+                // frame routes (guest_frames > 0) we stop, so a working setup is
+                // never moved. Refused when the guest's subnet overlaps a host
+                // network: adopting it would shadow the host's real LAN, so we
+                // leave the guest unrouted and the GUI asks the user to change the
+                // guest's ec0 to a non-overlapping subnet instead.
+                if self.config.gateway_ip != tpa
+                    && !self.ctl.routed.load(Ordering::Relaxed)
+                    && !conflicts
+                {
+                    dlog_dev!(LogModule::Net, "NAT adopting gateway {} (was {})", tpa, self.config.gateway_ip);
+                    self.config.gateway_ip = tpa;
+                    self.config.client_ip = Ipv4Addr::new(t[0], t[1], t[2], 2);
+                    self.config.netmask = Ipv4Addr::new(255, 255, 255, 0);
+                } else if conflicts {
+                    dlog_dev!(LogModule::Net, "NAT refusing to adopt {}: subnet {}/24 overlaps a host network", tpa, adopt_net);
+                }
+            }
+        }
         dlog_dev!(LogModule::Net, "NAT TX {}", eth_summary(frame));
         if self.ctl.dbg_tcp() && etype == ETHERTYPE_IP {
             dlog_dev!(LogModule::Net, "NAT RX (IRIX→NAT):");
@@ -748,7 +1041,20 @@ impl NatEngine {
         }
         match etype {
             ETHERTYPE_ARP => self.handle_arp(frame, &src_mac),
-            ETHERTYPE_IP  => self.handle_ip(frame, &src_mac),
+            ETHERTYPE_IP  => {
+                // Count only IP traffic — the actual NAT workload — as the
+                // network-alive signal. ARP (and other link-layer chatter)
+                // happens even when the guest's IP is missing or wrong, so
+                // counting it would flash the indicator green misleadingly.
+                self.ctl.guest_frames.fetch_add(1, Ordering::Relaxed);
+                // A frame addressed to the gateway's MAC is off-subnet traffic
+                // the guest is routing through us — that, not local/broadcast IP
+                // chatter, is what locks adoption to the current gateway.
+                if frame[0..6] == self.config.gateway_mac {
+                    self.ctl.routed.store(true, Ordering::Relaxed);
+                }
+                self.handle_ip(frame, &src_mac);
+            }
             _ => {}
         }
     }
@@ -799,6 +1105,31 @@ impl NatEngine {
         // Clamp to actual frame size in case ip_total > frame bytes available.
         let ip_end = ip_total.min(frame.len() - 14);
         let payload = &ip[ihl..ip_end];
+
+        // Inbound IP-fragment reassembly: a guest NFS WRITE with a large wsize
+        // arrives fragmented. Buffer fragments keyed by (src, id, proto) and
+        // dispatch the whole datagram once it's contiguous.
+        let flags_frag = r16(ip, 6);
+        let more_frags = flags_frag & 0x2000 != 0;
+        let frag_off = ((flags_frag & 0x1fff) as usize) * 8;
+        if more_frags || frag_off != 0 {
+            let id = r16(ip, 4);
+            let key = (u32::from(src_ip), id, proto);
+            self.frag_reasm.retain(|_, v| v.last.elapsed() < Duration::from_secs(5));
+            let assembled = self
+                .frag_reasm
+                .entry(key)
+                .or_insert_with(FragReasm::new)
+                .add(frag_off, payload, more_frags);
+            if let Some(full) = assembled {
+                self.frag_reasm.remove(&key);
+                if proto == IP_PROTO_UDP {
+                    self.handle_udp(src_mac, src_ip, dst_ip, &full);
+                }
+            }
+            return;
+        }
+
         match proto {
             IP_PROTO_ICMP => self.handle_icmp(src_mac, src_ip, dst_ip, ttl, payload),
             IP_PROTO_UDP  => self.handle_udp(src_mac, src_ip, dst_ip, payload),
@@ -982,6 +1313,8 @@ impl NatEngine {
             UDP_PORT_DNS          => self.forward_dns(src_mac, src_ip, sport, payload),
             UDP_PORT_PORTMAP if self.config.nfs.is_some()
                               => self.handle_portmap_udp(src_mac, src_ip, sport, payload),
+            NFS_VM_PORT | MOUNTD_VM_PORT if self.nfs.is_some() && dst_ip == self.config.gateway_ip
+                              => self.handle_nfs_udp(src_mac, src_ip, sport, dport, payload),
             UDP_PORT_TIME if dst_ip == self.config.gateway_ip
                               => self.handle_time_udp(src_mac, src_ip, sport),
             UDP_PORT_NTP  if dst_ip == self.config.gateway_ip
@@ -992,6 +1325,24 @@ impl NatEngine {
                 self.nat_udp(src_mac, src_ip, real_dst.0, sport, real_dst.1, payload);
             }
         }
+    }
+
+    // ── in-core NFS ─────────────────────────────────────────────────────────
+    /// Dispatch a guest MOUNT/NFS RPC datagram to the in-core server and inject
+    /// the reply (auto-fragmented). `server_port` is the port the guest sent to
+    /// (NFS 2049 or mountd 1234), which becomes the reply's source port.
+    fn handle_nfs_udp(&mut self, client_mac: &[u8; 6], client_ip: Ipv4Addr,
+                      client_port: u16, server_port: u16, payload: &[u8]) {
+        let reply = match self.nfs.as_mut() {
+            Some(server) => server.handle(payload),
+            None => return,
+        };
+        let Some(reply) = reply else { return };
+        let udp = udp_packet(self.config.gateway_ip, client_ip, server_port, client_port, &reply);
+        let id = self.ip_id;
+        self.ip_id = self.ip_id.wrapping_add(1);
+        self.deferred_rx.extend(ip_frames_udp(
+            client_mac, &self.config.gateway_mac, self.config.gateway_ip, client_ip, id, &udp));
     }
 
     // ── BOOTP / DHCP ──────────────────────────────────────────────────────────
@@ -1161,17 +1512,10 @@ impl NatEngine {
     //
     // IRIX sees the gateway at 192.168.0.1 but that's a virtual address iris
     // doesn't actually bind to, so unmodified TcpStream::connect() fails. We
-    // rewrite any gateway-destined packet to 127.0.0.1. NFS ports additionally
-    // shift to the high host ports where unfsd listens.
+    // rewrite any gateway-destined packet to 127.0.0.1. (NFS no longer goes
+    // through here — it's served in-process by the NAT before this point.)
     fn nfs_remap_dst(&self, dst_ip: Ipv4Addr, dport: u16) -> (Ipv4Addr, u16) {
         if dst_ip != self.config.gateway_ip { return (dst_ip, dport); }
-        if let Some(nfs) = &self.config.nfs {
-            match dport {
-                NFS_VM_PORT    => return (Ipv4Addr::LOCALHOST, nfs.nfs_host_port),
-                MOUNTD_VM_PORT => return (Ipv4Addr::LOCALHOST, nfs.mountd_host_port),
-                _ => {}
-            }
-        }
         // Generic outbound: guest→gateway becomes guest→host loopback on
         // the same port. Lets the guest reach any service the host is
         // running on 127.0.0.1:<dport> (pyftpdlib on 2121, python -m
@@ -1183,10 +1527,6 @@ impl NatEngine {
     // dialed, so replies look like they came from the gateway.
     fn nfs_unmap_src(&self, src_ip: Ipv4Addr, sport: u16) -> (Ipv4Addr, u16) {
         if src_ip != Ipv4Addr::LOCALHOST { return (src_ip, sport); }
-        if let Some(nfs) = &self.config.nfs {
-            if sport == nfs.nfs_host_port    { return (self.config.gateway_ip, NFS_VM_PORT);    }
-            if sport == nfs.mountd_host_port { return (self.config.gateway_ip, MOUNTD_VM_PORT); }
-        }
         // Generic outbound: reply from host-side dport becomes gateway:dport
         // to the guest.
         (self.config.gateway_ip, sport)
@@ -1469,6 +1809,10 @@ impl NatEngine {
             self.tcp_nat.remove(&key); return;
         }
 
+        // FTP ALG: a rewritten PASV reply binds a host data listener here and
+        // defers registering its forward until the `entry` borrow ends below.
+        let mut new_data_fwd: Option<(TcpListener, u16)> = None;
+        let gateway_ip = self.config.gateway_ip;
         let entry = match self.tcp_nat.get_mut(&key) {
             Some(e) => e,
             None => {
@@ -1521,7 +1865,34 @@ impl NatEngine {
                                 && seq != entry.client_seq;
             if !already_acked {
                 use std::io::Write as _;
-                let _ = entry.stream.write_all(payload);
+                // FTP ALG: on an inbound port-forward to the guest's ftpd
+                // (server = gateway, guest control port 21), rewrite a passive
+                // 227 reply so the host client reaches the data connection via a
+                // freshly-bound host forward. client_seq still advances by the
+                // *original* length (that's what the guest sent and we ACK).
+                let is_ftp_ctrl = entry.server_ip == gateway_ip && entry.client_port == 21;
+                let mut handled = false;
+                if is_ftp_ctrl && ftp_pasv_rewrite(payload, Ipv4Addr::LOCALHOST, 0).is_some() {
+                    if let Ok(listener) = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)) {
+                        if let Ok(addr) = listener.local_addr() {
+                            let host_port = addr.port();
+                            let _ = listener.set_nonblocking(true);
+                            if let Some((rewritten, data_port)) =
+                                ftp_pasv_rewrite(payload, Ipv4Addr::LOCALHOST, host_port)
+                            {
+                                dlog_dev!(LogModule::Net,
+                                    "NAT FTP ALG: PASV guest data port {} -> host 127.0.0.1:{}",
+                                    data_port, host_port);
+                                let _ = entry.stream.write_all(&rewritten);
+                                new_data_fwd = Some((listener, data_port));
+                                handled = true;
+                            }
+                        }
+                    }
+                }
+                if !handled {
+                    let _ = entry.stream.write_all(payload);
+                }
                 entry.client_seq = seq.wrapping_add(payload.len() as u32);
             }
             let sip  = entry.server_ip;
@@ -1555,6 +1926,19 @@ impl NatEngine {
             use std::net::Shutdown;
             let _ = entry.stream.shutdown(Shutdown::Write);
             entry.fin_wait = true;
+        }
+
+        // Register the FTP-ALG data forward now that the `entry` borrow is gone.
+        // Transient and FIFO-bounded so a long session's PASV transfers don't
+        // leak host listeners; the oldest is dropped once the cap is hit.
+        if let Some((listener, data_port)) = new_data_fwd {
+            const MAX_FTP_DATA_FWD: usize = 16;
+            while self.tcp_fwd_listeners.len() >= self.fwd_static_count + MAX_FTP_DATA_FWD
+                && self.tcp_fwd_listeners.len() > self.fwd_static_count
+            {
+                self.tcp_fwd_listeners.remove(self.fwd_static_count); // drop oldest dynamic
+            }
+            self.tcp_fwd_listeners.push(TcpFwdListener { listener, guest_port: data_port });
         }
     }
 
@@ -1678,7 +2062,9 @@ impl NatEngine {
             if self.fwd_ephemeral_next < 49152 { self.fwd_ephemeral_next = 49152; }
 
             let client_isn = 0x6000_0000u32.wrapping_add(ephemeral as u32);
-            let guest_ip   = self.config.client_ip;
+            // Forward to the guest's *actual* IP (learned from its traffic), not
+            // the assumed NAT client address — a static guest can be on any host.
+            let guest_ip   = self.ctl.observed_guest_ip().unwrap_or(self.config.client_ip);
             let gw_ip      = self.config.gateway_ip;
             let gw_mac     = self.config.gateway_mac;
 
@@ -1742,7 +2128,7 @@ impl NatEngine {
             {
                 fwd.last_sender = Some(from);
             }
-            let guest_ip = self.config.client_ip;
+            let guest_ip = self.ctl.observed_guest_ip().unwrap_or(self.config.client_ip);
             let gw_ip    = self.config.gateway_ip;
             let gw_mac   = self.config.gateway_mac;
             // Inject as UDP: src=gateway_ip:host_port dst=guest_ip:guest_port

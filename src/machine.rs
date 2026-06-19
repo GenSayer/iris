@@ -701,6 +701,13 @@ impl Machine {
         self.hpc3.ioc().scc().inject_b(bytes);
     }
 
+    /// Read (and consume) IRIX serial-console (tty1) output captured in-process
+    /// since the last call. Pairs with `inject_serial_console` to drive a
+    /// request/response probe over the console without a loopback TCP client.
+    pub fn read_serial_console(&self) -> Vec<u8> {
+        self.hpc3.ioc().scc().drain_console()
+    }
+
     /// CPU thread, started explicitly by the CI `start` command or by
     /// `ci_restore`. In `--ci` mode the CPU is not autostarted in `start()`
     /// — the harness drives startup via `restore`.
@@ -714,6 +721,71 @@ impl Machine {
     /// guest has shut down without subscribing to machine events.
     pub fn cpu_is_running(&self) -> bool {
         self.cpu.is_running()
+    }
+
+    /// Number of attached CHD disks whose `.diff.chd` holds changes pending a
+    /// fold-back into the base on a clean shutdown (the "Synchronizing disks"
+    /// step). 0 means a clean exit needs no disk sync.
+    pub fn pending_chd_sync_count(&self) -> usize {
+        self.hpc3.scsi().pending_chd_sync_count()
+    }
+
+    /// Fold every pending CHD diff back into its base, preserving compression.
+    /// Call only after the guest has stopped (so disk I/O is quiesced).
+    /// `progress(done, total, fraction)` drives a UI; `cancel()` aborts cleanly,
+    /// leaving un-synced bases+diffs intact. Returns the count synced.
+    pub fn sync_chd_disks(
+        &self,
+        progress: &mut dyn FnMut(usize, usize, f32),
+        cancel: &dyn Fn() -> bool,
+    ) -> std::io::Result<usize> {
+        self.hpc3.scsi().sync_chd_disks(progress, cancel)
+    }
+
+    /// Cumulative count of guest-originated Ethernet frames the NAT engine has
+    /// processed. Monotonic for the life of the machine; an embedder samples the
+    /// delta to tell whether the guest's internal networking is alive.
+    pub fn net_guest_frames(&self) -> u64 {
+        self.hpc3.seeq().nat_control().guest_frames()
+    }
+
+    /// NAT addresses the emulator hands the guest: (ec0 client IP, gateway IP,
+    /// netmask) — the source of truth for what the guest's ec0 should be.
+    pub fn nat_expected(&self) -> (std::net::Ipv4Addr, std::net::Ipv4Addr, std::net::Ipv4Addr) {
+        self.hpc3.seeq().gateway_addrs()
+    }
+
+    /// The guest's own source IP as last seen on the wire (None if no frame has
+    /// revealed one yet). Captured passively, so it works even when the guest's
+    /// networking is misconfigured and nothing routes.
+    pub fn net_observed_guest_ip(&self) -> Option<std::net::Ipv4Addr> {
+        self.hpc3.seeq().nat_control().observed_guest_ip()
+    }
+
+    /// The guest's likely default gateway, inferred passively from the in-subnet
+    /// address it keeps ARP-ing for but can't resolve. None if none seen.
+    pub fn net_observed_gateway(&self) -> Option<std::net::Ipv4Addr> {
+        self.hpc3.seeq().nat_control().observed_gateway()
+    }
+
+    /// Move the running NAT onto a new subnet without a reboot: the NAT thread
+    /// swaps its `(gateway, client, netmask)` and flushes connection state on
+    /// its next loop. Typically gateway = network+1, client = network+2.
+    pub fn set_nat_subnet(&self, gateway: std::net::Ipv4Addr, client: std::net::Ipv4Addr, netmask: std::net::Ipv4Addr) {
+        self.hpc3.seeq().nat_control().request_subnet(gateway, client, netmask);
+    }
+
+    /// Tell the NAT engine the host's own IPv4 networks `(network, prefix)` so it
+    /// won't adopt a guest subnet that overlaps them (which would shadow the
+    /// host's real LAN). The embedder gathers these from the host interfaces.
+    pub fn set_host_nets(&self, nets: Vec<(std::net::Ipv4Addr, u8)>) {
+        self.hpc3.seeq().nat_control().set_host_nets(nets);
+    }
+
+    /// Replace the running NAT's inbound port-forward rules without a reboot;
+    /// the NAT thread rebinds its host listeners on its next loop.
+    pub fn set_port_forwards(&self, rules: Vec<crate::config::PortForwardConfig>) {
+        self.hpc3.seeq().nat_control().set_port_forwards(rules);
     }
 
     /// Step the CPU `n` instructions in-line on the calling thread, with all

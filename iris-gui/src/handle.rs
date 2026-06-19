@@ -1,9 +1,10 @@
 use crate::framebuffer::{CaptureRenderer, FrameSink};
 use crossbeam_channel::{unbounded, Receiver, Sender};
-use iris::config::MachineConfig;
+use iris::config::{MachineConfig, PortForwardConfig};
 use iris::machine::Machine;
 use iris::ps2::Ps2Controller;
 use parking_lot::Mutex;
+use std::net::Ipv4Addr;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::thread::JoinHandle;
@@ -15,9 +16,27 @@ pub enum Cmd {
     /// Type `halt\n` at the IRIX serial console in-process (no loopback socket)
     /// for a clean guest shutdown.
     HaltIrix,
+    /// Move the running NAT onto a new subnet live (CIDR string, e.g.
+    /// `192.168.1.0/24`) — no reboot. Ignored if not running / invalid.
+    SetNatSubnet(String),
+    /// Rebind the running NAT's inbound port-forward listeners from this rule
+    /// set, live — no reboot. Ignored if not running.
+    SetPortForwards(Vec<PortForwardConfig>),
     SaveState(String),
     RestoreState(String),
     Screenshot(PathBuf),
+    /// Stop the machine and fold any pending CHD `.diff.chd` sidecars back into
+    /// their bases ("Synchronizing disks"), emitting `SyncProgress`/`SyncDone`.
+    /// Sent on a clean exit when `Status::chd_sync_pending` is set.
+    SyncDisks,
+    /// Commit a single disk's COW overlay into its base ("apply changes"). File-
+    /// level (no machine) — only valid while stopped. `chd` picks the `.diff.chd`
+    /// vs raw `.overlay` path. A CHD commit streams `SyncProgress`/`SyncDone`
+    /// (it recompresses); a raw commit ends with `CowDone`.
+    CowCommit { base: String, chd: bool },
+    /// Discard a single disk's COW overlay ("roll back") — delete the
+    /// `.diff.chd` / `.overlay`. File-level; only valid while stopped.
+    CowReset { base: String, chd: bool },
     Quit,
 }
 
@@ -35,6 +54,14 @@ pub enum Evt {
     Screenshot(PathBuf),
     Error(String),
     Status(Status),
+    /// Per-disk progress of a `SyncDisks` run: `disk` of `total` disks, the
+    /// current disk `fraction` (0.0..=1.0) through its rebuild.
+    SyncProgress { disk: usize, total: usize, fraction: f32 },
+    /// `SyncDisks` finished; the app may now close. Carries the disks synced.
+    SyncDone(usize),
+    /// A `CowCommit` (raw) or `CowReset` finished. `committed` = changes were
+    /// applied (vs rolled back / nothing to do).
+    CowDone { committed: bool },
 }
 
 #[derive(Debug, Clone, Default)]
@@ -52,6 +79,48 @@ pub struct Status {
     /// PROM after an IRIX `halt` (0 MIPS). When set, the guest has shut down and
     /// stopping the machine can't corrupt a disk — see [`crate::safe_stop`].
     pub cpu_halted: bool,
+    /// The CPU thread has actually stopped — a soft power-off called
+    /// `Machine::stop`. Unlike `cpu_halted` this is NOT set by mere 0-MIPS idle
+    /// (PROM prompt, idle desktop), so it's the precise "the machine powered
+    /// off" signal the framebuffer overlay uses.
+    pub cpu_stopped: bool,
+    /// At least one attached CHD has diff-borne changes pending a fold-back into
+    /// its base on a clean shutdown — drives the "Synchronizing disks" step.
+    pub chd_sync_pending: bool,
+    /// Cumulative count of guest Ethernet frames the NAT engine has processed.
+    /// Monotonic within a run; the handle watches it advance to light the
+    /// internal-network indicator (see [`EmulatorHandle::net_state`]).
+    pub net_frames: u64,
+    /// The guest's observed source IP (None until a frame reveals one) and the
+    /// address NAT expects it to have. Drive the "Check networking" diagnosis.
+    pub net_guest_ip: Option<Ipv4Addr>,
+    /// The guest's likely default gateway (passively inferred from its ARPs).
+    pub net_guest_gateway: Option<Ipv4Addr>,
+    /// IRIS's current NAT gateway (reflects any live adoption).
+    pub net_nat_gateway: Option<Ipv4Addr>,
+}
+
+/// State of the internal-network ("NET") indicator shown next to MIPS.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NetState {
+    /// Guest isn't executing — stopped, halted, or idle at the PROM (grey).
+    Off,
+    /// NAT IP traffic has flowed this run — networking is up (green).
+    Active,
+    /// Running, but no NAT IP traffic seen yet this run (red).
+    Idle,
+}
+
+/// Pure decision for the NET indicator, factored out so it's unit-testable
+/// without a live machine. Grey whenever the guest isn't executing; otherwise
+/// green once NAT IP traffic has been seen this run (`net_seen > 0`) — the
+/// signal latches, since a guest that has networked doesn't become misconfigured
+/// just by going idle — else red.
+fn net_state_for(running: bool, halted: bool, net_seen: u64) -> NetState {
+    if !running || halted {
+        return NetState::Off;
+    }
+    if net_seen > 0 { NetState::Active } else { NetState::Idle }
 }
 
 pub struct EmulatorHandle {
@@ -66,6 +135,10 @@ pub struct EmulatorHandle {
     /// `None` when no machine is up.
     pub ps2: Arc<Mutex<Option<Arc<Ps2Controller>>>>,
     pub status: Status,
+    /// NAT IP-frame count observed this run (reset on Start). Non-zero once the
+    /// guest's networking has actually carried traffic; latches the NET
+    /// indicator green for the rest of the run.
+    net_seen_frames: u64,
 }
 
 impl EmulatorHandle {
@@ -95,6 +168,7 @@ impl EmulatorHandle {
             frame_sink,
             ps2,
             status: Status::default(),
+            net_seen_frames: 0,
         }
     }
 
@@ -113,9 +187,30 @@ impl EmulatorHandle {
                 self.status.mips = s.mips;
                 self.status.dirty_cow = s.dirty_cow;
                 self.status.cpu_halted = s.cpu_halted;
+                self.status.cpu_stopped = s.cpu_stopped;
+                self.status.chd_sync_pending = s.chd_sync_pending;
+                // Latch the NET light: once NAT IP traffic has flowed this run
+                // the guest's networking is up, so keep it green through idle
+                // lulls (it resets to red on the next Start).
+                if s.net_frames > self.net_seen_frames {
+                    self.net_seen_frames = s.net_frames;
+                }
+                self.status.net_frames = s.net_frames;
+                self.status.net_guest_ip = s.net_guest_ip;
+                self.status.net_guest_gateway = s.net_guest_gateway;
+                self.status.net_nat_gateway = s.net_nat_gateway;
             }
             match &evt {
-                Evt::Started => self.status.running = true,
+                Evt::Started => {
+                    self.status.running = true;
+                    // Clear a stale stop from the previous run so the new boot
+                    // isn't dimmed before the first status tick lands.
+                    self.status.cpu_stopped = false;
+                    // Fresh machine → fresh NAT counter (starts at 0); reset our
+                    // tracking so the indicator starts red and only greens on
+                    // this run's first observed NAT traffic.
+                    self.net_seen_frames = 0;
+                }
                 Evt::Stopped => self.status.running = false,
                 Evt::PowerOff => self.status.power_off_seen = true,
                 _ => {}
@@ -126,6 +221,17 @@ impl EmulatorHandle {
     }
 
     pub fn is_running(&self) -> bool { self.status.running }
+
+    /// Whether a clean exit needs a "Synchronizing disks" step (a CHD has
+    /// diff-borne changes to fold back into its base). Latest reported status.
+    pub fn has_pending_chd_sync(&self) -> bool { self.status.chd_sync_pending }
+
+    /// State of the internal-network indicator: grey when the guest isn't
+    /// executing (stopped/halted/PROM), green once NAT IP traffic has flowed
+    /// this run, red while a running guest has produced no NAT traffic yet.
+    pub fn net_state(&self) -> NetState {
+        net_state_for(self.status.running, self.status.cpu_halted, self.net_seen_frames)
+    }
 
     /// Stop the machine (if running) and join the worker thread. Idempotent.
     /// Call this from the GUI's `on_exit` so a running machine is cleaned up
@@ -146,6 +252,23 @@ impl Drop for EmulatorHandle {
     // path). No-op once the worker has already been joined.
     fn drop(&mut self) {
         self.shutdown();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn net_indicator_states() {
+        // Unpowered (not running) → grey, regardless of past traffic.
+        assert_eq!(net_state_for(false, false, 42), NetState::Off);
+        // Running but halted / idle at the PROM → grey.
+        assert_eq!(net_state_for(true, true, 42), NetState::Off);
+        // Running, no NAT traffic seen yet → red.
+        assert_eq!(net_state_for(true, false, 0), NetState::Idle);
+        // Running, NAT traffic has flowed → green (and latches, so it stays).
+        assert_eq!(net_state_for(true, false, 1), NetState::Active);
     }
 }
 
@@ -187,7 +310,16 @@ fn worker_loop(
                         // instructions this window (halted/idle at the PROM, 0 MIPS).
                         let cpu_stopped = machine.as_ref().map_or(true, |m| !m.cpu_is_running());
                         let cpu_halted = cpu_stopped || mips == 0.0;
-                        let _ = evt_tx.send(Evt::Status(Status { mips, cpu_halted, ..Status::default() }));
+                        let chd_sync_pending = machine.as_ref().map_or(false, |m| m.pending_chd_sync_count() > 0);
+                        let net_frames = machine.as_ref().map_or(0, |m| m.net_guest_frames());
+                        let net_guest_ip = machine.as_ref().and_then(|m| m.net_observed_guest_ip());
+                        let net_guest_gateway = machine.as_ref().and_then(|m| m.net_observed_gateway());
+                        let net_nat_gateway = machine.as_ref().map(|m| m.nat_expected().1);
+                        let _ = evt_tx.send(Evt::Status(Status {
+                            mips, cpu_halted, cpu_stopped, chd_sync_pending,
+                            net_frames, net_guest_ip, net_guest_gateway, net_nat_gateway,
+                            ..Status::default()
+                        }));
                     }
                 }
                 continue;
@@ -228,6 +360,11 @@ fn worker_loop(
                 }));
                 match result {
                     Ok(m) => {
+                        // Tell the NAT the host's own networks so it won't adopt a
+                        // guest subnet that overlaps the host's real LAN/VPN/Docker.
+                        m.set_host_nets(
+                            crate::netplan::gather_host_ifaces()
+                                .into_iter().map(|h| (h.network, h.prefix)).collect());
                         *ps2_slot.lock() = Some(m.get_ps2());
                         // Latch REX3's cycle counter for the live MIPS estimate.
                         cycles = m.get_rex3().map(|r| r.cycles.clone());
@@ -251,6 +388,18 @@ fn worker_loop(
                     None => { let _ = evt_tx.send(Evt::Error("halt: not running".into())); }
                 }
             }
+            Ok(Cmd::SetNatSubnet(cidr)) => {
+                match machine.as_ref() {
+                    Some(m) => match iris::config::parse_nat_subnet(&cidr) {
+                        Ok((gateway, client, netmask)) => m.set_nat_subnet(gateway, client, netmask),
+                        Err(e) => { let _ = evt_tx.send(Evt::Error(format!("set NAT subnet '{cidr}': {e}"))); }
+                    },
+                    None => { let _ = evt_tx.send(Evt::Error("set NAT subnet: not running".into())); }
+                }
+            }
+            Ok(Cmd::SetPortForwards(rules)) => {
+                if let Some(m) = machine.as_ref() { m.set_port_forwards(rules); }
+            }
             Ok(Cmd::Stop) => {
                 if let Some(m) = machine.take() {
                     *ps2_slot.lock() = None;
@@ -263,6 +412,80 @@ fn worker_loop(
                     let _ = evt_tx.send(Evt::Stopped);
                 } else {
                     let _ = evt_tx.send(Evt::Error("not running".into()));
+                }
+            }
+            Ok(Cmd::SyncDisks) => {
+                // Clean-exit disk sync: stop the machine (quiescing disk I/O),
+                // then fold each pending CHD diff back into its base, streaming
+                // progress so the GUI can show "Synchronizing disks…". The
+                // machine is dropped afterwards, exactly like a Stop.
+                let mut synced = 0usize;
+                if let Some(mut m) = machine.take() {
+                    *ps2_slot.lock() = None;
+                    cycles = None;
+                    m.stop();
+                    synced = m
+                        .sync_chd_disks(
+                            &mut |disk, total, fraction| {
+                                let _ = evt_tx.send(Evt::SyncProgress { disk, total, fraction });
+                            },
+                            &|| false,
+                        )
+                        .unwrap_or(0);
+                    // `m` dropped here → fully torn down.
+                }
+                let _ = evt_tx.send(Evt::Stopped);
+                let _ = evt_tx.send(Evt::SyncDone(synced));
+            }
+            Ok(Cmd::CowCommit { base, chd }) => {
+                // File-level commit (the GUI only offers this while stopped, so
+                // the disk files are closed). CHD recompresses with progress; raw
+                // applies the overlay in place.
+                if chd {
+                    let diff = iris::chd_disk::diff_path_for(std::path::Path::new(&base));
+                    if diff.exists() {
+                        let _ = evt_tx.send(Evt::SyncProgress { disk: 0, total: 1, fraction: 0.0 });
+                        match iris::chd_disk::flatten_diff(
+                            std::path::Path::new(&base),
+                            &diff,
+                            &mut |f| { let _ = evt_tx.send(Evt::SyncProgress { disk: 0, total: 1, fraction: f }); },
+                            &|| false,
+                        ) {
+                            Ok(()) => { let _ = evt_tx.send(Evt::SyncDone(1)); }
+                            Err(e) => {
+                                let _ = evt_tx.send(Evt::Error(format!("commit failed: {e}")));
+                                let _ = evt_tx.send(Evt::SyncDone(0));
+                            }
+                        }
+                    } else {
+                        let _ = evt_tx.send(Evt::CowDone { committed: false });
+                    }
+                } else {
+                    let overlay = format!("{base}.overlay");
+                    if std::path::Path::new(&overlay).exists() {
+                        match iris::cow_disk::CowDisk::new(&base, &overlay).and_then(|mut c| c.commit()) {
+                            Ok(_) => { let _ = evt_tx.send(Evt::CowDone { committed: true }); }
+                            Err(e) => { let _ = evt_tx.send(Evt::Error(format!("commit failed: {e}"))); }
+                        }
+                    } else {
+                        let _ = evt_tx.send(Evt::CowDone { committed: false });
+                    }
+                }
+            }
+            Ok(Cmd::CowReset { base, chd }) => {
+                // Roll back: discard the overlay. File-level; stopped-only.
+                let target = if chd {
+                    iris::chd_disk::diff_path_for(std::path::Path::new(&base))
+                } else {
+                    let _ = std::fs::remove_file(format!("{base}.overlay.dirty"));
+                    std::path::PathBuf::from(format!("{base}.overlay"))
+                };
+                match std::fs::remove_file(&target) {
+                    Ok(()) => { let _ = evt_tx.send(Evt::CowDone { committed: false }); }
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                        let _ = evt_tx.send(Evt::CowDone { committed: false });
+                    }
+                    Err(e) => { let _ = evt_tx.send(Evt::Error(format!("roll back failed: {e}"))); }
                 }
             }
             Ok(Cmd::SaveState(name)) => {

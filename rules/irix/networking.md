@@ -12,6 +12,13 @@
 
 ## Common mistakes
 
+- **Networking turned off:** `/etc/config/network` must be `on` (set it with
+  `chkconfig network on`). If it's `off` or missing, the network rc scripts never
+  run, `ec0` is never configured, and the guest emits **no traffic at all** — the
+  GUI's "Check networking" window shows "No guest traffic seen yet" with no error.
+  Reboot after enabling (or `/etc/init.d/network start`). Easy to miss because
+  every other file can be correct and networking still won't start.
+
 - **Wrong filename:** Use `ifconfig-ec0.options`, NOT `ifconfig-1.options`.
   IRIX names config files after the interface device name.
 

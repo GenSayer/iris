@@ -590,9 +590,17 @@ pub struct Z85c30 {
     // "Send IRIX halt") can type at the console without opening a loopback TCP
     // client. Independent of whichever backend is installed.
     inject_b: Arc<Mutex<VecDeque<u8>>>,
+    // Bounded mirror of channel-B (IRIX serial console) guest output. Lets an
+    // in-process reader — the GUI's network probe — scrape the console without
+    // opening the 8881 TCP socket. Oldest bytes drop once full.
+    console_buf: Arc<Mutex<VecDeque<u8>>>,
     running: Arc<AtomicBool>,
     threads: Arc<Mutex<Vec<thread::JoinHandle<()>>>>,
 }
+
+/// Cap on the channel-B console mirror (`console_buf`). 64 KiB is far more than
+/// any single probe response; the buffer is drained on each read.
+const CONSOLE_TAP_CAP: usize = 64 * 1024;
 
 impl Z85c30 {
     /// Default constructor: binds TCP serial backends on 127.0.0.1:8880
@@ -635,6 +643,7 @@ impl Z85c30 {
             backend_a: Arc::new(Mutex::new(backend_a)),
             backend_b: Arc::new(Mutex::new(backend_b)),
             inject_b: Arc::new(Mutex::new(VecDeque::new())),
+            console_buf: Arc::new(Mutex::new(VecDeque::new())),
             running: Arc::new(AtomicBool::new(false)),
             threads: Arc::new(Mutex::new(Vec::new())),
         }
@@ -669,6 +678,13 @@ impl Z85c30 {
     /// depend on the serial server socket.
     pub fn inject_b(&self, data: &[u8]) {
         self.inject_b.lock().extend(data.iter().copied());
+    }
+
+    /// Drain and return the channel-B (IRIX serial console) output captured
+    /// since the last call. Empties the mirror buffer. Used by the GUI network
+    /// probe to read the guest's response to an injected command in-process.
+    pub fn drain_console(&self) -> Vec<u8> {
+        self.console_buf.lock().drain(..).collect()
     }
 
     pub fn read_a_control(&self) -> u8 { 
@@ -815,7 +831,10 @@ impl Device for Z85c30 {
             let tx_channel = channel_arc.clone();
             let tx_backend = backend.clone();
             let running = self.running.clone();
-            
+            // Channel B (i == 1) is the IRIX serial console — mirror its output
+            // into console_buf for in-process readers (the GUI network probe).
+            let tx_tap = if i == 1 { Some(self.console_buf.clone()) } else { None };
+
             threads.push(thread::Builder::new().name(format!("SCC-TX-{}", ch_name)).spawn(move || {
                 let mut last_tx_time = Instant::now();
                 let channel_name = {
@@ -874,6 +893,11 @@ impl Device for Z85c30 {
 
                         // Output character
                         crate::dlog_dev!(LogModule::Scc, "SCC: TX({}) '{}' ({:02x})", channel_name, if byte.is_ascii_graphic() { byte as char } else { '.' }, byte);
+                        if let Some(tap) = &tx_tap {
+                            let mut b = tap.lock();
+                            while b.len() >= CONSOLE_TAP_CAP { b.pop_front(); }
+                            b.push_back(byte);
+                        }
                         tx_backend.send_byte(byte);
 
                         // Transmission complete: fire Tx interrupt (once) to

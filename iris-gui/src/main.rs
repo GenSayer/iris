@@ -7,6 +7,8 @@ mod framebuffer;
 mod handle;
 mod input;
 mod macos_sandbox;
+mod netfix;
+mod netplan;
 mod safe_stop;
 mod scsi_menu;
 mod serial_console;
@@ -18,7 +20,7 @@ use dialogs::create_disk::CreateDiskDialog;
 use dialogs::new_machine::{distribute_ram, NewMachineDialog};
 use eframe::egui;
 use egui::{Color32, RichText, ViewportCommand};
-use handle::{Cmd, EmulatorHandle, Evt};
+use handle::{Cmd, EmulatorHandle, Evt, NetState};
 use iris::config::MachineConfig;
 use safe_stop::{evaluate, reason_lines};
 use settings::{GuiSettings, UI_SCALE_MAX, UI_SCALE_MIN, WINDOW_DEFAULT_SIZE};
@@ -117,7 +119,7 @@ fn main() -> eframe::Result<()> {
         // Open large enough for the 1280×1024 display + chrome so it looks right
         // immediately; clamp to the monitor so it can't overflow a smaller
         // screen. Persisted size (once saved) takes precedence over the default.
-        .with_inner_size(prefs.window_size.unwrap_or(WINDOW_DEFAULT_SIZE))
+        .with_inner_size(WINDOW_DEFAULT_SIZE)
         .with_clamp_size_to_monitor_size(true)
         // Start hidden so the first frame can fit the window to the monitor
         // (see the reveal logic in `update`) before it's shown — the window
@@ -159,11 +161,19 @@ struct App {
     missing_modal: Option<MissingDiskModal>,
     /// Set when the user clicks "Use embedded PROM"; drives a confirmation modal.
     confirm_embedded_prom: bool,
+    /// Host interface networks (from `if-addrs`), used by the Networking tab for
+    /// first-free subnet presets and overlap warnings. Sampled once at launch.
+    net_ifaces: Vec<netplan::HostIface>,
+    /// Set when the Networking tab commits a subnet that fails the sanity checks
+    /// (non-RFC1918 or a host conflict); drives the Override/Cancel modal.
+    net_sanity_modal: Option<NetSanityModal>,
     new_machine: NewMachineDialog,
     create_disk: CreateDiskDialog,
     /// If true, central panel shows the tabbed config editor; otherwise the
     /// welcome/status summary panel (default — most config lives in menus).
     show_config_editor: bool,
+    /// Whether the "Check networking" diagnosis window is open.
+    show_net_check: bool,
     save_state_name: String,
     restore_state_name: String,
     /// egui texture holding the most recent REX3 framebuffer. Allocated
@@ -189,10 +199,10 @@ struct App {
     /// Not set on Start — the window size is latched at app load, so launching
     /// the VM never resizes the window.
     pending_fb_snap: bool,
-    /// True on a first-ever launch (no persisted window size). Consumed on the
-    /// first frame that knows the monitor size, to fit the window to a 1280×1024
-    /// display at the chosen VM scale so it opens at a sensible, windowed size
-    /// before the first Start. Returning users just reopen at their saved size.
+    /// Set at every launch. Consumed on the first frame that knows the monitor
+    /// size, to fit the window to a 1280×1024 display at the chosen VM scale.
+    /// Window size is no longer persisted — each launch re-derives it from
+    /// `vm_scale`, so the window opens at a consistent scale every time.
     pending_launcher_fit: bool,
     /// The window starts hidden (`with_visible(false)`) so the first frame can
     /// fit it to the monitor before it's shown. Set true once we've revealed it.
@@ -222,10 +232,45 @@ struct App {
     serial_input: String,
     /// Whether the "How camera & networking work" Help window is open.
     show_help_info: bool,
+    /// Whether the "Mount the shared folder in IRIX" Help window is open.
+    show_nfs_help: bool,
+    /// Active "Synchronizing disks…" job (folding CHD diffs back into bases on a
+    /// clean exit); `Some` shows the modal. `None` when no sync is in flight.
+    syncing: Option<SyncJob>,
+    /// Latched once the exit-time disk sync has been kicked off, so the close
+    /// isn't re-intercepted after it finishes.
+    sync_then_close: bool,
+    /// Pending "Discard changes (roll back)" awaiting confirmation; `Some` shows
+    /// the are-you-sure modal.
+    cow_discard_confirm: Option<CowDiscard>,
+}
+
+/// Progress of the exit-time "Synchronizing disks…" step.
+struct SyncJob {
+    /// Disk index currently being synced (0-based) and the total count.
+    disk: usize,
+    total: usize,
+    /// Fraction (0.0..=1.0) through the current disk's rebuild.
+    fraction: f32,
+}
+
+/// A COW overlay the user has asked to discard, awaiting confirmation.
+struct CowDiscard {
+    id: u8,
+    base: String,
+    chd: bool,
 }
 
 struct StopModal {
     lines: Vec<String>,
+}
+
+/// Confirmation when the Networking tab commits a sanity-failing subnet. Cancel
+/// restores `revert_to`; Override keeps the value as typed.
+struct NetSanityModal {
+    reason: String,
+    suggestion: String,
+    revert_to: Option<String>,
 }
 
 /// One SCSI device that is missing its backing file at Start time.
@@ -313,7 +358,7 @@ impl App {
             fullscreen: false,
             // First-ever launch (no saved size) → fit the window to the monitor
             // on the first frame instead of using the static default verbatim.
-            pending_launcher_fit: prefs.window_size.is_none(),
+            pending_launcher_fit: true,
             revealed: false,
             startup_frame: 0,
             prefs,
@@ -328,9 +373,12 @@ impl App {
             stop_modal: None,
             missing_modal: None,
             confirm_embedded_prom: false,
+            net_ifaces: netplan::gather_host_ifaces(),
+            net_sanity_modal: None,
             new_machine,
             create_disk: CreateDiskDialog::default(),
             show_config_editor: false,
+            show_net_check: false,
             save_state_name: "snap1".into(),
             restore_state_name: "snap1".into(),
             fb_tex: None,
@@ -346,6 +394,10 @@ impl App {
             serial_console: None,
             serial_input: String::new(),
             show_help_info: false,
+            show_nfs_help: false,
+            syncing: None,
+            sync_then_close: false,
+            cow_discard_confirm: None,
         }
     }
 
@@ -513,12 +565,94 @@ impl App {
         self.start_emulator();
     }
 
+    /// App Store sandbox: let the user grant a folder (recursive read-write) so
+    /// disk images, the CHD diff / fold temp written beside a base, and an NFS
+    /// shared subfolder under it are all accessible from one grant. Persists a
+    /// directory security-scoped bookmark and asserts access immediately.
+    fn grant_disk_folder(&mut self) {
+        if let Some(dir) = rfd::FileDialog::new().pick_folder() {
+            let path = dir.to_string_lossy().into_owned();
+            if !self.prefs.disk_folders.contains(&path) {
+                self.prefs.disk_folders.push(path.clone());
+            }
+            let _ = self.prefs.save(); // mints the directory bookmark
+            macos_sandbox::restore(&self.prefs.bookmarks); // start accessing now
+            self.toast(format!("granted disk folder: {path}"));
+        }
+    }
+
+    /// SCSI-menu section: per-disk Commit / Discard for copy-on-write overlays.
+    /// Only offered while the machine is stopped — the disk files are closed
+    /// then, so applying or discarding can't corrupt a running guest.
+    fn draw_cow_menu(&mut self, ui: &mut egui::Ui) {
+        // Snapshot disks that currently have an overlay on disk (cloned so we
+        // don't hold a `cfg` borrow while sending worker commands below).
+        let mut entries: Vec<(u8, String, bool)> = Vec::new(); // (id, base, is_chd)
+        for (&id, dev) in &self.cfg.scsi {
+            if dev.cdrom || dev.scratch || dev.path.trim().is_empty() {
+                continue;
+            }
+            let is_chd = iris::chd_disk::is_chd(&dev.path);
+            let has_overlay = if is_chd {
+                iris::chd_disk::diff_path_for(std::path::Path::new(&dev.path)).exists()
+            } else if dev.overlay {
+                std::path::Path::new(&format!("{}.overlay", dev.path)).exists()
+            } else {
+                false
+            };
+            if has_overlay {
+                entries.push((id, dev.path.clone(), is_chd));
+            }
+        }
+        if entries.is_empty() {
+            return;
+        }
+        ui.separator();
+        ui.label(RichText::new("Copy-on-write changes").strong());
+        if self.emu.is_running() {
+            ui.label(RichText::new("Stop the machine to commit or roll back.").weak());
+            return;
+        }
+        for (id, base, is_chd) in entries {
+            let name = std::path::Path::new(&base).file_name().and_then(|n| n.to_str()).unwrap_or(&base);
+            ui.label(RichText::new(format!("SCSI {id}: {name}")).weak());
+            if ui.button("    ⬇ Commit changes to disk")
+                .on_hover_text("Permanently merge this session's overlay into the disk image")
+                .clicked()
+            {
+                if is_chd {
+                    // A CHD commit recompresses — show the progress modal.
+                    self.syncing = Some(SyncJob { disk: 0, total: 1, fraction: 0.0 });
+                }
+                self.emu.send(Cmd::CowCommit { base: base.clone(), chd: is_chd });
+                ui.close_menu();
+            }
+            if ui.button("    ↩ Discard changes (roll back)")
+                .on_hover_text("Throw away this session's overlay and revert to the disk as it was")
+                .clicked()
+            {
+                // Destructive — confirm before discarding.
+                self.cow_discard_confirm = Some(CowDiscard { id, base: base.clone(), chd: is_chd });
+                ui.close_menu();
+            }
+        }
+    }
+
     fn request_stop(&mut self) {
         let reasons = evaluate(&self.emu.status, &self.cfg);
-        if reasons.is_empty() {
-            self.emu.send(Cmd::Stop);
-        } else {
+        if !reasons.is_empty() {
             self.stop_modal = Some(StopModal { lines: reason_lines(&reasons) });
+            return;
+        }
+        // Safe to stop (guest quiesced). If a CHD has diff-borne changes, fold
+        // them back into the base now ("Synchronizing disks…") instead of leaving
+        // a sidecar — the worker stops the machine as part of the sync. This is a
+        // stop, not a quit, so `sync_then_close` stays false and the app stays open.
+        if self.emu.has_pending_chd_sync() {
+            self.syncing = Some(SyncJob { disk: 0, total: 0, fraction: 0.0 });
+            self.emu.send(Cmd::SyncDisks);
+        } else {
+            self.emu.send(Cmd::Stop);
         }
     }
 
@@ -533,6 +667,24 @@ impl App {
                 Evt::Screenshot(p)    => self.toast(format!("screenshot: {}", p.display())),
                 Evt::Error(e)         => self.toast(format!("error: {e}")),
                 Evt::Status(_) => {}
+                Evt::SyncProgress { disk, total, fraction } => {
+                    self.syncing = Some(SyncJob { disk, total, fraction });
+                }
+                Evt::CowDone { committed } => {
+                    self.toast(if committed { "changes committed to disk" } else { "done" });
+                }
+                Evt::SyncDone(n) => {
+                    self.syncing = None;
+                    if n > 0 { self.toast(format!("synchronized {n} disk{}", if n == 1 { "" } else { "s" })); }
+                    // If the sync was a pre-quit step, finish closing now. The
+                    // `sync_then_close` latch stays set so this Close isn't
+                    // re-intercepted (the machine is gone, so `chd_sync_pending`
+                    // is stale-true). A Stop-triggered sync leaves it false, so
+                    // the app stays open with the machine stopped.
+                    if self.sync_then_close {
+                        ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                    }
+                }
             }
         }
         // Repaint cadence: ~60 fps while the emulator is running so we
@@ -629,6 +781,37 @@ impl App {
                             self.save_config(path);
                         }
                         ui.close_menu();
+                    }
+                }
+                // App Store sandbox: grant a whole folder (recursive) so the
+                // disk-sync fold — which writes a temp beside the base and
+                // renames over it — works, and so a disk image / NFS shared
+                // subfolder under it is covered by one grant. Hidden elsewhere.
+                if cfg!(feature = "appstore") {
+                    ui.separator();
+                    ui.label(RichText::new("Disk folder access").strong());
+                    if ui.button("Grant a disk folder…")
+                        .on_hover_text("Pick the folder your disk images live in. Grants read/write to \
+                                        everything inside (disk images, CHD diffs, an NFS shared subfolder) \
+                                        so changes can be synced back into the disk.")
+                        .clicked()
+                    {
+                        self.grant_disk_folder();
+                        ui.close_menu();
+                    }
+                    let folders = self.prefs.disk_folders.clone();
+                    for f in &folders {
+                        ui.horizontal(|ui| {
+                            ui.label(RichText::new(f).weak());
+                            if ui.small_button("📂").on_hover_text("Reveal in Finder").clicked() {
+                                config_ui::reveal_in_file_manager(f);
+                            }
+                            if ui.small_button("✕").on_hover_text("Revoke").clicked() {
+                                self.prefs.disk_folders.retain(|x| x != f);
+                                self.prefs.bookmarks.remove(f);
+                                let _ = self.prefs.save();
+                            }
+                        });
                     }
                 }
                 ui.separator();
@@ -741,6 +924,7 @@ impl App {
                         }
                     }
                 }
+                self.draw_cow_menu(ui);
             });
             ui.menu_button("View  ▶", |ui| {
                 if ui.button(if self.fullscreen { "Exit fullscreen (F11)" } else { "Fullscreen (F11)" }).clicked() {
@@ -802,6 +986,13 @@ impl App {
                 }
                 if ui.button("ℹ How camera & networking work…").clicked() {
                     self.show_help_info = true;
+                    ui.close_menu();
+                }
+                if ui.button("🗂 Mount the shared folder in IRIX…")
+                    .on_hover_text("The exact mount command for the NFS share")
+                    .clicked()
+                {
+                    self.show_nfs_help = true;
                     ui.close_menu();
                 }
                 ui.separator();
@@ -880,9 +1071,182 @@ impl App {
         }
     }
 
+    /// Mouse/keyboard capture state for the control column, sitting between the
+    /// config controls and the status footer. Only the *capture* action is a
+    /// button — releasing stays the Ctrl+Alt+Esc hotkey, because while captured
+    /// the host pointer is grabbed by the guest and can't click anything.
+    /// Caller renders this only while the machine is running.
+    fn capture_controls(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
+        if self.input_state.captured {
+            ui.label(RichText::new("Mouse/Keyboard Captured").color(Color32::LIGHT_GREEN));
+            ui.label(RichText::new("To disable: Ctrl+Alt+Esc").weak());
+        } else {
+            ui.label(RichText::new("Mouse/Keyboard Capture Disabled").weak());
+            if ui
+                .add_sized(
+                    egui::vec2(ui.available_width(), 0.0),
+                    egui::Button::new("Capture mouse/keyboard"),
+                )
+                .clicked()
+            {
+                input::engage_capture(ctx, &mut self.input_state);
+            }
+        }
+    }
+
+    /// "Check networking" diagnosis window. Compares the guest's passively
+    /// observed IP to what IRIS's NAT expects and explains how to fix a
+    /// mismatch — no guest login required (detection is from frames the guest
+    /// already emits). The permanent auto-fix over telnet comes later.
+    fn network_check_window(&mut self, ctx: &egui::Context) {
+        if !self.show_net_check {
+            return;
+        }
+        let state = self.emu.net_state();
+        let guest = self.emu.status.net_guest_ip;
+        let gw = self.emu.status.net_guest_gateway;
+        // The configured NAT subnet, for fresh-guest guidance and the
+        // "match the guest" action. IRIS is plug-and-play: it ADOPTS whatever
+        // gateway the guest ARPs for (src/net.rs), so the guest's own subnet is
+        // fine — there is no fixed address it must use once ec0 is configured.
+        let (eb, ep) = netplan::parse_cidr(self.cfg.nat_subnet.as_deref());
+        let cfg_net = netplan::classify(eb, ep, &[]).derived;
+        let fresh_hint = cfg_net.as_ref().map(|d| format!(
+            "If ec0 is unconfigured, the simplest setup is IRIS's defaults: ec0 {}, gateway {}, mask {}.",
+            d.client, d.gateway, d.netmask));
+        let mut switch_to: Option<String> = None;
+        let mut open = true;
+        egui::Window::new("Check networking")
+            .collapsible(false)
+            .resizable(false)
+            .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+            .open(&mut open)
+            .show(ctx, |ui| {
+                ui.set_max_width(440.0);
+                match state {
+                    NetState::Off => {
+                        ui.label("Start the machine first, then check again.");
+                        return;
+                    }
+                    NetState::Active => {
+                        ui.label(RichText::new("Networking is up")
+                            .color(Color32::from_rgb(0x35, 0xb8, 0x4a)).strong());
+                        let who = guest.map(|i| i.to_string()).unwrap_or_else(|| "The guest".into());
+                        ui.label(format!("{who} is reaching the network through IRIS."));
+                        if let Some(g) = gw {
+                            ui.label(RichText::new(format!("Gateway in use: {g} (adopted by IRIS).")).weak());
+                        }
+                        return;
+                    }
+                    NetState::Idle => {} // running but no traffic — diagnose below
+                }
+                let Some(ip) = guest else {
+                    ui.label(RichText::new("No guest traffic seen yet").strong());
+                    ui.label("If IRIX just booted, give it a few seconds and re-check. \
+                              Otherwise ec0 may be unconfigured, or networking may be turned \
+                              off in IRIX.");
+                    ui.add_space(4.0);
+                    ui.label(RichText::new("Make sure networking is enabled (as root):").strong());
+                    ui.code("chkconfig network on");
+                    ui.label(RichText::new(
+                        "Networking is off in some IRIX setups (the /etc/config/network flag); \
+                         with it off the guest sends no traffic at all. After enabling, reboot \
+                         (or run /etc/init.d/network start).").weak());
+                    if let Some(l) = &fresh_hint { ui.label(RichText::new(l).weak()); }
+                    return;
+                };
+                let o = ip.octets();
+                let guest_net = std::net::Ipv4Addr::new(o[0], o[1], o[2], 0);
+                let sub_gw = std::net::Ipv4Addr::new(o[0], o[1], o[2], 1);
+                ui.label(RichText::new("Networking is down")
+                    .color(Color32::from_rgb(0xd9, 0x4a, 0x3d)).strong());
+                ui.label(format!("Your guest is using {ip} (network {guest_net}/24)."));
+                ui.add_space(6.0);
+                match gw {
+                    Some(g) => {
+                        ui.label(format!(
+                            "Its gateway is {g}, and IRIS adopts the guest's gateway automatically, so this \
+                             should come up within a few seconds. Leave it a moment and re-check."));
+                        ui.label(RichText::new(
+                            "If it stays red, the guest's gateway may be unreachable; log in as root to \
+                             check it.").weak());
+                    }
+                    None => {
+                        ui.label("Its routing table has no default gateway, so it can reach only its own \
+                                  subnet. IRIS adopts whatever gateway you point it at, so the fix is just \
+                                  to give the guest a default route (no need to match subnets by hand):");
+                        ui.add_space(4.0);
+                        ui.label(RichText::new("Log in as root (serial console or a winterm) and run:").strong());
+                        ui.code(format!("/usr/etc/route add default {sub_gw} 1"));
+                        ui.label(RichText::new(
+                            "Lasts until reboot; to persist it, set the default route in IRIX's network \
+                             config (5.3 and 6.5 differ).").weak());
+                    }
+                }
+                // Optional: align IRIS's configured subnet to the guest's, for a
+                // guest kept permanently on a fixed subnet. IRIS adopts live
+                // regardless; this just makes IRIS's default match on next boot.
+                let cfg_base = cfg_net.as_ref().map(|d| d.network);
+                if cfg_base != Some(guest_net) {
+                    ui.add_space(6.0);
+                    ui.separator();
+                    match netplan::conflict(guest_net, 24, &self.net_ifaces) {
+                        Some(h) => {
+                            // The guest's subnet is one the host itself uses.
+                            // Refuse to move IRIS there (it would shadow the
+                            // host's real network); tell the user to renumber the
+                            // guest onto IRIS's own subnet instead.
+                            ui.label(RichText::new(format!(
+                                "The guest's subnet {guest_net}/24 overlaps your host network ({} {}). \
+                                 IRIS won't move its NAT onto your real network, so change the Indy's \
+                                 address instead — put ec0 on IRIS's own subnet:", h.name, h.addr))
+                                .color(Color32::from_rgb(0xd9, 0x4a, 0x3d)));
+                            if let Some(d) = cfg_net.as_ref() {
+                                ui.add_space(4.0);
+                                ui.label(RichText::new("Log in as root (serial console or a winterm) and run:").strong());
+                                let e = netfix::ExpectedNet { ip: d.client, gateway: d.gateway, netmask: d.netmask };
+                                for cmd in netfix::runtime_fix_commands(&e) {
+                                    ui.code(cmd);
+                                }
+                                ui.label(RichText::new(format!(
+                                    "That puts ec0 on {} (gateway {}), which doesn't clash with your \
+                                     network. Re-check after.", d.client, d.gateway)).weak());
+                            }
+                        }
+                        None => {
+                            let where_ = cfg_net.as_ref()
+                                .map(|d| format!("{}/{}", d.network, d.prefix))
+                                .unwrap_or_else(|| "a different subnet".into());
+                            ui.label(RichText::new(format!(
+                                "IRIS's NAT defaults to {where_}. You can make IRIS default to the guest's \
+                                 subnet instead:")).weak());
+                            if ui.button(format!("Set IRIS's NAT subnet to {guest_net}/24")).clicked() {
+                                switch_to = Some(format!("{guest_net}/24"));
+                            }
+                        }
+                    }
+                }
+            });
+        if let Some(s) = switch_to {
+            self.cfg.nat_subnet = Some(s.clone());
+            self.mark_dirty();
+            if self.emu.is_running() {
+                // Apply to the running NAT so the guest can route immediately,
+                // and persist for next launch.
+                self.emu.send(Cmd::SetNatSubnet(s.clone()));
+                self.toast(format!("NAT subnet set to {s} (applied live)"));
+            } else {
+                self.toast(format!("NAT subnet set to {s} (applies on next launch)"));
+            }
+        }
+        if !open {
+            self.show_net_check = false;
+        }
+    }
+
     /// Run-state line (IRIX running / PROM / halted / stopped + MIPS). Used in
     /// the control column's status footer.
-    fn run_state_label(&self, ui: &mut egui::Ui) {
+    fn run_state_label(&mut self, ui: &mut egui::Ui) {
         let running = self.emu.is_running();
         let halted = running && self.emu.status.cpu_halted;
         let status = if halted {
@@ -897,6 +1261,35 @@ impl App {
         ui.label(status);
         if running && !halted {
             ui.label(format!("{:.0} MIPS", self.emu.status.mips));
+        }
+        // Internal-network indicator — always shown (grey while unpowered or
+        // halted). Green once the guest is carrying NAT IP traffic; red when a
+        // running guest has produced none (a hint its IP is missing or wrong for
+        // the configured NAT subnet).
+        let (net_color, net_tip) = match self.emu.net_state() {
+            NetState::Active => (
+                Color32::from_rgb(0x35, 0xb8, 0x4a),
+                "Internal network: carrying guest NAT traffic.",
+            ),
+            NetState::Idle => (
+                Color32::from_rgb(0xd9, 0x4a, 0x3d),
+                "Internal network: no NAT traffic yet.\nThe guest may have no IP — or the wrong IP for this NAT subnet.",
+            ),
+            NetState::Off => (
+                Color32::from_gray(0x80),
+                "Internal network: machine not running.",
+            ),
+        };
+        let mut want_check = false;
+        ui.horizontal(|ui| {
+            ui.label(RichText::new("\u{25CF}").color(net_color)).on_hover_text(net_tip);
+            ui.label("NET").on_hover_text(net_tip);
+            if running && ui.small_button("check").on_hover_text("Diagnose guest networking").clicked() {
+                want_check = true;
+            }
+        });
+        if want_check {
+            self.show_net_check = true;
         }
         if running && self.fb_scale > 0.0 {
             // How magnified the emulated display currently is (1× = native).
@@ -960,10 +1353,13 @@ impl App {
         // ¼× steps, so we don't snap here — when we must clamp to the monitor we
         // use the full fitting size (the footer readout reports the actual scale
         // and tags non-crisp ones) rather than dropping a whole step.
+        // Largest scale that fits, never exceeding the requested target, floored
+        // at a sane minimum — but the floor must not exceed target, or clamp()
+        // panics (min > max) on a degenerate target from a zeroed/garbage scale.
         let scale = target
             .min((avail_w.max(64.0)) / fb_px.x)
             .min((avail_h.max(64.0)) / fb_px.y)
-            .clamp(0.05, target);
+            .clamp(0.05_f32.min(target), target);
         let inner = egui::vec2(fb_px.x * scale + chrome_w, fb_px.y * scale + chrome_h);
         ctx.send_viewport_cmd(ViewportCommand::InnerSize(inner));
     }
@@ -1028,7 +1424,6 @@ impl App {
         // Consume the snap request before the immutable borrow of self.fb_tex.
         let do_snap = std::mem::take(&mut self.pending_fb_snap);
 
-        let mut fb_rect = egui::Rect::NOTHING;
         let mut fb_clicked = false;
         let mut new_fb_scale = 0.0;
         if let Some(tex) = &self.fb_tex {
@@ -1048,16 +1443,37 @@ impl App {
             if tex_size.y >= 1.0 {
                 new_fb_scale = size.y * zoom / tex_size.y;
             }
+            let mut fb_rect = None;
             ui.centered_and_justified(|ui| {
                 let response = ui.add(
                     egui::Image::new((tex.id(), size)).fit_to_exact_size(size).sense(egui::Sense::click())
                 );
-                fb_rect = response.rect;
                 // Take keyboard focus so that egui delivers Key events
                 // to us instead of routing them to other widgets when
                 // the user clicks into the FB.
                 if response.clicked() { response.request_focus(); fb_clicked = true; }
+                fb_rect = Some(response.rect);
             });
+
+            // After a soft power-off the core stops the CPU but keeps the window
+            // running, so the last frame stays frozen on screen. Dim it with a
+            // translucent grey scrim + label so it reads as inactive, not live.
+            // Keyed on `cpu_stopped` (a real CPU stop), NOT `cpu_halted` — the
+            // latter also trips on 0-MIPS idle at the PROM, which would wrongly
+            // dim a machine that's only paused. The frame underneath stays visible.
+            if self.emu.status.cpu_stopped {
+                if let Some(rect) = fb_rect {
+                    let p = ui.painter_at(rect);
+                    p.rect_filled(rect, 0.0, Color32::from_rgba_unmultiplied(40, 42, 48, 130));
+                    p.text(
+                        rect.center(),
+                        egui::Align2::CENTER_CENTER,
+                        "⏻ Powered off",
+                        egui::FontId::proportional(26.0),
+                        Color32::from_rgba_unmultiplied(235, 235, 235, 235),
+                    );
+                }
+            }
         }
         self.fb_scale = new_fb_scale;
 
@@ -1082,21 +1498,6 @@ impl App {
             input::pump(ui.ctx(), fb_clicked, &ps2, &mut self.input_state, self.cfg.mouse_scroll_pixels_per_line);
         }
 
-        // Capture hint, drawn over the framebuffer.
-        if fb_rect.is_positive() {
-            let hint = if self.input_state.captured {
-                "Ctrl+Alt+Esc to release mouse"
-            } else {
-                "Click to capture mouse / keyboard"
-            };
-            ui.painter().text(
-                fb_rect.center_bottom() + egui::vec2(0.0, -6.0),
-                egui::Align2::CENTER_BOTTOM,
-                hint,
-                egui::FontId::proportional(12.0),
-                Color32::from_white_alpha(140),
-            );
-        }
     }
 
     fn central_tabs(&mut self, ui: &mut egui::Ui) {
@@ -1106,10 +1507,22 @@ impl App {
             }
         });
         ui.separator();
-        match show_tab(ui, self.tab, &mut self.cfg, &mut self.jit) {
+        let out = show_tab(ui, self.tab, &mut self.cfg, &mut self.jit, &self.net_ifaces, &self.prefs.disk_folders);
+        match out.action {
             ConfigAction::RequestEmbeddedProm => self.confirm_embedded_prom = true,
             ConfigAction::TestCamera => self.open_camera_test(),
             ConfigAction::None => {}
+        }
+        if out.net.changed { self.mark_dirty(); }
+        if out.net.forwards_changed && self.emu.is_running() {
+            // Rebind the running NAT's listeners so a forward added/removed now
+            // takes effect without a restart (latest-wins coalesces in the NAT).
+            self.emu.send(Cmd::SetPortForwards(self.cfg.port_forward.clone()));
+        }
+        if let Some(p) = out.net.prompt {
+            self.net_sanity_modal = Some(NetSanityModal {
+                reason: p.reason, suggestion: p.suggestion, revert_to: p.revert_to,
+            });
         }
     }
 
@@ -1161,7 +1574,7 @@ impl App {
                         format!("Camera unavailable: {e}"));
                     ui.label(RichText::new(
                         "Check that a camera is connected and that IRIS has camera \
-                         permission (System Settings → Privacy & Security → Camera).")
+                         permission (System Settings > Privacy & Security > Camera).")
                         .weak());
                 } else if let Some(tex) = &self.camera_test_tex {
                     // The capture field is half-height (interlaced), so present
@@ -1174,7 +1587,7 @@ impl App {
                     ui.label("Starting capture…");
                     ui.label(RichText::new(
                         "If no image appears, grant camera access in System \
-                         Settings → Privacy & Security → Camera, then reopen.")
+                         Settings > Privacy & Security > Camera, then reopen.")
                         .weak().small());
                 }
                 ui.add_space(6.0);
@@ -1306,8 +1719,8 @@ impl App {
                     );
                     ui.add_space(6.0);
                     ui.label(RichText::new("How to use it").strong());
-                    ui.label("• Help → Diagnostics → Test Camera shows a live preview (start a machine first).");
-                    ui.label("• Or set Video-In → Source = camera, boot IRIX, and run an IndyCam app like vino/cam.");
+                    ui.label("• Help > Diagnostics > Test Camera shows a live preview (start a machine first).");
+                    ui.label("• Or set Video-In > Source = camera, boot IRIX, and run an IndyCam app like vino/cam.");
                     ui.label("• On first use macOS asks for camera permission. Closing the preview releases the camera.");
                     ui.add_space(6.0);
                     ui.label(RichText::new("Privacy / for App Review").strong());
@@ -1329,8 +1742,17 @@ impl App {
                     ui.label(RichText::new("How to use it").strong());
                     ui.label("• The guest serial console (ttyd1) and PROM monitor are exposed on loopback");
                     ui.label("   TCP (127.0.0.1:8881 / 8888) so you can attach a terminal.");
-                    ui.label("• Help → Diagnostics → Network test opens an in-app viewer of that console.");
+                    ui.label("• Help > Diagnostics > Network test opens an in-app viewer of that console.");
                     ui.label("• Optional inbound port-forwards (Networking tab) let you reach guest services.");
+                    ui.add_space(6.0);
+                    ui.label(RichText::new("Guest IP & subnets").strong());
+                    ui.label("• IRIS's NAT is a router on one subnet; the gateway is the .1 of that subnet");
+                    ui.label("   (default 192.168.0.0/24, gateway 192.168.0.1 — set on the Networking tab).");
+                    ui.label("• The guest must sit on that SAME subnet, with its default route = that .1 gateway.");
+                    ui.label("• If the guest's IP is on a different network, nothing routes. The NET light's");
+                    ui.label("   'check' button shows the guest's IP vs IRIS's, and how to line them up.");
+                    ui.label("• No port-forwards exist by default; '+ Add forward' maps a host port to a guest");
+                    ui.label("   port (inbound, host to guest) — e.g. to telnet into the guest.");
                     ui.add_space(6.0);
                     ui.label(RichText::new("Privacy / for App Review").strong());
                     ui.label(
@@ -1347,6 +1769,226 @@ impl App {
             });
         if !open {
             self.show_help_info = false;
+        }
+    }
+
+    /// Help → "Mount the shared folder in IRIX": the exact, copy-pasteable mount
+    /// command for the in-core NFS server, with the live gateway filled in and a
+    /// note matching the configured NFS version.
+    fn nfs_help_window(&mut self, ctx: &egui::Context) {
+        if !self.show_nfs_help {
+            return;
+        }
+        use iris::nfsudp::NfsVersion;
+
+        // Gateway the guest will mount from: the one IRIS has live-adopted while
+        // running, else the gateway derived from the configured NAT subnet, else
+        // the documented default. Matches network_check_window's derivation.
+        let (eb, ep) = netplan::parse_cidr(self.cfg.nat_subnet.as_deref());
+        let cfg_gw = netplan::classify(eb, ep, &[]).derived.map(|d| d.gateway.to_string());
+        let gw = self
+            .emu
+            .status
+            .net_guest_gateway
+            .map(|g| g.to_string())
+            .or(cfg_gw)
+            .unwrap_or_else(|| "192.168.0.1".into());
+
+        let mut open = true;
+        egui::Window::new("Mount the shared folder in IRIX")
+            .open(&mut open)
+            .collapsible(false)
+            // Non-resizable so the window auto-sizes to its content. A resizable
+            // egui Window keeps a remembered/default size and will NOT shrink-wrap,
+            // which is why it spilled to full height before.
+            .resizable(false)
+            .show(ctx, |ui| {
+                ui.set_max_width(520.0);
+                // Cap height so the limitations-expanded page scrolls instead of
+                // growing off-screen; short content just shrinks to fit.
+                egui::ScrollArea::vertical().max_height(560.0).auto_shrink([false, true]).show(ui, |ui| {
+                    let Some(nfs) = self.cfg.nfs.as_ref() else {
+                        ui.label(RichText::new("NFS file sharing isn't enabled yet.").strong());
+                        ui.add_space(4.0);
+                        ui.label(
+                            "Turn it on under Configuration → Networking → NFS share, pick a folder \
+                             to share, then reopen this window for the exact mount command.");
+                        return;
+                    };
+
+                    ui.label(
+                        "IRIS serves the folder below over NFS, in-process, from the NAT gateway. \
+                         Boot IRIX, make sure networking is up (the NET light / Check networking), \
+                         then log in as root and run these commands at an IRIX shell:");
+                    ui.add_space(6.0);
+
+                    if nfs.shared_dir.trim().is_empty() {
+                        ui.label(RichText::new(
+                            "No folder is selected yet — pick one under Configuration → Networking → \
+                             NFS share first.").color(Color32::from_rgb(0xd9, 0x4a, 0x3d)));
+                    } else {
+                        ui.label(RichText::new(format!("Sharing: {}", nfs.shared_dir)).weak());
+                    }
+                    ui.add_space(6.0);
+
+                    // The simple form — IRIX auto-detects NFS from the host:/path
+                    // syntax. The export is the single root "/".
+                    ui.code(format!("mkdir -p /shared\nmount {gw}:/ /shared"));
+                    ui.label(RichText::new(
+                        "Your shared folder then appears at /shared on the Indy. Use any empty mount \
+                         point you like in place of /shared.").weak());
+
+                    ui.add_space(8.0);
+                    let ver_note = match nfs.version {
+                        NfsVersion::Auto => "NFS version: Auto — IRIX picks it. IRIX 6.5 mounts NFSv3; \
+                                             IRIX 5.3 uses NFSv2.",
+                        NfsVersion::V2 => "NFS version: v2 — IRIS only answers NFSv2 (the right choice \
+                                           for IRIX 5.3).",
+                        NfsVersion::V3 => "NFS version: v3 — IRIS only answers NFSv3 (IRIX 6.x).",
+                    };
+                    ui.label(RichText::new(ver_note).weak());
+                    match nfs.version {
+                        NfsVersion::V3 => {
+                            ui.label(RichText::new(
+                                "Max file size: NFSv3 is 64-bit, so files are limited only by your disk.")
+                                .weak());
+                        }
+                        _ => {
+                            ui.label(RichText::new(
+                                "⚠ Max file size over NFSv2 is ~2 GiB (4 GiB protocol ceiling; its \
+                                 sizes/offsets are 32-bit). For larger files, use NFSv3.")
+                                .color(Color32::from_rgb(0xd9, 0x9a, 0x2d)));
+                        }
+                    }
+
+                    ui.separator();
+                    ui.label(RichText::new("If the mount hangs or is refused").strong());
+                    ui.label(
+                        "IRIS's NFS server is UDP-only, and IRIX may otherwise try TCP or the wrong \
+                         version. Pin both explicitly:");
+                    let pin = match nfs.version {
+                        NfsVersion::V2 => "vers=2,proto=udp",
+                        _ => "vers=3,proto=udp",
+                    };
+                    ui.code(format!("mount -o {pin} {gw}:/ /shared"));
+                    ui.add_space(4.0);
+                    ui.label(RichText::new(
+                        "Still stuck? Use Help → \"How camera & networking work\" and the NET light's \
+                         Check button to confirm the guest is on IRIS's subnet first — NFS can't mount \
+                         until networking is up.").weak());
+
+                    ui.add_space(8.0);
+                    ui.label(RichText::new("To unmount later:").strong());
+                    ui.code("umount /shared");
+
+                    ui.add_space(8.0);
+                    ui.collapsing("Limitations & advanced details", |ui| {
+                        let item = |ui: &mut egui::Ui, head: &str, body: &str| {
+                            ui.horizontal_wrapped(|ui| {
+                                ui.label(RichText::new(format!("{head} — ")).strong());
+                                ui.label(RichText::new(body).weak());
+                            });
+                        };
+                        item(ui, "File size",
+                            "NFSv2 caps a single file at ~2 GiB (4 GiB protocol max) — 32-bit sizes and \
+                             offsets. NFSv3 is 64-bit, bounded only by the host disk.");
+                        item(ui, "Transport",
+                            "UDP only — there is no NFS-over-TCP. Large reads are split into IP fragments.");
+                        item(ui, "Single export",
+                            "The whole shared folder is exported as \"/\"; the path after the colon in the \
+                             mount command is ignored.");
+                        item(ui, "Permissions",
+                            "Synthetic: everything is owned by root (uid/gid 0), directories 0755, files \
+                             0644. chmod/chown are accepted but ignored; changing a file's size is honored.");
+                        item(ui, "No authentication",
+                            "Every client is allowed and credentials are ignored — don't expose anything \
+                             sensitive through the share.");
+                        item(ui, "No file locking",
+                            "There is no NLM/lockd, so advisory locks across host and guest won't work.");
+                        item(ui, "No special files",
+                            "Symlinks, device nodes (mknod), and hard links (link) are not served.");
+                        item(ui, "Synchronous writes",
+                            "Every write is flushed immediately and COMMIT is a no-op — data is safe but \
+                             writes are slower than a caching server.");
+                    });
+                });
+                ui.separator();
+                if ui.button("Close").clicked() {
+                    self.show_nfs_help = false;
+                }
+            });
+        if !open {
+            self.show_nfs_help = false;
+        }
+    }
+
+    /// The "Synchronizing disks…" modal shown while a clean exit folds pending
+    /// CHD `.diff.chd` sidecars back into their bases. Driven by `self.syncing`,
+    /// updated from `Evt::SyncProgress`; closes the app on `Evt::SyncDone`.
+    fn sync_modal(&mut self, ctx: &egui::Context) {
+        let Some(job) = &self.syncing else { return };
+        let frac = if job.total > 0 {
+            ((job.disk as f32 + job.fraction) / job.total as f32).clamp(0.0, 1.0)
+        } else {
+            job.fraction.clamp(0.0, 1.0)
+        };
+        let disk_line = (job.total > 1).then(|| format!("Disk {} of {}", (job.disk + 1).min(job.total), job.total));
+        egui::Window::new("Synchronizing disks…")
+            .collapsible(false)
+            .resizable(false)
+            .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+            .show(ctx, |ui| {
+                ui.set_max_width(430.0);
+                ui.label(
+                    "Applying your changes to the CHD disk image. Everything written this session is \
+                     being merged permanently into the disk — this only happens with some (compressed) \
+                     CHD files.");
+                ui.add_space(10.0);
+                ui.add(egui::ProgressBar::new(frac).show_percentage());
+                if let Some(line) = disk_line {
+                    ui.label(RichText::new(line).weak());
+                }
+                ui.add_space(4.0);
+                ui.label(RichText::new("Please don't force-quit — this finishes in a moment.").weak());
+            });
+        // The worker is busy rebuilding; keep repainting so progress updates show.
+        ctx.request_repaint();
+    }
+
+    /// Confirmation before discarding a COW overlay (it's destructive).
+    fn cow_discard_modal(&mut self, ctx: &egui::Context) {
+        let Some(job) = &self.cow_discard_confirm else { return };
+        let name = std::path::Path::new(&job.base).file_name().and_then(|n| n.to_str()).unwrap_or(&job.base).to_string();
+        let (id, base, chd) = (job.id, job.base.clone(), job.chd);
+        let mut decision: Option<bool> = None; // Some(true) = discard, Some(false) = cancel
+        egui::Window::new("Discard changes?")
+            .collapsible(false)
+            .resizable(false)
+            .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+            .show(ctx, |ui| {
+                ui.set_max_width(400.0);
+                ui.label(RichText::new("Are you sure? You will lose any changes to the disk.").strong());
+                ui.add_space(4.0);
+                ui.label(RichText::new(format!("SCSI {id}: {name}")).weak());
+                ui.add_space(8.0);
+                ui.horizontal(|ui| {
+                    if ui.button("Cancel").clicked() {
+                        decision = Some(false);
+                    }
+                    if ui.add(egui::Button::new(RichText::new("Discard changes").color(Color32::WHITE))
+                        .fill(Color32::from_rgb(140, 40, 40))).clicked()
+                    {
+                        decision = Some(true);
+                    }
+                });
+            });
+        match decision {
+            Some(true) => {
+                self.emu.send(Cmd::CowReset { base, chd });
+                self.cow_discard_confirm = None;
+            }
+            Some(false) => self.cow_discard_confirm = None,
+            None => {}
         }
     }
 
@@ -1445,6 +2087,12 @@ impl App {
             self.menu_list(ui, ctx);
             ui.separator();
             self.config_quick_buttons(ui);
+            // Capture status + "Capture" button — only while a machine is up
+            // (it's meaningless at the stopped state shown in the footer).
+            if self.emu.is_running() {
+                ui.separator();
+                self.capture_controls(ui, ctx);
+            }
         });
     }
 }
@@ -1454,14 +2102,20 @@ impl eframe::App for App {
         self.handle_events(ctx);
         self.maybe_autosave();
 
-        // Remember the current window size so the next launch reopens at it.
-        // inner_rect is in logical points — the same unit ViewportBuilder's
-        // with_inner_size() takes — so this round-trips regardless of UI zoom.
-        // Stored in-memory here; on_exit() (and other save() calls) persist it.
-        if let Some(r) = ctx.input(|i| i.viewport().inner_rect) {
-            let sz = r.size();
-            if sz.x.is_finite() && sz.y.is_finite() && sz.x >= 480.0 && sz.y >= 360.0 {
-                self.prefs.window_size = Some([sz.x.round(), sz.y.round()]);
+        // Intercept a clean exit (window close / File→Quit) to fold any pending
+        // CHD `.diff.chd` back into its base first ("Synchronizing disks…"). On
+        // the first close request with a pending sync we kick off the worker,
+        // show the modal, and cancel the close; the real close happens on
+        // Evt::SyncDone. `sync_then_close` latches so we don't re-intercept the
+        // final close (by then the machine is gone and chd_sync_pending is stale).
+        if ctx.input(|i| i.viewport().close_requested()) {
+            if !self.sync_then_close && self.emu.has_pending_chd_sync() {
+                self.sync_then_close = true;
+                self.syncing = Some(SyncJob { disk: 0, total: 0, fraction: 0.0 });
+                self.emu.send(Cmd::SyncDisks);
+                ctx.send_viewport_cmd(ViewportCommand::CancelClose);
+            } else if self.syncing.is_some() {
+                ctx.send_viewport_cmd(ViewportCommand::CancelClose); // still syncing — stay alive
             }
         }
 
@@ -1491,6 +2145,7 @@ impl eframe::App for App {
             .resizable(false)
             .exact_width(186.0)
             .show(ctx, |ui| self.control_panel(ui, ctx));
+        self.network_check_window(ctx);
 
         // Config editor lives in a collapsible side panel so the emulator
         // screen (central panel) is never hidden by it. The toolbar's
@@ -1526,10 +2181,11 @@ impl eframe::App for App {
             if self.emu.is_running() {
                 self.framebuffer_panel(ui);
             } else {
-                // First-ever launch: size the window to the monitor for the
-                // standard 1280×1024 display before the user sees it (the
-                // on-Start snap later re-fits to the actual guest resolution).
-                // Wait for the monitor size to be known before consuming the flag.
+                // Size the window for the standard 1280×1024 display at the
+                // chosen VM scale before the user sees it. Runs on every launch
+                // (window size isn't persisted), so the window always opens at
+                // the configured scale. Wait until the monitor size is known
+                // before consuming the flag.
                 if self.pending_launcher_fit
                     && ui.ctx().input(|i| i.viewport().monitor_size).is_some()
                 {
@@ -1575,6 +2231,15 @@ impl eframe::App for App {
 
         // Help → "How camera & networking work" explainer.
         self.help_info_window(ctx);
+
+        // Help → "Mount the shared folder in IRIX" — the NFS mount command.
+        self.nfs_help_window(ctx);
+
+        // "Synchronizing disks…" modal during the exit-time CHD fold-back.
+        self.sync_modal(ctx);
+
+        // "Discard changes?" confirmation for a COW roll-back.
+        self.cow_discard_modal(ctx);
 
         // Safe-stop confirmation modal.
         let mut close_modal = false;
@@ -1639,6 +2304,47 @@ impl eframe::App for App {
                 self.toast("using embedded PROM");
             }
             if close { self.confirm_embedded_prom = false; }
+        }
+
+        // Networking sanity-check override modal.
+        if let Some(modal) = &self.net_sanity_modal {
+            let reason = modal.reason.clone();
+            let suggestion = modal.suggestion.clone();
+            let revert_to = modal.revert_to.clone();
+            let mut close = false;
+            let mut do_revert = false;
+            let mut do_suggest = false;
+            egui::Window::new("Check networking configuration")
+                .collapsible(false)
+                .resizable(false)
+                .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+                .show(ctx, |ui| {
+                    ui.set_max_width(420.0);
+                    ui.label(RichText::new(
+                        "This networking configuration does not appear to be valid, please double-check:")
+                        .strong());
+                    ui.label(format!("- {reason}"));
+                    ui.label(RichText::new(
+                        "The defaults are chosen to just work; an unusual subnet can leave the Indy \
+                         without internet access.").weak());
+                    ui.add_space(8.0);
+                    ui.horizontal(|ui| {
+                        if ui.button("Cancel").clicked() { do_revert = true; close = true; }
+                        if ui.add(egui::Button::new(format!("Use {suggestion}"))
+                            .fill(Color32::from_rgb(60, 90, 140))).clicked()
+                        {
+                            do_suggest = true; close = true;
+                        }
+                        if ui.add(egui::Button::new("Override Sanity Checks")
+                            .fill(Color32::from_rgb(140, 90, 40))).clicked()
+                        {
+                            close = true;
+                        }
+                    });
+                });
+            if do_revert  { self.cfg.nat_subnet = revert_to;          self.mark_dirty(); }
+            if do_suggest { self.cfg.nat_subnet = Some(suggestion);   self.mark_dirty(); }
+            if close { self.net_sanity_modal = None; }
         }
 
         // Missing-disk modal.
@@ -1720,7 +2426,6 @@ impl eframe::App for App {
     }
 
     fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
-        self.prefs.fullscreen = self.fullscreen;
         // Make sure the latest cfg lands in `machines` before save().
         if self.cfg_dirty { self.flush_machine(); } else { let _ = self.prefs.save(); }
         // Synchronously stop the machine and join the worker, so a running

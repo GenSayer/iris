@@ -16,7 +16,8 @@ fn main() {
     let input  = &args[1];
     let output = &args[2];
 
-    let mut chd = match iris::chd_disk::ChdHd::open(input) {
+    // Extract reads through the merged view; COW off (no diff is created here).
+    let mut chd = match iris::chd_disk::ChdHd::open(input, false) {
         Ok(c) => c,
         Err(e) => { eprintln!("open {}: {}", input, e); exit(1); }
     };

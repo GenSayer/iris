@@ -5,6 +5,7 @@ use iris::config::{
     ForwardBind, ForwardProto, MachineConfig, NfsConfig, PortForwardConfig,
     ScsiDeviceConfig, VinoSource, VinoStandard, VALID_BANK_SIZES,
 };
+use iris::nfsudp::NfsVersion;
 
 /// Which config tab is focused. Toolbar quick-buttons set this.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -99,16 +100,30 @@ pub enum ConfigAction {
     TestCamera,
 }
 
-pub fn show_tab(ui: &mut Ui, tab: Tab, cfg: &mut MachineConfig, jit: &mut JitEnv) -> ConfigAction {
+/// Everything a config tab hands back to the app for one frame.
+#[derive(Default)]
+pub struct TabOutcome {
+    pub action: ConfigAction,
+    pub net: NetworkOutcome,
+}
+
+pub fn show_tab(
+    ui: &mut Ui,
+    tab: Tab,
+    cfg: &mut MachineConfig,
+    jit: &mut JitEnv,
+    host: &[crate::netplan::HostIface],
+    disk_folders: &[String],
+) -> TabOutcome {
     ScrollArea::vertical().show(ui, |ui| match tab {
-        Tab::General => show_general(ui, cfg),
-        Tab::Disks   => { show_disks(ui, cfg); ConfigAction::None }
-        Tab::Network => { show_network(ui, cfg); ConfigAction::None }
-        Tab::Memory  => { show_memory(ui, cfg); ConfigAction::None }
-        Tab::Display => { show_display(ui, cfg); ConfigAction::None }
-        Tab::VideoIn => show_vino(ui, cfg),
-        Tab::Debug   => { show_debug(ui, cfg, jit); ConfigAction::None }
-        Tab::Ci      => { show_ci(ui, cfg); ConfigAction::None }
+        Tab::General => TabOutcome { action: show_general(ui, cfg), ..Default::default() },
+        Tab::Disks   => { show_disks(ui, cfg); TabOutcome::default() }
+        Tab::Network => TabOutcome { net: show_network(ui, cfg, host, disk_folders), ..Default::default() },
+        Tab::Memory  => { show_memory(ui, cfg); TabOutcome::default() }
+        Tab::Display => { show_display(ui, cfg); TabOutcome::default() }
+        Tab::VideoIn => TabOutcome { action: show_vino(ui, cfg), ..Default::default() },
+        Tab::Debug   => { show_debug(ui, cfg, jit); TabOutcome::default() }
+        Tab::Ci      => { show_ci(ui, cfg); TabOutcome::default() }
     }).inner
 }
 
@@ -264,8 +279,14 @@ fn show_disks(ui: &mut Ui, cfg: &mut MachineConfig) {
                     ui.end_row();
                 }
 
-                ui.label("Overlay (COW writes -> .overlay)");
-                ui.checkbox(&mut dev.overlay, "");
+                ui.label("Copy-on-write")
+                    .on_hover_text(
+                        "Keep this session's changes in a separate overlay instead of writing the disk \
+                         directly, so you can roll back. Off: changes go into the disk (a compressed CHD \
+                         still uses an overlay, folded back on a clean exit). Raw → .overlay; CHD → \
+                         .diff.chd. Apply or discard with the monitor: `cow commit` / `cow reset`.");
+                ui.checkbox(&mut dev.overlay, "")
+                    .on_hover_text("Keep changes separate (roll back with `cow reset`, apply with `cow commit`)");
                 ui.end_row();
 
                 ui.label("Scratch volume");
@@ -301,77 +322,317 @@ fn show_disks(ui: &mut Ui, cfg: &mut MachineConfig) {
     if let Some(id) = to_delete { cfg.scsi.remove(&id); }
 }
 
-fn show_network(ui: &mut Ui, cfg: &mut MachineConfig) {
+/// A soft-invalid subnet the user just entered, surfaced to the app so it can
+/// pop the "Override Sanity Checks / Cancel" confirmation modal.
+pub struct NetSanityPrompt {
+    /// Why it's questionable (non-RFC1918 or a host-network conflict).
+    pub reason: String,
+    /// A known-good CIDR offered as the safe alternative.
+    pub suggestion: String,
+    /// The `nat_subnet` value before this edit, restored if the user cancels.
+    pub revert_to: Option<String>,
+}
+
+/// What the Networking tab asks the app to do beyond mutating `cfg`. Routed up
+/// through [`show_tab`] because the immediate-mode tab can't own app-level state
+/// (the dirty flag, the confirmation modal).
+#[derive(Default)]
+pub struct NetworkOutcome {
+    /// A networking field changed this frame → the app should mark cfg dirty.
+    pub changed: bool,
+    /// A port-forward rule was added/removed/edited → the app should rebind the
+    /// running NAT's forward listeners live.
+    pub forwards_changed: bool,
+    /// A soft-invalid subnet was just committed → pop the override modal.
+    pub prompt: Option<NetSanityPrompt>,
+}
+
+fn show_network(ui: &mut Ui, cfg: &mut MachineConfig, host: &[crate::netplan::HostIface], disk_folders: &[String]) -> NetworkOutcome {
+    use crate::netplan;
+    let mut out = NetworkOutcome::default();
     ui.heading("Networking");
+
+    ui.label(RichText::new(
+        "IRIS gives the Indy its own private NAT network, the same trick your home router uses. \
+         The Indy reaches the internet through IRIS, but nothing on your real network can see it. \
+         Pick a subnet that does not overlap a network your computer already uses (Wi-Fi, Ethernet, \
+         VPN, Docker, etc.). If it does, IRIS flags it below.")
+        .weak());
+    ui.add_space(6.0);
+
+    // The UI exposes the network base address (a plain IPv4, not CIDR) and the
+    // mask separately; they compose into `cfg.nat_subnet` (a CIDR string the
+    // backend wants, always snapped to a clean network address). The custom-mode
+    // flags and the base text buffer persist in egui memory so partial typing
+    // and the "Custom" reveal survive across frames; `last_id` tracks the value
+    // we last stored so an external change (Cancel revert, machine switch)
+    // re-syncs the controls.
+    let before = cfg.nat_subnet.clone();
+    let (base0, prefix0) = netplan::parse_cidr(cfg.nat_subnet.as_deref());
+
+    let net_custom_id  = ui.make_persistent_id("net_net_custom");
+    let mask_custom_id = ui.make_persistent_id("net_mask_custom");
+    let base_buf_id    = ui.make_persistent_id("net_base_buf");
+    let last_id        = ui.make_persistent_id("net_last_composed");
+
+    let preset_mask = |p: u8| netplan::MASK_PRESETS.contains(&p);
+    let mut net_custom:  bool = ui.data_mut(|d| d.get_temp::<bool>(net_custom_id)).unwrap_or(false);
+    let mut mask_custom: bool = ui.data_mut(|d| d.get_temp::<bool>(mask_custom_id)).unwrap_or(!preset_mask(prefix0));
+    let mut base_text: String = ui.data_mut(|d| d.get_temp::<String>(base_buf_id)).unwrap_or_else(|| base0.to_string());
+
+    let mut prefix = prefix0;
+    let fa = [
+        netplan::first_free(netplan::PrivateBlock::C, prefix, host),
+        netplan::first_free(netplan::PrivateBlock::B, prefix, host),
+        netplan::first_free(netplan::PrivateBlock::A, prefix, host),
+    ];
+
+    // Re-sync the controls if the stored subnet changed outside this code.
+    let cur = cfg.nat_subnet.clone().unwrap_or_default();
+    let last: String = ui.data_mut(|d| d.get_temp::<String>(last_id)).unwrap_or_default();
+    if cur != last {
+        net_custom = !fa.contains(&base0);
+        mask_custom = !preset_mask(prefix0);
+        base_text = base0.to_string();
+    }
+    let mut base = if net_custom { base_text.parse().unwrap_or(base0) } else { base0 };
+
+    let mut changed = false;     // any subnet field changed → recompose + mark dirty
+    let mut committed = false;   // a deliberate commit → eligible for the override modal
+
     Grid::new("nat_grid").num_columns(2).striped(true).show(ui, |ui| {
-        ui.label("NAT subnet (CIDR)");
-        let mut s = cfg.nat_subnet.clone().unwrap_or_default();
-        if ui.add(TextEdit::singleline(&mut s).hint_text("192.168.0.0/24").desired_width(220.0)).changed() {
-            cfg.nat_subnet = if s.is_empty() { None } else { Some(s) };
-        }
+        ui.label("Network");
+        ui.horizontal(|ui| {
+            let sel = if net_custom { "Custom".to_string() } else { base.to_string() };
+            ComboBox::from_id_salt("net_preset").selected_text(sel).show_ui(ui, |ui| {
+                for addr in fa {
+                    if ui.selectable_label(!net_custom && base == addr, addr.to_string()).clicked() {
+                        base = addr; net_custom = false; changed = true; committed = true;
+                    }
+                }
+                if ui.selectable_label(net_custom, "Custom").clicked() {
+                    net_custom = true;
+                    base_text = base.to_string(); // seed the field with the current address
+                }
+            });
+            if net_custom {
+                let resp = ui.add(TextEdit::singleline(&mut base_text)
+                    .hint_text("192.168.0.0").desired_width(130.0));
+                if resp.changed() {
+                    if let Ok(ip) = base_text.parse::<std::net::Ipv4Addr>() { base = ip; changed = true; }
+                }
+                if resp.lost_focus() { committed = true; }
+            }
+            // A custom mask shows the prefix right beside the base address.
+            if mask_custom {
+                ui.label("/");
+                let mut bits = prefix.clamp(8, netplan::MAX_PREFIX);
+                if ui.add(DragValue::new(&mut bits).range(8..=netplan::MAX_PREFIX)).changed() {
+                    prefix = bits; changed = true; committed = true;
+                }
+            }
+        });
+        ui.end_row();
+
+        ui.label("Subnet mask");
+        let sel = if mask_custom { format!("Custom  (/{prefix})") } else { netplan::mask_label(prefix) };
+        ComboBox::from_id_salt("net_mask").selected_text(sel).show_ui(ui, |ui| {
+            for &p in netplan::MASK_PRESETS {
+                if ui.selectable_label(!mask_custom && prefix == p, netplan::mask_label(p)).clicked() {
+                    prefix = p; mask_custom = false; changed = true; committed = true;
+                }
+            }
+            if ui.selectable_label(mask_custom, "Custom").clicked() {
+                mask_custom = true;
+                if preset_mask(prefix) { prefix = 24; } // default a fresh custom mask to /24
+                changed = true;
+            }
+        });
         ui.end_row();
     });
+
+    if changed {
+        cfg.nat_subnet = Some(netplan::to_cidr(base, prefix));
+        out.changed = true;
+    }
+    ui.data_mut(|d| {
+        d.insert_temp(net_custom_id, net_custom);
+        d.insert_temp(mask_custom_id, mask_custom);
+        d.insert_temp(base_buf_id, base_text);
+        d.insert_temp(last_id, cfg.nat_subnet.clone().unwrap_or_default());
+    });
+
+    // Derived addressing + sanity, from the live (unsnapped) base + prefix so the
+    // snap note stays consistent across frames.
+    let assess = netplan::classify(base, prefix, host);
+    if let Some(msg) = &assess.hard_error {
+        ui.label(RichText::new(format!("Invalid: {msg}")).color(Color32::from_rgb(0xd9, 0x4a, 0x3d)));
+    } else if let Some(d) = &assess.derived {
+        ui.label(RichText::new(format!(
+            "Gateway (IRIS host) {}, Indy ec0 {}, {} usable hosts, broadcast {}",
+            d.gateway, d.client, netplan::commas(d.usable_hosts), d.broadcast)).weak());
+        if let Some(typed) = assess.off_boundary {
+            ui.label(RichText::new(format!(
+                "{typed} is not a network address; using {}/{}.", d.network, d.prefix)).weak());
+        }
+        match &assess.soft {
+            Some(w) => {
+                ui.horizontal(|ui| {
+                    let sug = netplan::to_cidr(w.suggestion_net, w.suggestion_prefix);
+                    ui.label(RichText::new(format!("Warning: {}", w.reason))
+                        .color(Color32::from_rgb(0xd9, 0x9a, 0x3d)));
+                    if ui.button(format!("Use {sug}")).clicked() {
+                        cfg.nat_subnet = Some(sug); // external-change re-sync repaints the controls
+                        out.changed = true;
+                    }
+                });
+            }
+            None => {
+                ui.label(RichText::new("OK: private range, no conflict with your host networks")
+                    .color(Color32::from_rgb(0x35, 0xb8, 0x4a)));
+            }
+        }
+        // Pop the override modal when a deliberate edit (preset/mask pick, custom
+        // mask bits, or the base field losing focus) lands on a soft-invalid
+        // subnet. Live keystrokes don't trigger it — only a committed value does.
+        if committed && assess.soft.is_some() {
+            let w = assess.soft.as_ref().unwrap();
+            out.prompt = Some(NetSanityPrompt {
+                reason: w.reason.clone(),
+                suggestion: netplan::to_cidr(w.suggestion_net, w.suggestion_prefix),
+                revert_to: before.clone(),
+            });
+        }
+    }
 
     ui.separator();
     ui.strong("Port forwards");
     let mut drop: Option<usize> = None;
     for (i, pf) in cfg.port_forward.iter_mut().enumerate() {
         ui.horizontal(|ui| {
+            let mut c = false;
             ComboBox::from_id_salt(("proto", i))
                 .selected_text(match pf.proto { ForwardProto::Tcp => "tcp", ForwardProto::Udp => "udp" })
                 .show_ui(ui, |ui| {
-                    ui.selectable_value(&mut pf.proto, ForwardProto::Tcp, "tcp");
-                    ui.selectable_value(&mut pf.proto, ForwardProto::Udp, "udp");
+                    c |= ui.selectable_value(&mut pf.proto, ForwardProto::Tcp, "tcp").changed();
+                    c |= ui.selectable_value(&mut pf.proto, ForwardProto::Udp, "udp").changed();
                 });
             ui.label("host");
-            ui.add(DragValue::new(&mut pf.host_port).range(1..=65535));
-            ui.label("-> guest");
-            ui.add(DragValue::new(&mut pf.guest_port).range(1..=65535));
+            c |= ui.add(DragValue::new(&mut pf.host_port).range(1..=65535)).changed();
+            ui.label("to guest");
+            c |= ui.add(DragValue::new(&mut pf.guest_port).range(1..=65535)).changed();
             ComboBox::from_id_salt(("bind", i))
                 .selected_text(match pf.bind { ForwardBind::Localhost => "localhost", ForwardBind::Any => "any" })
                 .show_ui(ui, |ui| {
-                    ui.selectable_value(&mut pf.bind, ForwardBind::Localhost, "localhost");
-                    ui.selectable_value(&mut pf.bind, ForwardBind::Any, "any");
+                    c |= ui.selectable_value(&mut pf.bind, ForwardBind::Localhost, "localhost").changed();
+                    c |= ui.selectable_value(&mut pf.bind, ForwardBind::Any, "any").changed();
                 });
-            if ui.button("×").clicked() { drop = Some(i); }
+            if ui.button("Remove").clicked() { drop = Some(i); }
+            out.changed |= c;
+            out.forwards_changed |= c;
         });
     }
-    if let Some(i) = drop { cfg.port_forward.remove(i); }
-    if ui.button("+ Add forward").clicked() {
-        cfg.port_forward.push(PortForwardConfig {
-            proto: ForwardProto::Tcp, host_port: 0, guest_port: 0, bind: ForwardBind::Localhost,
-        });
-    }
+    if let Some(i) = drop { cfg.port_forward.remove(i); out.changed = true; out.forwards_changed = true; }
+
+    let has_port = |p: u16| cfg.port_forward.iter().any(|f| f.guest_port == p);
+    let mut add: Option<PortForwardConfig> = None;
+    ui.menu_button("+ Add forward", |ui| {
+        if ui.add_enabled(!has_port(23), egui::Button::new("Telnet (host 2323 to guest 23)"))
+            .on_hover_text("Log in with: telnet localhost 2323. Needs the guest on IRIS's NAT subnet with telnetd running.")
+            .clicked()
+        {
+            add = Some(PortForwardConfig { proto: ForwardProto::Tcp, host_port: 2323, guest_port: 23, bind: ForwardBind::Localhost });
+            ui.close_menu();
+        }
+        if ui.add_enabled(!has_port(21), egui::Button::new("FTP (host 2121 to guest 21)"))
+            .on_hover_text("Reach the guest's FTP server. Forwards the control port; file transfer also needs the data channel (see docs).")
+            .clicked()
+        {
+            add = Some(PortForwardConfig { proto: ForwardProto::Tcp, host_port: 2121, guest_port: 21, bind: ForwardBind::Localhost });
+            ui.close_menu();
+        }
+        if ui.button("Custom (empty row)").clicked() {
+            add = Some(PortForwardConfig { proto: ForwardProto::Tcp, host_port: 0, guest_port: 0, bind: ForwardBind::Localhost });
+            ui.close_menu();
+        }
+    });
+    if let Some(pf) = add { cfg.port_forward.push(pf); out.changed = true; out.forwards_changed = true; }
+
+    ui.label(RichText::new(
+        "A port forward maps a port on your computer to a port on the Indy, so host tools can reach \
+         guest services (log in, copy files, and so on). Inbound only, and it works once the guest is \
+         up on the NAT subnet. None exist by default.")
+        .weak());
 
     ui.separator();
     ui.strong("NFS share");
+    ui.label(RichText::new(
+        "The Indy speaks NFS natively — the easiest way to move files between your computer and the \
+         emulated machine. IRIS serves NFS itself, in-process, backed by the folder you pick below: \
+         nothing to install on any platform, and no NFS setup on the Indy side.")
+        .weak());
     let mut has_nfs = cfg.nfs.is_some();
     if ui.checkbox(&mut has_nfs, "Enable NFS").changed() {
         cfg.nfs = if has_nfs {
-            Some(NfsConfig {
-                shared_dir: String::new(),
-                unfsd: "unfsd".into(),
-                nfs_host_port: 12049,
-                mountd_host_port: 11234,
-            })
+            Some(NfsConfig { shared_dir: String::new(), version: NfsVersion::Auto })
         } else { None };
+        out.changed = true;
     }
     if let Some(nfs) = cfg.nfs.as_mut() {
         Grid::new("nfs_grid").num_columns(2).striped(true).show(ui, |ui| {
             ui.label("Shared dir");
-            path_row(ui, "nfs_shared", &mut nfs.shared_dir, Pick::Dir, ANY_FILTERS);
+            out.changed |= path_row(ui, "nfs_shared", &mut nfs.shared_dir, Pick::Dir, ANY_FILTERS);
             ui.end_row();
-            ui.label("unfsd binary");
-            path_row(ui, "nfs_unfsd", &mut nfs.unfsd, Pick::OpenFile, ANY_FILTERS);
-            ui.end_row();
-            ui.label("NFS host port");
-            ui.add(DragValue::new(&mut nfs.nfs_host_port).range(1..=65535));
-            ui.end_row();
-            ui.label("mountd host port");
-            ui.add(DragValue::new(&mut nfs.mountd_host_port).range(1..=65535));
+            ui.label("NFS version");
+            ComboBox::from_id_salt("nfs_ver")
+                .selected_text(match nfs.version {
+                    NfsVersion::Auto => "Auto",
+                    NfsVersion::V2 => "v2 (IRIX 5.3)",
+                    NfsVersion::V3 => "v3 (IRIX 6.x)",
+                })
+                .show_ui(ui, |ui| {
+                    out.changed |= ui.selectable_value(&mut nfs.version, NfsVersion::Auto, "Auto").changed();
+                    out.changed |= ui.selectable_value(&mut nfs.version, NfsVersion::V2, "v2 (IRIX 5.3)").changed();
+                    out.changed |= ui.selectable_value(&mut nfs.version, NfsVersion::V3, "v3 (IRIX 6.x)").changed();
+                });
             ui.end_row();
         });
+
+        // App Store: the in-core NFS server can only reach a folder the sandbox
+        // has granted. Easiest path — put the share inside a granted disk folder,
+        // whose recursive grant flows down to it (you can also pick any folder
+        // above; the folder picker grants that one directly).
+        if cfg!(feature = "appstore") {
+            ui.add_space(4.0);
+            if disk_folders.is_empty() {
+                ui.label(RichText::new(
+                    "On the App Store build the shared folder must live somewhere the app has been \
+                     granted. Grant a disk folder first (File → \"Grant a disk folder…\"), then create \
+                     a shared folder inside it here — or pick any folder above to grant it directly.")
+                    .weak());
+            } else {
+                ui.label(RichText::new("Or create a \"shared\" folder inside a granted disk folder:").weak());
+                for folder in disk_folders {
+                    let shared = std::path::Path::new(folder).join("shared");
+                    if ui.button(format!("Use {}", shared.display())).clicked()
+                        && std::fs::create_dir_all(&shared).is_ok()
+                    {
+                        nfs.shared_dir = shared.to_string_lossy().into_owned();
+                        out.changed = true;
+                    }
+                }
+            }
+        }
+
+        // Live mount command — gateway fills in to match the subnet. The export
+        // is the single root, so the path is just "/".
+        let gw = assess.derived.as_ref().map(|d| d.gateway.to_string()).unwrap_or_else(|| "192.168.0.1".into());
+        ui.label(RichText::new("Pick a folder, boot the Indy, then mount it:").weak());
+        ui.code(format!("mkdir /shared\nmount {gw}:/ /shared"));
+        ui.label(RichText::new("Your files then appear at /shared on the Indy.").weak());
     }
+
+    out
 }
 
 fn show_vino(ui: &mut Ui, cfg: &mut MachineConfig) -> ConfigAction {
@@ -541,18 +802,40 @@ enum Pick {
     Dir,
 }
 
-/// A TextEdit + 📁 Browse button that updates `value` in place.
-/// `filters` is a list of (label, &[extensions]); ignored for `Pick::Dir`.
+/// Reveal `path` in the host file manager, selecting it (Finder on macOS,
+/// Explorer on Windows, the default manager on the containing dir elsewhere).
+/// Best-effort — failures (e.g. a sandbox blocking the spawn) are ignored.
+pub fn reveal_in_file_manager(path: &str) {
+    #[cfg(target_os = "macos")]
+    {
+        // NSWorkspace, not `open` — sandbox-safe (see macos_sandbox::reveal_in_finder).
+        crate::macos_sandbox::reveal_in_finder(path);
+    }
+    #[cfg(target_os = "windows")]
+    {
+        let _ = std::process::Command::new("explorer").arg(format!("/select,{path}")).spawn();
+    }
+    #[cfg(all(unix, not(target_os = "macos")))]
+    {
+        let dir = Path::new(path).parent().unwrap_or_else(|| Path::new("."));
+        let _ = std::process::Command::new("xdg-open").arg(dir).spawn();
+    }
+}
+
+/// A TextEdit + 📁 Browse button that updates `value` in place. Returns whether
+/// `value` changed this frame, so callers can mark the config dirty (typed text
+/// or a Browse pick — both must persist).
 fn path_row(
     ui: &mut Ui,
     id: impl std::hash::Hash,
     value: &mut String,
     mode: Pick,
     filters: &[(&str, &[&str])],
-) {
+) -> bool {
+    let mut changed = false;
     ui.push_id(id, |ui| {
         ui.horizontal(|ui| {
-            ui.add(TextEdit::singleline(value).desired_width(320.0));
+            changed |= ui.add(TextEdit::singleline(value).desired_width(320.0)).changed();
             if ui.button("📁").on_hover_text("Browse…").clicked() {
                 let mut d = rfd::FileDialog::new();
                 // Start the dialog in the existing path's directory if any.
@@ -579,10 +862,19 @@ fn path_row(
                 };
                 if let Some(p) = picked {
                     *value = p.to_string_lossy().into_owned();
+                    changed = true;
                 }
+            }
+            // Reveal an existing path in the host file manager (Finder, Explorer,
+            // …) so the user can find/open it without navigating by hand.
+            if !value.trim().is_empty() && Path::new(value.trim()).exists()
+                && ui.button("📂").on_hover_text("Reveal in file manager").clicked()
+            {
+                reveal_in_file_manager(value.trim());
             }
         });
     });
+    changed
 }
 
 /// Same as `path_row` but for `Option<String>` — Browse populates Some,
