@@ -218,21 +218,60 @@ impl ScsiDevice {
         self.unit_attention = true;
     }
 
-    /// Commit the COW overlay to the base image. No-op if not using COW.
-    /// Returns the number of sectors committed, or 0 if direct/no media.
+    /// Commit the COW overlay into the base image ("apply the changes"). For a
+    /// raw overlay this copies the dirty sectors in place; for a CHD it rebuilds
+    /// the base from the diff (recompressing) and reopens a fresh overlay. No-op
+    /// if not overlaid. Returns a coarse count of what was committed.
     pub fn cow_commit(&mut self) -> io::Result<usize> {
-        match &mut self.backend {
-            Some(DiskBackend::Cow(cow)) => cow.commit(),
-            _ => Ok(0),
+        if let Some(DiskBackend::Cow(cow)) = &mut self.backend {
+            return cow.commit();
         }
+        #[cfg(feature = "chd")]
+        {
+            // CHD: rebuild needs the file closed first, so extract the paths,
+            // drop the backend, flatten, then reopen with the same COW mode.
+            let info = match &self.backend {
+                Some(DiskBackend::ChdHd(hd)) if hd.diff_dirty() => {
+                    hd.overlay_paths().map(|(b, d)| (b, d, hd.is_cow()))
+                }
+                _ => None,
+            };
+            if let Some((base, diff, cow)) = info {
+                self.backend = None;
+                crate::chd_disk::flatten_diff(&base, &diff, &mut |_| {}, &|| false)?;
+                let base_str = base.to_str()
+                    .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "non-UTF-8 CHD path"))?;
+                let reopened = crate::chd_disk::ChdHd::open(base_str, cow)?;
+                self.backend = Some(DiskBackend::ChdHd(reopened));
+                return Ok(1);
+            }
+        }
+        Ok(0)
     }
 
-    /// Reset the COW overlay (discard all writes). No-op if not using COW.
+    /// Reset the COW overlay — discard all uncommitted writes ("roll back"). For
+    /// a raw overlay this truncates it; for a CHD it deletes the `.diff.chd` and
+    /// reopens a fresh overlay over the untouched base. No-op if not overlaid.
     pub fn cow_reset(&mut self) -> io::Result<()> {
-        match &mut self.backend {
-            Some(DiskBackend::Cow(cow)) => cow.reset_overlay(),
-            _ => Ok(()),
+        if let Some(DiskBackend::Cow(cow)) = &mut self.backend {
+            return cow.reset_overlay();
         }
+        #[cfg(feature = "chd")]
+        {
+            let info = match &self.backend {
+                Some(DiskBackend::ChdHd(hd)) => hd.overlay_paths().map(|(b, d)| (b, d, hd.is_cow())),
+                _ => None,
+            };
+            if let Some((base, diff, cow)) = info {
+                self.backend = None;
+                let _ = std::fs::remove_file(&diff); // discard every overlay write
+                let base_str = base.to_str()
+                    .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "non-UTF-8 CHD path"))?;
+                let reopened = crate::chd_disk::ChdHd::open(base_str, cow)?;
+                self.backend = Some(DiskBackend::ChdHd(reopened));
+            }
+        }
+        Ok(())
     }
 
     /// Copy the COW overlay into `dest` and return its dirty sector set.
@@ -253,17 +292,51 @@ impl ScsiDevice {
         }
     }
 
-    /// Number of dirty sectors in the COW overlay, or 0 if direct/no media.
+    /// Number of dirty sectors in the COW overlay (raw), or for a CHD a coarse
+    /// 1/0 "has uncommitted changes" (we don't track per-sector dirt there).
+    /// 0 if direct / no media.
     pub fn cow_dirty_count(&self) -> usize {
         match &self.backend {
             Some(DiskBackend::Cow(cow)) => cow.dirty_count(),
+            #[cfg(feature = "chd")]
+            Some(DiskBackend::ChdHd(hd)) => usize::from(hd.diff_dirty()),
             _ => 0,
         }
     }
 
-    /// Whether this device is using COW overlay mode.
+    /// Whether this device has a copy-on-write overlay (a raw `.overlay` or a CHD
+    /// `.diff.chd`) that `cow commit` / `cow reset` can act on.
     pub fn is_cow(&self) -> bool {
-        matches!(&self.backend, Some(DiskBackend::Cow(_)))
+        match &self.backend {
+            Some(DiskBackend::Cow(_)) => true,
+            #[cfg(feature = "chd")]
+            Some(DiskBackend::ChdHd(hd)) => hd.overlay_paths().is_some(),
+            _ => false,
+        }
+    }
+
+    /// `(base, diff)` paths if this device is a CHD writing to a `.diff.chd`
+    /// sidecar that holds changes worth folding back into the base on a clean
+    /// shutdown. `None` for in-place / non-CHD / no-media devices.
+    pub fn pending_chd_sync(&self) -> Option<(std::path::PathBuf, std::path::PathBuf)> {
+        #[cfg(feature = "chd")]
+        {
+            if let Some(DiskBackend::ChdHd(hd)) = &self.backend {
+                return hd.pending_sync();
+            }
+        }
+        None
+    }
+
+    /// Take the pending-sync paths AND release the disk backend, closing the CHD
+    /// so the base can be atomically rebuilt by `chd_disk::flatten_diff`. Returns
+    /// `None` and leaves the backend in place when there's nothing to sync.
+    pub fn take_pending_chd_sync(&mut self) -> Option<(std::path::PathBuf, std::path::PathBuf)> {
+        let pending = self.pending_chd_sync();
+        if pending.is_some() {
+            self.backend = None;
+        }
+        pending
     }
 
     /// Advance to the next disc in the list (wraps around).

@@ -344,10 +344,12 @@ impl Wd33c93a {
                     let sz = cd.size();
                     (DiskBackend::ChdCd(cd), sz)
                 } else {
-                    // HD CHDs are inherently writable via the libchdman-rs HdImage
-                    // surface (in-place for uncompressed, diff sidecar for
-                    // compressed), so the `overlay` flag is not applicable here.
-                    let hd = ChdHd::open(path)?;
+                    // HD CHD. The `overlay` flag is the per-disk copy-on-write
+                    // toggle: COW on → always overlay (even an uncompressed base
+                    // gets a diff) and never auto-fold on exit (commit/roll back
+                    // manually); COW off → write in place (uncompressed) or a diff
+                    // that auto-folds on a clean exit (compressed).
+                    let hd = ChdHd::open(path, overlay)?;
                     let sz = hd.size();
                     (DiskBackend::ChdHd(hd), sz)
                 }
@@ -486,6 +488,63 @@ impl Wd33c93a {
             }
         }
         results
+    }
+
+    /// Number of attached CHD devices whose `.diff.chd` holds changes pending a
+    /// fold-back into the base on a clean shutdown.
+    pub fn pending_chd_sync_count(&self) -> usize {
+        let state = self.state.lock();
+        state.devices.iter().flatten().filter(|d| d.pending_chd_sync().is_some()).count()
+    }
+
+    /// Fold every pending CHD diff back into its base ("sync"), preserving the
+    /// base's compression. Releases each disk backend first (closing the CHD),
+    /// then rebuilds outside the device lock since recompression is slow.
+    /// `progress(done, total, fraction)` reports per-disk progress; `cancel()`
+    /// stops before the next disk (the in-flight rebuild also honours it),
+    /// leaving every un-synced base+diff intact. Returns the count synced.
+    #[cfg(feature = "chd")]
+    pub fn sync_chd_disks(
+        &self,
+        progress: &mut dyn FnMut(usize, usize, f32),
+        cancel: &dyn Fn() -> bool,
+    ) -> std::io::Result<usize> {
+        // Collect pending (base, diff) pairs, releasing CHD handles under the
+        // lock so the files can be atomically rebuilt. The rebuild itself runs
+        // unlocked.
+        let pending: Vec<(std::path::PathBuf, std::path::PathBuf)> = {
+            let mut state = self.state.lock();
+            let mut v = Vec::new();
+            for id in 0..8 {
+                if let Some(dev) = &mut state.devices[id] {
+                    if let Some(pair) = dev.take_pending_chd_sync() {
+                        v.push(pair);
+                    }
+                }
+            }
+            v
+        };
+        let total = pending.len();
+        let mut done = 0usize;
+        for (base, diff) in pending {
+            if cancel() {
+                break;
+            }
+            progress(done, total, 0.0);
+            crate::chd_disk::flatten_diff(&base, &diff, &mut |f| progress(done, total, f), cancel)?;
+            done += 1;
+            progress(done, total, 1.0);
+        }
+        Ok(done)
+    }
+
+    #[cfg(not(feature = "chd"))]
+    pub fn sync_chd_disks(
+        &self,
+        _progress: &mut dyn FnMut(usize, usize, f32),
+        _cancel: &dyn Fn() -> bool,
+    ) -> std::io::Result<usize> {
+        Ok(0)
     }
 
     /// Copy every COW overlay into `dir` as `scsi<id>.overlay`. Returns a

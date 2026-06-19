@@ -723,6 +723,25 @@ impl Machine {
         self.cpu.is_running()
     }
 
+    /// Number of attached CHD disks whose `.diff.chd` holds changes pending a
+    /// fold-back into the base on a clean shutdown (the "Synchronizing disks"
+    /// step). 0 means a clean exit needs no disk sync.
+    pub fn pending_chd_sync_count(&self) -> usize {
+        self.hpc3.scsi().pending_chd_sync_count()
+    }
+
+    /// Fold every pending CHD diff back into its base, preserving compression.
+    /// Call only after the guest has stopped (so disk I/O is quiesced).
+    /// `progress(done, total, fraction)` drives a UI; `cancel()` aborts cleanly,
+    /// leaving un-synced bases+diffs intact. Returns the count synced.
+    pub fn sync_chd_disks(
+        &self,
+        progress: &mut dyn FnMut(usize, usize, f32),
+        cancel: &dyn Fn() -> bool,
+    ) -> std::io::Result<usize> {
+        self.hpc3.scsi().sync_chd_disks(progress, cancel)
+    }
+
     /// Cumulative count of guest-originated Ethernet frames the NAT engine has
     /// processed. Monotonic for the life of the machine; an embedder samples the
     /// delta to tell whether the guest's internal networking is alive.
