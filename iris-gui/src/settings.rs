@@ -45,6 +45,16 @@ pub struct GuiSettings {
     /// See [`crate::macos_sandbox`].
     #[serde(default)]
     pub bookmarks: BTreeMap<String, Vec<u8>>,
+
+    /// Folders the user has granted access to under the Mac App Store sandbox
+    /// (via "Grant disks folder…"). A *directory* security-scoped bookmark is
+    /// recursive, so granting one folder covers every disk image, the CHD diff /
+    /// fold temp written beside a base, AND an NFS shared subfolder under it — so
+    /// the "Synchronizing disks" fold (which needs to create a sibling temp and
+    /// rename over the base) works without per-file grants. Empty off the App
+    /// Store build. See [`crate::macos_sandbox`].
+    #[serde(default)]
+    pub disk_folders: Vec<String>,
 }
 
 /// Byte offset of the Indy's 6-byte Ethernet MAC inside the NVRAM. The PROM
@@ -271,7 +281,12 @@ impl GuiSettings {
             .values()
             .flat_map(crate::macos_sandbox::config_paths)
             .collect();
-        crate::macos_sandbox::harvest(paths.iter().map(String::as_str), &mut self.bookmarks);
+        // Harvest both per-file bookmarks and the user-granted disk folders (a
+        // directory bookmark is recursive — see `disk_folders`).
+        crate::macos_sandbox::harvest(
+            paths.iter().map(String::as_str).chain(self.disk_folders.iter().map(String::as_str)),
+            &mut self.bookmarks,
+        );
 
         let path = Self::config_path().ok_or("no config dir")?;
         if let Some(parent) = path.parent() {

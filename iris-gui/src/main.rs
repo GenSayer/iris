@@ -232,6 +232,33 @@ struct App {
     serial_input: String,
     /// Whether the "How camera & networking work" Help window is open.
     show_help_info: bool,
+    /// Whether the "Mount the shared folder in IRIX" Help window is open.
+    show_nfs_help: bool,
+    /// Active "Synchronizing disks…" job (folding CHD diffs back into bases on a
+    /// clean exit); `Some` shows the modal. `None` when no sync is in flight.
+    syncing: Option<SyncJob>,
+    /// Latched once the exit-time disk sync has been kicked off, so the close
+    /// isn't re-intercepted after it finishes.
+    sync_then_close: bool,
+    /// Pending "Discard changes (roll back)" awaiting confirmation; `Some` shows
+    /// the are-you-sure modal.
+    cow_discard_confirm: Option<CowDiscard>,
+}
+
+/// Progress of the exit-time "Synchronizing disks…" step.
+struct SyncJob {
+    /// Disk index currently being synced (0-based) and the total count.
+    disk: usize,
+    total: usize,
+    /// Fraction (0.0..=1.0) through the current disk's rebuild.
+    fraction: f32,
+}
+
+/// A COW overlay the user has asked to discard, awaiting confirmation.
+struct CowDiscard {
+    id: u8,
+    base: String,
+    chd: bool,
 }
 
 struct StopModal {
@@ -367,6 +394,10 @@ impl App {
             serial_console: None,
             serial_input: String::new(),
             show_help_info: false,
+            show_nfs_help: false,
+            syncing: None,
+            sync_then_close: false,
+            cow_discard_confirm: None,
         }
     }
 
@@ -534,12 +565,94 @@ impl App {
         self.start_emulator();
     }
 
+    /// App Store sandbox: let the user grant a folder (recursive read-write) so
+    /// disk images, the CHD diff / fold temp written beside a base, and an NFS
+    /// shared subfolder under it are all accessible from one grant. Persists a
+    /// directory security-scoped bookmark and asserts access immediately.
+    fn grant_disk_folder(&mut self) {
+        if let Some(dir) = rfd::FileDialog::new().pick_folder() {
+            let path = dir.to_string_lossy().into_owned();
+            if !self.prefs.disk_folders.contains(&path) {
+                self.prefs.disk_folders.push(path.clone());
+            }
+            let _ = self.prefs.save(); // mints the directory bookmark
+            macos_sandbox::restore(&self.prefs.bookmarks); // start accessing now
+            self.toast(format!("granted disk folder: {path}"));
+        }
+    }
+
+    /// SCSI-menu section: per-disk Commit / Discard for copy-on-write overlays.
+    /// Only offered while the machine is stopped — the disk files are closed
+    /// then, so applying or discarding can't corrupt a running guest.
+    fn draw_cow_menu(&mut self, ui: &mut egui::Ui) {
+        // Snapshot disks that currently have an overlay on disk (cloned so we
+        // don't hold a `cfg` borrow while sending worker commands below).
+        let mut entries: Vec<(u8, String, bool)> = Vec::new(); // (id, base, is_chd)
+        for (&id, dev) in &self.cfg.scsi {
+            if dev.cdrom || dev.scratch || dev.path.trim().is_empty() {
+                continue;
+            }
+            let is_chd = iris::chd_disk::is_chd(&dev.path);
+            let has_overlay = if is_chd {
+                iris::chd_disk::diff_path_for(std::path::Path::new(&dev.path)).exists()
+            } else if dev.overlay {
+                std::path::Path::new(&format!("{}.overlay", dev.path)).exists()
+            } else {
+                false
+            };
+            if has_overlay {
+                entries.push((id, dev.path.clone(), is_chd));
+            }
+        }
+        if entries.is_empty() {
+            return;
+        }
+        ui.separator();
+        ui.label(RichText::new("Copy-on-write changes").strong());
+        if self.emu.is_running() {
+            ui.label(RichText::new("Stop the machine to commit or roll back.").weak());
+            return;
+        }
+        for (id, base, is_chd) in entries {
+            let name = std::path::Path::new(&base).file_name().and_then(|n| n.to_str()).unwrap_or(&base);
+            ui.label(RichText::new(format!("SCSI {id}: {name}")).weak());
+            if ui.button("    ⬇ Commit changes to disk")
+                .on_hover_text("Permanently merge this session's overlay into the disk image")
+                .clicked()
+            {
+                if is_chd {
+                    // A CHD commit recompresses — show the progress modal.
+                    self.syncing = Some(SyncJob { disk: 0, total: 1, fraction: 0.0 });
+                }
+                self.emu.send(Cmd::CowCommit { base: base.clone(), chd: is_chd });
+                ui.close_menu();
+            }
+            if ui.button("    ↩ Discard changes (roll back)")
+                .on_hover_text("Throw away this session's overlay and revert to the disk as it was")
+                .clicked()
+            {
+                // Destructive — confirm before discarding.
+                self.cow_discard_confirm = Some(CowDiscard { id, base: base.clone(), chd: is_chd });
+                ui.close_menu();
+            }
+        }
+    }
+
     fn request_stop(&mut self) {
         let reasons = evaluate(&self.emu.status, &self.cfg);
-        if reasons.is_empty() {
-            self.emu.send(Cmd::Stop);
-        } else {
+        if !reasons.is_empty() {
             self.stop_modal = Some(StopModal { lines: reason_lines(&reasons) });
+            return;
+        }
+        // Safe to stop (guest quiesced). If a CHD has diff-borne changes, fold
+        // them back into the base now ("Synchronizing disks…") instead of leaving
+        // a sidecar — the worker stops the machine as part of the sync. This is a
+        // stop, not a quit, so `sync_then_close` stays false and the app stays open.
+        if self.emu.has_pending_chd_sync() {
+            self.syncing = Some(SyncJob { disk: 0, total: 0, fraction: 0.0 });
+            self.emu.send(Cmd::SyncDisks);
+        } else {
+            self.emu.send(Cmd::Stop);
         }
     }
 
@@ -554,6 +667,24 @@ impl App {
                 Evt::Screenshot(p)    => self.toast(format!("screenshot: {}", p.display())),
                 Evt::Error(e)         => self.toast(format!("error: {e}")),
                 Evt::Status(_) => {}
+                Evt::SyncProgress { disk, total, fraction } => {
+                    self.syncing = Some(SyncJob { disk, total, fraction });
+                }
+                Evt::CowDone { committed } => {
+                    self.toast(if committed { "changes committed to disk" } else { "done" });
+                }
+                Evt::SyncDone(n) => {
+                    self.syncing = None;
+                    if n > 0 { self.toast(format!("synchronized {n} disk{}", if n == 1 { "" } else { "s" })); }
+                    // If the sync was a pre-quit step, finish closing now. The
+                    // `sync_then_close` latch stays set so this Close isn't
+                    // re-intercepted (the machine is gone, so `chd_sync_pending`
+                    // is stale-true). A Stop-triggered sync leaves it false, so
+                    // the app stays open with the machine stopped.
+                    if self.sync_then_close {
+                        ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                    }
+                }
             }
         }
         // Repaint cadence: ~60 fps while the emulator is running so we
@@ -650,6 +781,37 @@ impl App {
                             self.save_config(path);
                         }
                         ui.close_menu();
+                    }
+                }
+                // App Store sandbox: grant a whole folder (recursive) so the
+                // disk-sync fold — which writes a temp beside the base and
+                // renames over it — works, and so a disk image / NFS shared
+                // subfolder under it is covered by one grant. Hidden elsewhere.
+                if cfg!(feature = "appstore") {
+                    ui.separator();
+                    ui.label(RichText::new("Disk folder access").strong());
+                    if ui.button("Grant a disk folder…")
+                        .on_hover_text("Pick the folder your disk images live in. Grants read/write to \
+                                        everything inside (disk images, CHD diffs, an NFS shared subfolder) \
+                                        so changes can be synced back into the disk.")
+                        .clicked()
+                    {
+                        self.grant_disk_folder();
+                        ui.close_menu();
+                    }
+                    let folders = self.prefs.disk_folders.clone();
+                    for f in &folders {
+                        ui.horizontal(|ui| {
+                            ui.label(RichText::new(f).weak());
+                            if ui.small_button("📂").on_hover_text("Reveal in Finder").clicked() {
+                                config_ui::reveal_in_file_manager(f);
+                            }
+                            if ui.small_button("✕").on_hover_text("Revoke").clicked() {
+                                self.prefs.disk_folders.retain(|x| x != f);
+                                self.prefs.bookmarks.remove(f);
+                                let _ = self.prefs.save();
+                            }
+                        });
                     }
                 }
                 ui.separator();
@@ -762,6 +924,7 @@ impl App {
                         }
                     }
                 }
+                self.draw_cow_menu(ui);
             });
             ui.menu_button("View  ▶", |ui| {
                 if ui.button(if self.fullscreen { "Exit fullscreen (F11)" } else { "Fullscreen (F11)" }).clicked() {
@@ -823,6 +986,13 @@ impl App {
                 }
                 if ui.button("ℹ How camera & networking work…").clicked() {
                     self.show_help_info = true;
+                    ui.close_menu();
+                }
+                if ui.button("🗂 Mount the shared folder in IRIX…")
+                    .on_hover_text("The exact mount command for the NFS share")
+                    .clicked()
+                {
+                    self.show_nfs_help = true;
                     ui.close_menu();
                 }
                 ui.separator();
@@ -1273,6 +1443,7 @@ impl App {
             if tex_size.y >= 1.0 {
                 new_fb_scale = size.y * zoom / tex_size.y;
             }
+            let mut fb_rect = None;
             ui.centered_and_justified(|ui| {
                 let response = ui.add(
                     egui::Image::new((tex.id(), size)).fit_to_exact_size(size).sense(egui::Sense::click())
@@ -1281,7 +1452,28 @@ impl App {
                 // to us instead of routing them to other widgets when
                 // the user clicks into the FB.
                 if response.clicked() { response.request_focus(); fb_clicked = true; }
+                fb_rect = Some(response.rect);
             });
+
+            // After a soft power-off the core stops the CPU but keeps the window
+            // running, so the last frame stays frozen on screen. Dim it with a
+            // translucent grey scrim + label so it reads as inactive, not live.
+            // Keyed on `cpu_stopped` (a real CPU stop), NOT `cpu_halted` — the
+            // latter also trips on 0-MIPS idle at the PROM, which would wrongly
+            // dim a machine that's only paused. The frame underneath stays visible.
+            if self.emu.status.cpu_stopped {
+                if let Some(rect) = fb_rect {
+                    let p = ui.painter_at(rect);
+                    p.rect_filled(rect, 0.0, Color32::from_rgba_unmultiplied(40, 42, 48, 130));
+                    p.text(
+                        rect.center(),
+                        egui::Align2::CENTER_CENTER,
+                        "⏻ Powered off",
+                        egui::FontId::proportional(26.0),
+                        Color32::from_rgba_unmultiplied(235, 235, 235, 235),
+                    );
+                }
+            }
         }
         self.fb_scale = new_fb_scale;
 
@@ -1315,7 +1507,7 @@ impl App {
             }
         });
         ui.separator();
-        let out = show_tab(ui, self.tab, &mut self.cfg, &mut self.jit, &self.net_ifaces);
+        let out = show_tab(ui, self.tab, &mut self.cfg, &mut self.jit, &self.net_ifaces, &self.prefs.disk_folders);
         match out.action {
             ConfigAction::RequestEmbeddedProm => self.confirm_embedded_prom = true,
             ConfigAction::TestCamera => self.open_camera_test(),
@@ -1580,6 +1772,226 @@ impl App {
         }
     }
 
+    /// Help → "Mount the shared folder in IRIX": the exact, copy-pasteable mount
+    /// command for the in-core NFS server, with the live gateway filled in and a
+    /// note matching the configured NFS version.
+    fn nfs_help_window(&mut self, ctx: &egui::Context) {
+        if !self.show_nfs_help {
+            return;
+        }
+        use iris::nfsudp::NfsVersion;
+
+        // Gateway the guest will mount from: the one IRIS has live-adopted while
+        // running, else the gateway derived from the configured NAT subnet, else
+        // the documented default. Matches network_check_window's derivation.
+        let (eb, ep) = netplan::parse_cidr(self.cfg.nat_subnet.as_deref());
+        let cfg_gw = netplan::classify(eb, ep, &[]).derived.map(|d| d.gateway.to_string());
+        let gw = self
+            .emu
+            .status
+            .net_guest_gateway
+            .map(|g| g.to_string())
+            .or(cfg_gw)
+            .unwrap_or_else(|| "192.168.0.1".into());
+
+        let mut open = true;
+        egui::Window::new("Mount the shared folder in IRIX")
+            .open(&mut open)
+            .collapsible(false)
+            // Non-resizable so the window auto-sizes to its content. A resizable
+            // egui Window keeps a remembered/default size and will NOT shrink-wrap,
+            // which is why it spilled to full height before.
+            .resizable(false)
+            .show(ctx, |ui| {
+                ui.set_max_width(520.0);
+                // Cap height so the limitations-expanded page scrolls instead of
+                // growing off-screen; short content just shrinks to fit.
+                egui::ScrollArea::vertical().max_height(560.0).auto_shrink([false, true]).show(ui, |ui| {
+                    let Some(nfs) = self.cfg.nfs.as_ref() else {
+                        ui.label(RichText::new("NFS file sharing isn't enabled yet.").strong());
+                        ui.add_space(4.0);
+                        ui.label(
+                            "Turn it on under Configuration → Networking → NFS share, pick a folder \
+                             to share, then reopen this window for the exact mount command.");
+                        return;
+                    };
+
+                    ui.label(
+                        "IRIS serves the folder below over NFS, in-process, from the NAT gateway. \
+                         Boot IRIX, make sure networking is up (the NET light / Check networking), \
+                         then log in as root and run these commands at an IRIX shell:");
+                    ui.add_space(6.0);
+
+                    if nfs.shared_dir.trim().is_empty() {
+                        ui.label(RichText::new(
+                            "No folder is selected yet — pick one under Configuration → Networking → \
+                             NFS share first.").color(Color32::from_rgb(0xd9, 0x4a, 0x3d)));
+                    } else {
+                        ui.label(RichText::new(format!("Sharing: {}", nfs.shared_dir)).weak());
+                    }
+                    ui.add_space(6.0);
+
+                    // The simple form — IRIX auto-detects NFS from the host:/path
+                    // syntax. The export is the single root "/".
+                    ui.code(format!("mkdir -p /shared\nmount {gw}:/ /shared"));
+                    ui.label(RichText::new(
+                        "Your shared folder then appears at /shared on the Indy. Use any empty mount \
+                         point you like in place of /shared.").weak());
+
+                    ui.add_space(8.0);
+                    let ver_note = match nfs.version {
+                        NfsVersion::Auto => "NFS version: Auto — IRIX picks it. IRIX 6.5 mounts NFSv3; \
+                                             IRIX 5.3 uses NFSv2.",
+                        NfsVersion::V2 => "NFS version: v2 — IRIS only answers NFSv2 (the right choice \
+                                           for IRIX 5.3).",
+                        NfsVersion::V3 => "NFS version: v3 — IRIS only answers NFSv3 (IRIX 6.x).",
+                    };
+                    ui.label(RichText::new(ver_note).weak());
+                    match nfs.version {
+                        NfsVersion::V3 => {
+                            ui.label(RichText::new(
+                                "Max file size: NFSv3 is 64-bit, so files are limited only by your disk.")
+                                .weak());
+                        }
+                        _ => {
+                            ui.label(RichText::new(
+                                "⚠ Max file size over NFSv2 is ~2 GiB (4 GiB protocol ceiling; its \
+                                 sizes/offsets are 32-bit). For larger files, use NFSv3.")
+                                .color(Color32::from_rgb(0xd9, 0x9a, 0x2d)));
+                        }
+                    }
+
+                    ui.separator();
+                    ui.label(RichText::new("If the mount hangs or is refused").strong());
+                    ui.label(
+                        "IRIS's NFS server is UDP-only, and IRIX may otherwise try TCP or the wrong \
+                         version. Pin both explicitly:");
+                    let pin = match nfs.version {
+                        NfsVersion::V2 => "vers=2,proto=udp",
+                        _ => "vers=3,proto=udp",
+                    };
+                    ui.code(format!("mount -o {pin} {gw}:/ /shared"));
+                    ui.add_space(4.0);
+                    ui.label(RichText::new(
+                        "Still stuck? Use Help → \"How camera & networking work\" and the NET light's \
+                         Check button to confirm the guest is on IRIS's subnet first — NFS can't mount \
+                         until networking is up.").weak());
+
+                    ui.add_space(8.0);
+                    ui.label(RichText::new("To unmount later:").strong());
+                    ui.code("umount /shared");
+
+                    ui.add_space(8.0);
+                    ui.collapsing("Limitations & advanced details", |ui| {
+                        let item = |ui: &mut egui::Ui, head: &str, body: &str| {
+                            ui.horizontal_wrapped(|ui| {
+                                ui.label(RichText::new(format!("{head} — ")).strong());
+                                ui.label(RichText::new(body).weak());
+                            });
+                        };
+                        item(ui, "File size",
+                            "NFSv2 caps a single file at ~2 GiB (4 GiB protocol max) — 32-bit sizes and \
+                             offsets. NFSv3 is 64-bit, bounded only by the host disk.");
+                        item(ui, "Transport",
+                            "UDP only — there is no NFS-over-TCP. Large reads are split into IP fragments.");
+                        item(ui, "Single export",
+                            "The whole shared folder is exported as \"/\"; the path after the colon in the \
+                             mount command is ignored.");
+                        item(ui, "Permissions",
+                            "Synthetic: everything is owned by root (uid/gid 0), directories 0755, files \
+                             0644. chmod/chown are accepted but ignored; changing a file's size is honored.");
+                        item(ui, "No authentication",
+                            "Every client is allowed and credentials are ignored — don't expose anything \
+                             sensitive through the share.");
+                        item(ui, "No file locking",
+                            "There is no NLM/lockd, so advisory locks across host and guest won't work.");
+                        item(ui, "No special files",
+                            "Symlinks, device nodes (mknod), and hard links (link) are not served.");
+                        item(ui, "Synchronous writes",
+                            "Every write is flushed immediately and COMMIT is a no-op — data is safe but \
+                             writes are slower than a caching server.");
+                    });
+                });
+                ui.separator();
+                if ui.button("Close").clicked() {
+                    self.show_nfs_help = false;
+                }
+            });
+        if !open {
+            self.show_nfs_help = false;
+        }
+    }
+
+    /// The "Synchronizing disks…" modal shown while a clean exit folds pending
+    /// CHD `.diff.chd` sidecars back into their bases. Driven by `self.syncing`,
+    /// updated from `Evt::SyncProgress`; closes the app on `Evt::SyncDone`.
+    fn sync_modal(&mut self, ctx: &egui::Context) {
+        let Some(job) = &self.syncing else { return };
+        let frac = if job.total > 0 {
+            ((job.disk as f32 + job.fraction) / job.total as f32).clamp(0.0, 1.0)
+        } else {
+            job.fraction.clamp(0.0, 1.0)
+        };
+        let disk_line = (job.total > 1).then(|| format!("Disk {} of {}", (job.disk + 1).min(job.total), job.total));
+        egui::Window::new("Synchronizing disks…")
+            .collapsible(false)
+            .resizable(false)
+            .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+            .show(ctx, |ui| {
+                ui.set_max_width(430.0);
+                ui.label(
+                    "Applying your changes to the CHD disk image. Everything written this session is \
+                     being merged permanently into the disk — this only happens with some (compressed) \
+                     CHD files.");
+                ui.add_space(10.0);
+                ui.add(egui::ProgressBar::new(frac).show_percentage());
+                if let Some(line) = disk_line {
+                    ui.label(RichText::new(line).weak());
+                }
+                ui.add_space(4.0);
+                ui.label(RichText::new("Please don't force-quit — this finishes in a moment.").weak());
+            });
+        // The worker is busy rebuilding; keep repainting so progress updates show.
+        ctx.request_repaint();
+    }
+
+    /// Confirmation before discarding a COW overlay (it's destructive).
+    fn cow_discard_modal(&mut self, ctx: &egui::Context) {
+        let Some(job) = &self.cow_discard_confirm else { return };
+        let name = std::path::Path::new(&job.base).file_name().and_then(|n| n.to_str()).unwrap_or(&job.base).to_string();
+        let (id, base, chd) = (job.id, job.base.clone(), job.chd);
+        let mut decision: Option<bool> = None; // Some(true) = discard, Some(false) = cancel
+        egui::Window::new("Discard changes?")
+            .collapsible(false)
+            .resizable(false)
+            .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+            .show(ctx, |ui| {
+                ui.set_max_width(400.0);
+                ui.label(RichText::new("Are you sure? You will lose any changes to the disk.").strong());
+                ui.add_space(4.0);
+                ui.label(RichText::new(format!("SCSI {id}: {name}")).weak());
+                ui.add_space(8.0);
+                ui.horizontal(|ui| {
+                    if ui.button("Cancel").clicked() {
+                        decision = Some(false);
+                    }
+                    if ui.add(egui::Button::new(RichText::new("Discard changes").color(Color32::WHITE))
+                        .fill(Color32::from_rgb(140, 40, 40))).clicked()
+                    {
+                        decision = Some(true);
+                    }
+                });
+            });
+        match decision {
+            Some(true) => {
+                self.emu.send(Cmd::CowReset { base, chd });
+                self.cow_discard_confirm = None;
+            }
+            Some(false) => self.cow_discard_confirm = None,
+            None => {}
+        }
+    }
+
     fn welcome_panel(&mut self, ui: &mut egui::Ui) {
         ui.add_space(8.0);
         ui.heading("iris — SGI Indy emulator");
@@ -1689,6 +2101,23 @@ impl eframe::App for App {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.handle_events(ctx);
         self.maybe_autosave();
+
+        // Intercept a clean exit (window close / File→Quit) to fold any pending
+        // CHD `.diff.chd` back into its base first ("Synchronizing disks…"). On
+        // the first close request with a pending sync we kick off the worker,
+        // show the modal, and cancel the close; the real close happens on
+        // Evt::SyncDone. `sync_then_close` latches so we don't re-intercept the
+        // final close (by then the machine is gone and chd_sync_pending is stale).
+        if ctx.input(|i| i.viewport().close_requested()) {
+            if !self.sync_then_close && self.emu.has_pending_chd_sync() {
+                self.sync_then_close = true;
+                self.syncing = Some(SyncJob { disk: 0, total: 0, fraction: 0.0 });
+                self.emu.send(Cmd::SyncDisks);
+                ctx.send_viewport_cmd(ViewportCommand::CancelClose);
+            } else if self.syncing.is_some() {
+                ctx.send_viewport_cmd(ViewportCommand::CancelClose); // still syncing — stay alive
+            }
+        }
 
         // F11 toggles fullscreen.
         if ctx.input(|i| i.key_pressed(egui::Key::F11)) {
@@ -1802,6 +2231,15 @@ impl eframe::App for App {
 
         // Help → "How camera & networking work" explainer.
         self.help_info_window(ctx);
+
+        // Help → "Mount the shared folder in IRIX" — the NFS mount command.
+        self.nfs_help_window(ctx);
+
+        // "Synchronizing disks…" modal during the exit-time CHD fold-back.
+        self.sync_modal(ctx);
+
+        // "Discard changes?" confirmation for a COW roll-back.
+        self.cow_discard_modal(ctx);
 
         // Safe-stop confirmation modal.
         let mut close_modal = false;

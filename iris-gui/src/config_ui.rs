@@ -113,11 +113,12 @@ pub fn show_tab(
     cfg: &mut MachineConfig,
     jit: &mut JitEnv,
     host: &[crate::netplan::HostIface],
+    disk_folders: &[String],
 ) -> TabOutcome {
     ScrollArea::vertical().show(ui, |ui| match tab {
         Tab::General => TabOutcome { action: show_general(ui, cfg), ..Default::default() },
         Tab::Disks   => { show_disks(ui, cfg); TabOutcome::default() }
-        Tab::Network => TabOutcome { net: show_network(ui, cfg, host), ..Default::default() },
+        Tab::Network => TabOutcome { net: show_network(ui, cfg, host, disk_folders), ..Default::default() },
         Tab::Memory  => { show_memory(ui, cfg); TabOutcome::default() }
         Tab::Display => { show_display(ui, cfg); TabOutcome::default() }
         Tab::VideoIn => TabOutcome { action: show_vino(ui, cfg), ..Default::default() },
@@ -278,8 +279,14 @@ fn show_disks(ui: &mut Ui, cfg: &mut MachineConfig) {
                     ui.end_row();
                 }
 
-                ui.label("Overlay (COW writes -> .overlay)");
-                ui.checkbox(&mut dev.overlay, "");
+                ui.label("Copy-on-write")
+                    .on_hover_text(
+                        "Keep this session's changes in a separate overlay instead of writing the disk \
+                         directly, so you can roll back. Off: changes go into the disk (a compressed CHD \
+                         still uses an overlay, folded back on a clean exit). Raw → .overlay; CHD → \
+                         .diff.chd. Apply or discard with the monitor: `cow commit` / `cow reset`.");
+                ui.checkbox(&mut dev.overlay, "")
+                    .on_hover_text("Keep changes separate (roll back with `cow reset`, apply with `cow commit`)");
                 ui.end_row();
 
                 ui.label("Scratch volume");
@@ -340,7 +347,7 @@ pub struct NetworkOutcome {
     pub prompt: Option<NetSanityPrompt>,
 }
 
-fn show_network(ui: &mut Ui, cfg: &mut MachineConfig, host: &[crate::netplan::HostIface]) -> NetworkOutcome {
+fn show_network(ui: &mut Ui, cfg: &mut MachineConfig, host: &[crate::netplan::HostIface], disk_folders: &[String]) -> NetworkOutcome {
     use crate::netplan;
     let mut out = NetworkOutcome::default();
     ui.heading("Networking");
@@ -574,7 +581,7 @@ fn show_network(ui: &mut Ui, cfg: &mut MachineConfig, host: &[crate::netplan::Ho
     if let Some(nfs) = cfg.nfs.as_mut() {
         Grid::new("nfs_grid").num_columns(2).striped(true).show(ui, |ui| {
             ui.label("Shared dir");
-            path_row(ui, "nfs_shared", &mut nfs.shared_dir, Pick::Dir, ANY_FILTERS);
+            out.changed |= path_row(ui, "nfs_shared", &mut nfs.shared_dir, Pick::Dir, ANY_FILTERS);
             ui.end_row();
             ui.label("NFS version");
             ComboBox::from_id_salt("nfs_ver")
@@ -590,6 +597,33 @@ fn show_network(ui: &mut Ui, cfg: &mut MachineConfig, host: &[crate::netplan::Ho
                 });
             ui.end_row();
         });
+
+        // App Store: the in-core NFS server can only reach a folder the sandbox
+        // has granted. Easiest path — put the share inside a granted disk folder,
+        // whose recursive grant flows down to it (you can also pick any folder
+        // above; the folder picker grants that one directly).
+        if cfg!(feature = "appstore") {
+            ui.add_space(4.0);
+            if disk_folders.is_empty() {
+                ui.label(RichText::new(
+                    "On the App Store build the shared folder must live somewhere the app has been \
+                     granted. Grant a disk folder first (File → \"Grant a disk folder…\"), then create \
+                     a shared folder inside it here — or pick any folder above to grant it directly.")
+                    .weak());
+            } else {
+                ui.label(RichText::new("Or create a \"shared\" folder inside a granted disk folder:").weak());
+                for folder in disk_folders {
+                    let shared = std::path::Path::new(folder).join("shared");
+                    if ui.button(format!("Use {}", shared.display())).clicked()
+                        && std::fs::create_dir_all(&shared).is_ok()
+                    {
+                        nfs.shared_dir = shared.to_string_lossy().into_owned();
+                        out.changed = true;
+                    }
+                }
+            }
+        }
+
         // Live mount command — gateway fills in to match the subnet. The export
         // is the single root, so the path is just "/".
         let gw = assess.derived.as_ref().map(|d| d.gateway.to_string()).unwrap_or_else(|| "192.168.0.1".into());
@@ -768,18 +802,40 @@ enum Pick {
     Dir,
 }
 
-/// A TextEdit + 📁 Browse button that updates `value` in place.
-/// `filters` is a list of (label, &[extensions]); ignored for `Pick::Dir`.
+/// Reveal `path` in the host file manager, selecting it (Finder on macOS,
+/// Explorer on Windows, the default manager on the containing dir elsewhere).
+/// Best-effort — failures (e.g. a sandbox blocking the spawn) are ignored.
+pub fn reveal_in_file_manager(path: &str) {
+    #[cfg(target_os = "macos")]
+    {
+        // NSWorkspace, not `open` — sandbox-safe (see macos_sandbox::reveal_in_finder).
+        crate::macos_sandbox::reveal_in_finder(path);
+    }
+    #[cfg(target_os = "windows")]
+    {
+        let _ = std::process::Command::new("explorer").arg(format!("/select,{path}")).spawn();
+    }
+    #[cfg(all(unix, not(target_os = "macos")))]
+    {
+        let dir = Path::new(path).parent().unwrap_or_else(|| Path::new("."));
+        let _ = std::process::Command::new("xdg-open").arg(dir).spawn();
+    }
+}
+
+/// A TextEdit + 📁 Browse button that updates `value` in place. Returns whether
+/// `value` changed this frame, so callers can mark the config dirty (typed text
+/// or a Browse pick — both must persist).
 fn path_row(
     ui: &mut Ui,
     id: impl std::hash::Hash,
     value: &mut String,
     mode: Pick,
     filters: &[(&str, &[&str])],
-) {
+) -> bool {
+    let mut changed = false;
     ui.push_id(id, |ui| {
         ui.horizontal(|ui| {
-            ui.add(TextEdit::singleline(value).desired_width(320.0));
+            changed |= ui.add(TextEdit::singleline(value).desired_width(320.0)).changed();
             if ui.button("📁").on_hover_text("Browse…").clicked() {
                 let mut d = rfd::FileDialog::new();
                 // Start the dialog in the existing path's directory if any.
@@ -806,10 +862,19 @@ fn path_row(
                 };
                 if let Some(p) = picked {
                     *value = p.to_string_lossy().into_owned();
+                    changed = true;
                 }
+            }
+            // Reveal an existing path in the host file manager (Finder, Explorer,
+            // …) so the user can find/open it without navigating by hand.
+            if !value.trim().is_empty() && Path::new(value.trim()).exists()
+                && ui.button("📂").on_hover_text("Reveal in file manager").clicked()
+            {
+                reveal_in_file_manager(value.trim());
             }
         });
     });
+    changed
 }
 
 /// Same as `path_row` but for `Option<String>` — Browse populates Some,

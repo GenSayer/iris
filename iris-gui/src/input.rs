@@ -33,19 +33,31 @@ pub struct InputState {
     last_buttons: u8,         // bit0=L, bit1=R, bit2=M, bit3=B4, bit4=B5
     /// True while the host cursor is grabbed and input is routed to the guest.
     pub captured: bool,
+    /// When the window first reported unfocused while captured. Used to debounce
+    /// a real focus loss (alt-tab) from the spurious single-frame `focused=false`
+    /// flickers macOS emits around cursor-grab / notifications / Spaces, which
+    /// otherwise dropped capture mid-typing. `None` while focused.
+    unfocused_since: Option<std::time::Instant>,
 }
 
 impl Default for InputState {
     fn default() -> Self {
-        Self { last_mods: Modifiers::NONE, last_buttons: 0, captured: false }
+        Self { last_mods: Modifiers::NONE, last_buttons: 0, captured: false, unfocused_since: None }
     }
 }
+
+/// How long the window must stay unfocused before a capture is released. Long
+/// enough to ride out macOS's transient focus flicker, short enough that a real
+/// alt-tab frees the cursor promptly.
+const FOCUS_LOSS_GRACE: std::time::Duration = std::time::Duration::from_millis(300);
 
 pub fn pump(ctx: &egui::Context, fb_clicked: bool, ps2: &Ps2Controller, state: &mut InputState, scroll_pixels_per_line: f64) {
     // Collect everything we need inside the input borrow, then act afterwards
     // (sending viewport commands / PS2 writes outside the `input()` closure).
     let mut want_enter = false;
     let mut want_release = false;
+    let mut esc_chord = false;
+    let mut focused = true;
     let mut dx = 0.0f32;
     let mut dy = 0.0f32;
     let mut dz = 0.0f32;
@@ -63,13 +75,14 @@ pub fn pump(ctx: &egui::Context, fb_clicked: bool, ps2: &Ps2Controller, state: &
             return;
         }
 
-        // Captured. Ctrl+Alt+Esc (Alt == Option on macOS) — or losing window
-        // focus (alt-tab) — releases. Using a chord rather than bare Esc lets
-        // plain Esc reach the guest.
-        if (i.key_pressed(Key::Escape) && i.modifiers.ctrl && i.modifiers.alt) || !i.focused {
-            want_release = true;
-            return;
-        }
+        // Captured. Ctrl+Alt+Esc (Alt == Option on macOS) is the release chord;
+        // a real focus loss (alt-tab) also releases, but only after a grace
+        // period (decided below) so a one-frame `focused=false` flicker doesn't
+        // drop capture while you're typing. A chord rather than bare Esc lets
+        // plain Esc reach the guest. Keep reading events even on a flicker frame
+        // so typing keeps flowing to the guest.
+        esc_chord = i.key_pressed(Key::Escape) && i.modifiers.ctrl && i.modifiers.alt;
+        focused = i.focused;
 
         mods = i.modifiers;
 
@@ -100,6 +113,23 @@ pub fn pump(ctx: &egui::Context, fb_clicked: bool, ps2: &Ps2Controller, state: &
         if i.pointer.button_down(PointerButton::Extra2)    { b |= 0x10; }
         buttons = b;
     });
+
+    // Decide whether to release, outside the input borrow. The Esc chord is
+    // immediate; focus loss is debounced over `FOCUS_LOSS_GRACE` so a transient
+    // macOS flicker doesn't drop capture, while a genuine alt-tab still does.
+    if state.captured {
+        if esc_chord {
+            want_release = true;
+        } else if !focused {
+            let now = std::time::Instant::now();
+            let since = *state.unfocused_since.get_or_insert(now);
+            if now.duration_since(since) >= FOCUS_LOSS_GRACE {
+                want_release = true;
+            }
+        } else {
+            state.unfocused_since = None;
+        }
+    }
 
     if want_enter {
         engage_capture(ctx, state);
@@ -172,6 +202,7 @@ pub fn engage_capture(ctx: &egui::Context, state: &mut InputState) {
     // key/button already held at capture time.
     state.last_mods = ctx.input(|i| i.modifiers);
     state.last_buttons = 0;
+    state.unfocused_since = None;
     ctx.send_viewport_cmd(ViewportCommand::CursorVisible(false));
     ctx.send_viewport_cmd(ViewportCommand::CursorGrab(grab_mode()));
 }
@@ -189,6 +220,7 @@ pub fn release_capture(ctx: &egui::Context, ps2: &Ps2Controller, state: &mut Inp
     state.captured = false;
     state.last_mods = Modifiers::NONE;
     state.last_buttons = 0;
+    state.unfocused_since = None;
     ctx.send_viewport_cmd(ViewportCommand::CursorVisible(true));
     ctx.send_viewport_cmd(ViewportCommand::CursorGrab(CursorGrab::None));
 }
@@ -201,6 +233,7 @@ pub fn force_release(ctx: &egui::Context, state: &mut InputState) {
     state.captured = false;
     state.last_mods = Modifiers::NONE;
     state.last_buttons = 0;
+    state.unfocused_since = None;
     ctx.send_viewport_cmd(ViewportCommand::CursorVisible(true));
     ctx.send_viewport_cmd(ViewportCommand::CursorGrab(CursorGrab::None));
 }

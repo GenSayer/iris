@@ -25,6 +25,18 @@ pub enum Cmd {
     SaveState(String),
     RestoreState(String),
     Screenshot(PathBuf),
+    /// Stop the machine and fold any pending CHD `.diff.chd` sidecars back into
+    /// their bases ("Synchronizing disks"), emitting `SyncProgress`/`SyncDone`.
+    /// Sent on a clean exit when `Status::chd_sync_pending` is set.
+    SyncDisks,
+    /// Commit a single disk's COW overlay into its base ("apply changes"). File-
+    /// level (no machine) — only valid while stopped. `chd` picks the `.diff.chd`
+    /// vs raw `.overlay` path. A CHD commit streams `SyncProgress`/`SyncDone`
+    /// (it recompresses); a raw commit ends with `CowDone`.
+    CowCommit { base: String, chd: bool },
+    /// Discard a single disk's COW overlay ("roll back") — delete the
+    /// `.diff.chd` / `.overlay`. File-level; only valid while stopped.
+    CowReset { base: String, chd: bool },
     Quit,
 }
 
@@ -42,6 +54,14 @@ pub enum Evt {
     Screenshot(PathBuf),
     Error(String),
     Status(Status),
+    /// Per-disk progress of a `SyncDisks` run: `disk` of `total` disks, the
+    /// current disk `fraction` (0.0..=1.0) through its rebuild.
+    SyncProgress { disk: usize, total: usize, fraction: f32 },
+    /// `SyncDisks` finished; the app may now close. Carries the disks synced.
+    SyncDone(usize),
+    /// A `CowCommit` (raw) or `CowReset` finished. `committed` = changes were
+    /// applied (vs rolled back / nothing to do).
+    CowDone { committed: bool },
 }
 
 #[derive(Debug, Clone, Default)]
@@ -59,6 +79,14 @@ pub struct Status {
     /// PROM after an IRIX `halt` (0 MIPS). When set, the guest has shut down and
     /// stopping the machine can't corrupt a disk — see [`crate::safe_stop`].
     pub cpu_halted: bool,
+    /// The CPU thread has actually stopped — a soft power-off called
+    /// `Machine::stop`. Unlike `cpu_halted` this is NOT set by mere 0-MIPS idle
+    /// (PROM prompt, idle desktop), so it's the precise "the machine powered
+    /// off" signal the framebuffer overlay uses.
+    pub cpu_stopped: bool,
+    /// At least one attached CHD has diff-borne changes pending a fold-back into
+    /// its base on a clean shutdown — drives the "Synchronizing disks" step.
+    pub chd_sync_pending: bool,
     /// Cumulative count of guest Ethernet frames the NAT engine has processed.
     /// Monotonic within a run; the handle watches it advance to light the
     /// internal-network indicator (see [`EmulatorHandle::net_state`]).
@@ -159,6 +187,8 @@ impl EmulatorHandle {
                 self.status.mips = s.mips;
                 self.status.dirty_cow = s.dirty_cow;
                 self.status.cpu_halted = s.cpu_halted;
+                self.status.cpu_stopped = s.cpu_stopped;
+                self.status.chd_sync_pending = s.chd_sync_pending;
                 // Latch the NET light: once NAT IP traffic has flowed this run
                 // the guest's networking is up, so keep it green through idle
                 // lulls (it resets to red on the next Start).
@@ -173,6 +203,9 @@ impl EmulatorHandle {
             match &evt {
                 Evt::Started => {
                     self.status.running = true;
+                    // Clear a stale stop from the previous run so the new boot
+                    // isn't dimmed before the first status tick lands.
+                    self.status.cpu_stopped = false;
                     // Fresh machine → fresh NAT counter (starts at 0); reset our
                     // tracking so the indicator starts red and only greens on
                     // this run's first observed NAT traffic.
@@ -188,6 +221,10 @@ impl EmulatorHandle {
     }
 
     pub fn is_running(&self) -> bool { self.status.running }
+
+    /// Whether a clean exit needs a "Synchronizing disks" step (a CHD has
+    /// diff-borne changes to fold back into its base). Latest reported status.
+    pub fn has_pending_chd_sync(&self) -> bool { self.status.chd_sync_pending }
 
     /// State of the internal-network indicator: grey when the guest isn't
     /// executing (stopped/halted/PROM), green once NAT IP traffic has flowed
@@ -273,12 +310,14 @@ fn worker_loop(
                         // instructions this window (halted/idle at the PROM, 0 MIPS).
                         let cpu_stopped = machine.as_ref().map_or(true, |m| !m.cpu_is_running());
                         let cpu_halted = cpu_stopped || mips == 0.0;
+                        let chd_sync_pending = machine.as_ref().map_or(false, |m| m.pending_chd_sync_count() > 0);
                         let net_frames = machine.as_ref().map_or(0, |m| m.net_guest_frames());
                         let net_guest_ip = machine.as_ref().and_then(|m| m.net_observed_guest_ip());
                         let net_guest_gateway = machine.as_ref().and_then(|m| m.net_observed_gateway());
                         let net_nat_gateway = machine.as_ref().map(|m| m.nat_expected().1);
                         let _ = evt_tx.send(Evt::Status(Status {
-                            mips, cpu_halted, net_frames, net_guest_ip, net_guest_gateway, net_nat_gateway,
+                            mips, cpu_halted, cpu_stopped, chd_sync_pending,
+                            net_frames, net_guest_ip, net_guest_gateway, net_nat_gateway,
                             ..Status::default()
                         }));
                     }
@@ -373,6 +412,80 @@ fn worker_loop(
                     let _ = evt_tx.send(Evt::Stopped);
                 } else {
                     let _ = evt_tx.send(Evt::Error("not running".into()));
+                }
+            }
+            Ok(Cmd::SyncDisks) => {
+                // Clean-exit disk sync: stop the machine (quiescing disk I/O),
+                // then fold each pending CHD diff back into its base, streaming
+                // progress so the GUI can show "Synchronizing disks…". The
+                // machine is dropped afterwards, exactly like a Stop.
+                let mut synced = 0usize;
+                if let Some(mut m) = machine.take() {
+                    *ps2_slot.lock() = None;
+                    cycles = None;
+                    m.stop();
+                    synced = m
+                        .sync_chd_disks(
+                            &mut |disk, total, fraction| {
+                                let _ = evt_tx.send(Evt::SyncProgress { disk, total, fraction });
+                            },
+                            &|| false,
+                        )
+                        .unwrap_or(0);
+                    // `m` dropped here → fully torn down.
+                }
+                let _ = evt_tx.send(Evt::Stopped);
+                let _ = evt_tx.send(Evt::SyncDone(synced));
+            }
+            Ok(Cmd::CowCommit { base, chd }) => {
+                // File-level commit (the GUI only offers this while stopped, so
+                // the disk files are closed). CHD recompresses with progress; raw
+                // applies the overlay in place.
+                if chd {
+                    let diff = iris::chd_disk::diff_path_for(std::path::Path::new(&base));
+                    if diff.exists() {
+                        let _ = evt_tx.send(Evt::SyncProgress { disk: 0, total: 1, fraction: 0.0 });
+                        match iris::chd_disk::flatten_diff(
+                            std::path::Path::new(&base),
+                            &diff,
+                            &mut |f| { let _ = evt_tx.send(Evt::SyncProgress { disk: 0, total: 1, fraction: f }); },
+                            &|| false,
+                        ) {
+                            Ok(()) => { let _ = evt_tx.send(Evt::SyncDone(1)); }
+                            Err(e) => {
+                                let _ = evt_tx.send(Evt::Error(format!("commit failed: {e}")));
+                                let _ = evt_tx.send(Evt::SyncDone(0));
+                            }
+                        }
+                    } else {
+                        let _ = evt_tx.send(Evt::CowDone { committed: false });
+                    }
+                } else {
+                    let overlay = format!("{base}.overlay");
+                    if std::path::Path::new(&overlay).exists() {
+                        match iris::cow_disk::CowDisk::new(&base, &overlay).and_then(|mut c| c.commit()) {
+                            Ok(_) => { let _ = evt_tx.send(Evt::CowDone { committed: true }); }
+                            Err(e) => { let _ = evt_tx.send(Evt::Error(format!("commit failed: {e}"))); }
+                        }
+                    } else {
+                        let _ = evt_tx.send(Evt::CowDone { committed: false });
+                    }
+                }
+            }
+            Ok(Cmd::CowReset { base, chd }) => {
+                // Roll back: discard the overlay. File-level; stopped-only.
+                let target = if chd {
+                    iris::chd_disk::diff_path_for(std::path::Path::new(&base))
+                } else {
+                    let _ = std::fs::remove_file(format!("{base}.overlay.dirty"));
+                    std::path::PathBuf::from(format!("{base}.overlay"))
+                };
+                match std::fs::remove_file(&target) {
+                    Ok(()) => { let _ = evt_tx.send(Evt::CowDone { committed: false }); }
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                        let _ = evt_tx.send(Evt::CowDone { committed: false });
+                    }
+                    Err(e) => { let _ = evt_tx.send(Evt::Error(format!("roll back failed: {e}"))); }
                 }
             }
             Ok(Cmd::SaveState(name)) => {
