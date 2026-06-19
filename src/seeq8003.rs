@@ -543,9 +543,40 @@ impl Device for Seeq8003 {
         let rx_wake_nat = self.rx_wake.clone();
         let nat_ctl     = self.nat_ctl.clone();
         thread::Builder::new().name("seeq-nat".into()).spawn(move || {
-            NatEngine::new(config, tx_cons, rx_prod,
-                           rx_wake_nat, tx_wake_nat,
-                           running_nat, nat_ctl).run();
+            // Select the network backend. PCAP bridging requires --features pcap;
+            // if the build lacks it, fall back to the software NAT gateway.
+            #[cfg(feature = "pcap")]
+            {
+                use crate::net::NetBackend;
+                if config.mode == crate::config::NetMode::Pcap {
+                    eprintln!("iris: networking backend = PCAP (bridged)");
+                    let mut engine = crate::net_pcap::PcapEngine::new(
+                        config, tx_cons, rx_prod,
+                        rx_wake_nat, tx_wake_nat,
+                        running_nat, nat_ctl);
+                    engine.run();
+                    return;
+                }
+                eprintln!("iris: networking backend = NAT (software gateway)");
+                let mut engine = NatEngine::new(config, tx_cons, rx_prod,
+                                                rx_wake_nat, tx_wake_nat,
+                                                running_nat, nat_ctl);
+                engine.run();
+                return;
+            }
+            #[cfg(not(feature = "pcap"))]
+            {
+                if config.mode == crate::config::NetMode::Pcap {
+                    eprintln!("iris: [network] mode = \"pcap\" requested but this build \
+                               lacks --features pcap; falling back to NAT gateway. \
+                               Rebuild with `--features pcap`.");
+                } else {
+                    eprintln!("iris: networking backend = NAT (software gateway)");
+                }
+                NatEngine::new(config, tx_cons, rx_prod,
+                               rx_wake_nat, tx_wake_nat,
+                               running_nat, nat_ctl).run();
+            }
         }).expect("seeq-nat spawn");
 
         // ── seeq-enet thread: DMA pump loop ───────────────────────────────────
@@ -673,7 +704,7 @@ impl Device for Seeq8003 {
     fn register_commands(&self) -> Vec<(String, String)> {
         vec![
             ("seeq".into(), "seeq status".into()),
-            ("net".into(),  "net status [tcp|udp|icmp|all] | net debug [tcp|udp|icmp] <on|off> [DEV]".into()),
+            ("net".into(),  "net status [tcp|udp|icmp|all] | net debug [tcp|udp|icmp] <on|off> [DEV] | net interfaces".into()),
         ]
     }
 
@@ -759,7 +790,18 @@ impl Device for Seeq8003 {
                             _ => return Err("usage: net debug [tcp|udp|icmp] [on|off]".into()),
                         }
                     }
-                    _ => return Err("usage: net status [tcp|udp|icmp|all] | net debug [tcp|udp|icmp] [on|off]".into()),
+                    Some("interfaces") | Some("ifaces") => {
+                        // List host interfaces available for PCAP bridging.
+                        #[cfg(feature = "pcap")]
+                        {
+                            write!(w, "{}", crate::net_pcap::format_interfaces()).ok();
+                        }
+                        #[cfg(not(feature = "pcap"))]
+                        {
+                            writeln!(w, "PCAP support not built in (rebuild with --features pcap).").ok();
+                        }
+                    }
+                    _ => return Err("usage: net status [tcp|udp|icmp|all] | net debug [tcp|udp|icmp] [on|off] | net interfaces".into()),
                 }
             }
             _ => return Err("not found".into()),

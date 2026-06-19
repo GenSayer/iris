@@ -5,6 +5,25 @@ fn main() {
     print_build_features();
 
     let (mut cfg, scale) = load_config();
+
+    // If PCAP networking is selected but no interface was configured, prompt the
+    // user to choose one now — on the main thread, before the machine starts —
+    // and write the choice into the config. Done here (not in the network
+    // backend, which spins up on its own thread during boot) so the prompt
+    // actually gates startup and reliably reads the console on every platform.
+    // Skipped silently when there's no interactive console (headless/CI), where
+    // the backend then auto-picks.
+    #[cfg(feature = "pcap")]
+    {
+        if cfg.network.mode == iris::config::NetMode::Pcap
+            && cfg.network.pcap_interface.as_deref().map(str::trim).unwrap_or("").is_empty()
+        {
+            if let Some(name) = iris::net_pcap::prompt_for_interface() {
+                cfg.network.pcap_interface = Some(name);
+            }
+        }
+    }
+
     let scroll_pixels_per_line = cfg.mouse_scroll_pixels_per_line;
     let lock_aspect_ratio = cfg.lock_aspect_ratio;
     let headless = cfg.headless;
@@ -129,6 +148,7 @@ fn print_build_features() {
         ("tlbstats", cfg!(feature = "tlbstats")),
         ("chd", cfg!(feature = "chd")),
         ("camera", cfg!(feature = "camera")),
+        ("pcap", cfg!(feature = "pcap")),
         ("ci_clock", cfg!(feature = "ci_clock")),
         ("developer", cfg!(feature = "developer")),
         ("developer_ip7", cfg!(feature = "developer_ip7")),

@@ -222,6 +222,15 @@ struct App {
     serial_input: String,
     /// Whether the "How camera & networking work" Help window is open.
     show_help_info: bool,
+    /// Cached host network-interface list for the PCAP backend selector on the
+    /// Network tab. `None` until first enumerated (lazily on tab open / refresh)
+    /// so we don't call libpcap every frame. `Some(Ok(..))` holds the candidate
+    /// interfaces; `Some(Err(..))` holds the enumeration error to display.
+    pcap_ifaces: Option<Result<Vec<config_ui::PcapIface>, String>>,
+    /// Latched networking backend + interface the machine was started with
+    /// (reset to None on Stop). Used by the running status footer to show "net:
+    /// PCAP → eth0" or "net: NAT" so the user can verify which backend is active.
+    launched_net: Option<(iris::config::NetMode, Option<String>)>,
 }
 
 struct StopModal {
@@ -346,7 +355,16 @@ impl App {
             serial_console: None,
             serial_input: String::new(),
             show_help_info: false,
+            pcap_ifaces: None,
+            launched_net: None,
         }
+    }
+
+    /// (Re)enumerate host network interfaces for the PCAP selector and cache the
+    /// result. Cheap to call on demand (tab open / Refresh button); never called
+    /// per-frame. A no-op placeholder when the build lacks `--features pcap`.
+    fn refresh_pcap_ifaces(&mut self) {
+        self.pcap_ifaces = Some(config_ui::enumerate_pcap_ifaces());
     }
 
     fn toast(&mut self, msg: impl Into<String>) {
@@ -443,6 +461,16 @@ impl App {
             self.toast(format!("'{}' not found — using embedded PROM", self.cfg.prom));
         }
         self.jit.export();
+        // Latch the networking backend the machine is being started with, so the
+        // running status footer can report PCAP vs NAT (and which interface)
+        // independent of any later edits to the config editor. On a build without
+        // PCAP support the runtime forces NAT (even for an imported `mode =
+        // "pcap"`), so reflect that here and never surface PCAP.
+        self.launched_net = Some(if iris::build_features::PCAP {
+            (self.cfg.network.mode, self.cfg.network.pcap_interface.clone())
+        } else {
+            (iris::config::NetMode::Nat, None)
+        });
         self.emu.send(Cmd::Start(Box::new(self.cfg.clone())));
         // Don't resize the window when the VM launches — its size is latched at
         // app load (the saved window size, or the first-launch fit to vm_scale)
@@ -898,6 +926,24 @@ impl App {
         if running && !halted {
             ui.label(format!("{:.0} MIPS", self.emu.status.mips));
         }
+        if running {
+            // Surface the active networking backend so PCAP vs NAT is verifiable
+            // at a glance. Reflects the config the running machine was started
+            // with (latched on Start), not the live editor.
+            match self.launched_net.as_ref() {
+                Some((iris::config::NetMode::Pcap, iface)) => {
+                    let iface = iface.as_deref().filter(|s| !s.is_empty()).unwrap_or("auto");
+                    ui.label(RichText::new(format!("net: PCAP → {iface}"))
+                        .color(Color32::from_rgb(120, 180, 220)))
+                        .on_hover_text("Bridged onto a host interface. See the console for \
+                                        'bridging onto interface …' / 'backend disabled …'.");
+                }
+                Some((iris::config::NetMode::Nat, _)) => {
+                    ui.label(RichText::new("net: NAT").color(Color32::LIGHT_GRAY));
+                }
+                None => {}
+            }
+        }
         if running && self.fb_scale > 0.0 {
             // How magnified the emulated display currently is (1× = native).
             // Round-snap the readout so a whole-number scale reads cleanly.
@@ -960,10 +1006,16 @@ impl App {
         // ¼× steps, so we don't snap here — when we must clamp to the monitor we
         // use the full fitting size (the footer readout reports the actual scale
         // and tags non-crisp ones) rather than dropping a whole step.
-        let scale = target
+        // Largest scale that fits the work area, never above the requested
+        // target. Use min() (not clamp) for the lower floor so we can't panic
+        // when `target` itself is below the floor (e.g. a tiny/zero vm_scale from
+        // a corrupt prefs file): clamp(min, max) panics if min > max, whereas
+        // 0.05.min(target).max(...) is order-independent and saturating.
+        let fit = target
             .min((avail_w.max(64.0)) / fb_px.x)
-            .min((avail_h.max(64.0)) / fb_px.y)
-            .clamp(0.05, target);
+            .min((avail_h.max(64.0)) / fb_px.y);
+        // Floor at 0.05, but never exceed the requested target.
+        let scale = fit.max(0.05).min(target.max(0.05));
         let inner = egui::vec2(fb_px.x * scale + chrome_w, fb_px.y * scale + chrome_h);
         ctx.send_viewport_cmd(ViewportCommand::InnerSize(inner));
     }
@@ -1100,15 +1152,29 @@ impl App {
     }
 
     fn central_tabs(&mut self, ui: &mut egui::Ui) {
+        let prev_tab = self.tab;
         ui.horizontal_wrapped(|ui| {
             for t in Tab::visible() {
                 ui.selectable_value(&mut self.tab, t, t.label());
             }
         });
         ui.separator();
-        match show_tab(ui, self.tab, &mut self.cfg, &mut self.jit) {
+
+        // Lazily enumerate PCAP interfaces the first time the Network tab is
+        // shown (or when switching to it), so the dropdown is populated without
+        // calling libpcap every frame.
+        if self.tab == config_ui::Tab::Network
+            && (self.pcap_ifaces.is_none() || prev_tab != config_ui::Tab::Network)
+        {
+            if self.pcap_ifaces.is_none() {
+                self.refresh_pcap_ifaces();
+            }
+        }
+
+        match show_tab(ui, self.tab, &mut self.cfg, &mut self.jit, &self.pcap_ifaces) {
             ConfigAction::RequestEmbeddedProm => self.confirm_embedded_prom = true,
             ConfigAction::TestCamera => self.open_camera_test(),
+            ConfigAction::RefreshPcapIfaces => self.refresh_pcap_ifaces(),
             ConfigAction::None => {}
         }
     }
@@ -1394,7 +1460,23 @@ impl App {
             });
             ui.end_row();
             ui.label("Network");
-            ui.label(self.cfg.nat_subnet.clone().unwrap_or_else(|| "192.168.0.0/24 (default)".into()));
+            // On a build without PCAP support, the runtime always uses NAT
+            // regardless of any imported `mode = "pcap"`, and the UI must never
+            // surface PCAP — so report NAT unconditionally there.
+            let effective_pcap = iris::build_features::PCAP
+                && self.cfg.network.mode == iris::config::NetMode::Pcap;
+            if effective_pcap {
+                let iface = match self.cfg.network.pcap_interface.as_deref() {
+                    Some(s) if !s.is_empty() => s.to_string(),
+                    _ => "auto-pick".to_string(),
+                };
+                ui.label(format!("PCAP bridged — interface: {iface}"));
+            } else {
+                ui.label(format!(
+                    "NAT gateway — {}",
+                    self.cfg.nat_subnet.clone().unwrap_or_else(|| "192.168.0.0/24 (default)".into())
+                ));
+            }
             ui.end_row();
         });
 

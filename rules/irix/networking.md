@@ -49,6 +49,26 @@ guest_port = 23
 bind = "localhost"
 ```
 
+## PCAP bridged networking (alternative to NAT)
+
+Build with `cargo build --features chd,pcap`. Then in `iris.toml`, set
+`[network] mode = "pcap"` and optionally specify a host interface with
+`pcap_interface = "<name-or-index>"`. The interface choice can be a numeric
+index (recommended, esp. on Windows where names are `\Device\NPF_{GUID}`), an
+exact name, or omitted to auto-pick. On Windows, a literal name must use a TOML
+*single-quoted* literal string because backslashes are escapes in
+`"double-quoted"` strings: `pcap_interface = '\Device\NPF_{...}'`.
+
+In PCAP mode the guest is a real L2 host on the physical LAN — there is NO
+built-in DHCP/DNS/NFS/port-forward. Configure IRIX networking for your real
+network (the `/etc/config` files above still apply, with your LAN's addresses).
+
+Requires root/CAP_NET_RAW (Linux), root (macOS), or Administrator + a
+WinPcap-compatible driver (WinPcap or Npcap) on Windows. The `pcap` crate links
+the generic `wpcap` import library, so the BSD-licensed WinPcap Developer Pack
+works too (set `LIBPCAP_LIBDIR` to point the linker at it); IRIS links
+dynamically and bundles no driver. The NVRAM `eaddr` MAC must still be set.
+
 ## Keyboard workaround
 
 Alt-tabbing away from the Rex window corrupts IRIX X11 keyboard input

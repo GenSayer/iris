@@ -8,7 +8,7 @@ use std::path::{Path, PathBuf};
 /// This is the **system of record** for machines: each named machine is a
 /// `MachineConfig` stored here. `iris.toml` is treated as import/export
 /// only, for compatibility with the standalone `iris` CLI.
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GuiSettings {
     /// Window width / height at last close.
     #[serde(default)]
@@ -51,6 +51,30 @@ pub struct GuiSettings {
     /// See [`crate::macos_sandbox`].
     #[serde(default)]
     pub bookmarks: BTreeMap<String, Vec<u8>>,
+}
+
+impl Default for GuiSettings {
+    /// Hand-written so the scale fields get their real defaults. `#[derive(Default)]`
+    /// would zero `ui_scale`/`vm_scale` (f32's default) and IGNORE the
+    /// `#[serde(default = "...")]` attributes — those only apply during
+    /// deserialization, not `Default::default()`. A zeroed `vm_scale` then makes
+    /// `snap_window_to_fb` compute a target below the clamp floor and panic
+    /// (`clamp(0.05, target)` with `target < 0.05`). `GuiSettings::load()` returns
+    /// `Self::default()` on the first launch (no gui.json yet) and on a parse
+    /// failure, so this path must produce valid scales.
+    fn default() -> Self {
+        Self {
+            window_size: None,
+            ui_scale: default_ui_scale(),
+            vm_scale: default_vm_scale(),
+            fullscreen: false,
+            machines: BTreeMap::new(),
+            active_machine: None,
+            recent_configs: Vec::new(),
+            last_config: None,
+            bookmarks: BTreeMap::new(),
+        }
+    }
 }
 
 /// Byte offset of the Indy's 6-byte Ethernet MAC inside the NVRAM. The PROM

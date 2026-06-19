@@ -9,7 +9,7 @@ use std::net::{IpAddr, Ipv4Addr, SocketAddr, TcpListener, TcpStream, UdpSocket};
 use socket2::{Domain, Protocol, Socket, Type};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use crate::config::{ForwardBind, ForwardProto, NatSubnet, NfsConfig, PortForwardConfig};
+use crate::config::{ForwardBind, ForwardProto, NatSubnet, NetMode, NfsConfig, PortForwardConfig};
 use crate::devlog::LogModule;
 use parking_lot::{Condvar, Mutex};
 use std::time::{Duration, Instant};
@@ -60,6 +60,10 @@ pub struct GatewayConfig {
     pub nfs: Option<NfsConfig>,
     /// Port forwarding rules: host listens and forwards to the guest.
     pub port_forwards: Vec<PortForwardConfig>,
+    /// Networking backend: NAT (software gateway) or PCAP (bridged). Default NAT.
+    pub mode: NetMode,
+    /// Host interface to bridge onto in PCAP mode. None = auto-pick.
+    pub pcap_interface: Option<String>,
 }
 
 impl Default for GatewayConfig {
@@ -73,8 +77,25 @@ impl Default for GatewayConfig {
             dns_upstream: "8.8.8.8:53".parse().unwrap(),
             nfs:          None,
             port_forwards: vec![],
+            mode:         NetMode::Nat,
+            pcap_interface: None,
         }
     }
+}
+
+// ── Network backend abstraction ───────────────────────────────────────────────
+//
+// The SEEQ 8003 chip is backend-agnostic: it hands outbound Ethernet frames to a
+// backend over an rtrb ring and receives inbound frames back over another. Any
+// type that owns those endpoints and a run loop can serve as the backend. Today
+// there are two implementations:
+//   - `NatEngine` (this file): a software NAT gateway/router.
+//   - `PcapEngine` (net_pcap.rs, `--features pcap`): bridges frames onto a real
+//     host interface via libpcap.
+pub trait NetBackend: Send {
+    /// Run the backend loop until the shared `running` flag goes false. Blocks
+    /// the calling thread (the `seeq-nat` thread).
+    fn run(&mut self);
 }
 
 // ── NAT table entries ─────────────────────────────────────────────────────────
@@ -1750,5 +1771,12 @@ impl NatEngine {
             let id = self.ip_id; self.ip_id = self.ip_id.wrapping_add(1);
             self.deferred_rx.extend(ip_frames_udp(&guest_mac, &gw_mac, gw_ip, guest_ip, id, &udp));
         }
+    }
+}
+
+impl NetBackend for NatEngine {
+    fn run(&mut self) {
+        // Delegate to the inherent run loop.
+        NatEngine::run(self)
     }
 }

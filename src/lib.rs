@@ -6,6 +6,7 @@
 pub mod build_features {
     pub const CHD:       bool = cfg!(feature = "chd");
     pub const CAMERA:    bool = cfg!(feature = "camera");
+    pub const PCAP:      bool = cfg!(feature = "pcap");
     pub const JIT:       bool = cfg!(feature = "jit");
     pub const REX_JIT:   bool = cfg!(feature = "rex-jit");
     /// Lightning build strips breakpoint checks and the traceback buffer
@@ -43,6 +44,8 @@ pub mod monitor;
 pub mod locks;
 pub mod pit8254;
 pub mod net;
+#[cfg(feature = "pcap")]
+pub mod net_pcap;
 pub mod seeq8003;
 pub mod cow_disk;
 #[cfg(feature = "chd")]

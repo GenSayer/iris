@@ -2,9 +2,73 @@ use egui::{Color32, ComboBox, DragValue, Grid, RichText, ScrollArea, TextEdit, U
 use iris::build_features;
 use std::path::Path;
 use iris::config::{
-    ForwardBind, ForwardProto, MachineConfig, NfsConfig, PortForwardConfig,
+    ForwardBind, ForwardProto, MachineConfig, NetMode, NfsConfig, PortForwardConfig,
     ScsiDeviceConfig, VinoSource, VinoStandard, VALID_BANK_SIZES,
 };
+
+/// A host network interface candidate for the PCAP backend selector. This is a
+/// GUI-local, feature-independent copy of `iris::net_pcap::NetInterface` so the
+/// App state and `show_network` signature don't need `#[cfg(feature = "pcap")]`.
+#[derive(Debug, Clone)]
+pub struct PcapIface {
+    pub name: String,
+    pub description: Option<String>,
+    pub addrs: Vec<String>,
+    pub up: bool,
+    pub running: bool,
+    pub loopback: bool,
+}
+
+impl PcapIface {
+    /// One-line summary for the dropdown row.
+    fn summary(&self) -> String {
+        let mut s = self.name.clone();
+        let mut tags = Vec::new();
+        if self.up { tags.push("up"); }
+        if self.running { tags.push("running"); }
+        if self.loopback { tags.push("loopback"); }
+        if !tags.is_empty() {
+            s.push_str(&format!("  [{}]", tags.join(",")));
+        }
+        if let Some(ip) = self.addrs.first() {
+            s.push_str(&format!("  {ip}"));
+        }
+        // Windows device names are opaque GUIDs; the description (NIC model) is
+        // far more useful, so append it when present.
+        if let Some(desc) = self.description.as_deref().filter(|d| !d.is_empty()) {
+            s.push_str(&format!("  — {desc}"));
+        }
+        s
+    }
+}
+
+/// Enumerate host interfaces for the PCAP selector. Returns the candidate list,
+/// or an error string (insufficient privileges / no driver / feature missing).
+/// Only does real work when built with `--features pcap`; otherwise returns a
+/// hint so the UI can explain why the dropdown is unavailable.
+pub fn enumerate_pcap_ifaces() -> Result<Vec<PcapIface>, String> {
+    #[cfg(feature = "pcap")]
+    {
+        iris::net_pcap::list_interfaces().map(|list| {
+            list.into_iter()
+                .map(|i| PcapIface {
+                    name: i.name,
+                    description: i.description,
+                    addrs: i.addresses.iter().map(|a| a.to_string()).collect(),
+                    up: i.up,
+                    running: i.running,
+                    loopback: i.loopback,
+                })
+                .collect()
+        })
+    }
+    #[cfg(not(feature = "pcap"))]
+    {
+        Err("this build lacks --features pcap; rebuild iris-gui with `--features pcap` \
+             to enumerate and bridge onto host interfaces"
+            .to_string())
+    }
+}
 
 /// Which config tab is focused. Toolbar quick-buttons set this.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -97,13 +161,22 @@ pub enum ConfigAction {
     /// host camera and show a live preview (using the current `[vino]` standard
     /// and camera index).
     TestCamera,
+    /// User clicked "Refresh" on the Network tab's PCAP selector; the app should
+    /// re-enumerate host interfaces and update its cache.
+    RefreshPcapIfaces,
 }
 
-pub fn show_tab(ui: &mut Ui, tab: Tab, cfg: &mut MachineConfig, jit: &mut JitEnv) -> ConfigAction {
+pub fn show_tab(
+    ui: &mut Ui,
+    tab: Tab,
+    cfg: &mut MachineConfig,
+    jit: &mut JitEnv,
+    pcap_ifaces: &Option<Result<Vec<PcapIface>, String>>,
+) -> ConfigAction {
     ScrollArea::vertical().show(ui, |ui| match tab {
         Tab::General => show_general(ui, cfg),
         Tab::Disks   => { show_disks(ui, cfg); ConfigAction::None }
-        Tab::Network => { show_network(ui, cfg); ConfigAction::None }
+        Tab::Network => show_network(ui, cfg, pcap_ifaces),
         Tab::Memory  => { show_memory(ui, cfg); ConfigAction::None }
         Tab::Display => { show_display(ui, cfg); ConfigAction::None }
         Tab::VideoIn => show_vino(ui, cfg),
@@ -301,8 +374,49 @@ fn show_disks(ui: &mut Ui, cfg: &mut MachineConfig) {
     if let Some(id) = to_delete { cfg.scsi.remove(&id); }
 }
 
-fn show_network(ui: &mut Ui, cfg: &mut MachineConfig) {
+fn show_network(
+    ui: &mut Ui,
+    cfg: &mut MachineConfig,
+    pcap_ifaces: &Option<Result<Vec<PcapIface>, String>>,
+) -> ConfigAction {
+    let mut action = ConfigAction::None;
     ui.heading("Networking");
+
+    // The backend selector (and the entire PCAP UI) is only shown when this
+    // build actually has PCAP support. App Store / bundled builds compile
+    // without `--features pcap`, where NAT is the only backend — so PCAP must
+    // not appear anywhere in the UI (a dangling, non-functional option risks an
+    // App Store rejection). Such builds also force NAT at runtime regardless of
+    // a stale `mode = "pcap"` carried in from an imported config.
+    if build_features::PCAP {
+        Grid::new("net_mode_grid").num_columns(2).striped(true).show(ui, |ui| {
+            ui.label("Backend");
+            ComboBox::from_id_salt("net_mode")
+                .selected_text(match cfg.network.mode {
+                    NetMode::Nat  => "NAT gateway",
+                    NetMode::Pcap => "PCAP (bridged)",
+                })
+                .show_ui(ui, |ui| {
+                    ui.selectable_value(&mut cfg.network.mode, NetMode::Nat, "NAT gateway");
+                    ui.selectable_value(&mut cfg.network.mode, NetMode::Pcap, "PCAP (bridged)");
+                });
+            ui.end_row();
+        });
+
+        if cfg.network.mode == NetMode::Pcap {
+            if let a @ ConfigAction::RefreshPcapIfaces = pcap_interface_picker(ui, cfg, pcap_ifaces) {
+                action = a;
+            }
+
+            ui.colored_label(Color32::from_rgb(0xd0, 0xa0, 0x40),
+                "PCAP mode bridges onto a real interface. NAT, port forwards, and NFS \
+                 below are ignored; the guest uses your real LAN. Requires elevated \
+                 privileges (root/CAP_NET_RAW on Unix, or a WinPcap-compatible driver \
+                 + Administrator on Windows).");
+            ui.separator();
+        }
+    }
+
     Grid::new("nat_grid").num_columns(2).striped(true).show(ui, |ui| {
         ui.label("NAT subnet (CIDR)");
         let mut s = cfg.nat_subnet.clone().unwrap_or_default();
@@ -372,6 +486,95 @@ fn show_network(ui: &mut Ui, cfg: &mut MachineConfig) {
             ui.end_row();
         });
     }
+
+    action
+}
+
+/// PCAP interface picker: a dropdown of enumerated host interfaces (with an
+/// "Auto-pick" entry and a "Manual…" escape hatch), plus a Refresh button.
+/// Stores the choice by interface *name* in `cfg.network.pcap_interface`
+/// (`None` = auto-pick). Returns `RefreshPcapIfaces` when the user asks to
+/// re-enumerate.
+fn pcap_interface_picker(
+    ui: &mut Ui,
+    cfg: &mut MachineConfig,
+    pcap_ifaces: &Option<Result<Vec<PcapIface>, String>>,
+) -> ConfigAction {
+    let mut action = ConfigAction::None;
+
+    // Selected text for the combo: the current name, "Auto-pick", or the raw
+    // value if it's something not in the list (e.g. an index or manual name).
+    let current = cfg.network.pcap_interface.clone();
+    let selected_text = match &current {
+        None => "Auto-pick (first up, non-loopback)".to_string(),
+        Some(v) if v.is_empty() => "Auto-pick (first up, non-loopback)".to_string(),
+        Some(v) => v.clone(),
+    };
+
+    ui.horizontal(|ui| {
+        ui.label("PCAP interface");
+
+        ComboBox::from_id_salt("pcap_iface")
+            .selected_text(selected_text)
+            .width(320.0)
+            .show_ui(ui, |ui| {
+                // Auto-pick entry.
+                let mut is_auto = current.as_deref().unwrap_or("").is_empty();
+                if ui.selectable_label(is_auto, "Auto-pick (first up, non-loopback)").clicked() {
+                    cfg.network.pcap_interface = None;
+                    is_auto = true;
+                }
+                let _ = is_auto;
+
+                match pcap_ifaces {
+                    Some(Ok(list)) if !list.is_empty() => {
+                        ui.separator();
+                        for iface in list {
+                            let selected = current.as_deref() == Some(iface.name.as_str());
+                            if ui.selectable_label(selected, iface.summary()).clicked() {
+                                cfg.network.pcap_interface = Some(iface.name.clone());
+                            }
+                        }
+                    }
+                    Some(Ok(_)) => {
+                        ui.separator();
+                        ui.label(RichText::new("(no interfaces enumerated)").weak());
+                    }
+                    Some(Err(e)) => {
+                        ui.separator();
+                        ui.label(RichText::new(format!("(cannot list: {e})")).weak());
+                    }
+                    None => {
+                        ui.separator();
+                        ui.label(RichText::new("(click Refresh to enumerate)").weak());
+                    }
+                }
+            });
+
+        if ui.button("⟳ Refresh").on_hover_text("Re-enumerate host interfaces").clicked() {
+            action = ConfigAction::RefreshPcapIfaces;
+        }
+    });
+
+    // Manual entry escape hatch: lets the user type an index ("1"), an exact
+    // name, or a Windows \Device\NPF_{...} string the dropdown can't show well.
+    ui.horizontal(|ui| {
+        ui.label("   or type index/name");
+        let mut manual = current.clone().unwrap_or_default();
+        if ui.add(TextEdit::singleline(&mut manual)
+            .hint_text("e.g. 1, eth0, or blank = auto")
+            .desired_width(260.0)).changed()
+        {
+            cfg.network.pcap_interface = if manual.trim().is_empty() { None } else { Some(manual) };
+        }
+    });
+
+    // Show an inline error if enumeration failed.
+    if let Some(Err(e)) = pcap_ifaces {
+        ui.colored_label(Color32::from_rgb(0xe0, 0x60, 0x60), format!("Interface list unavailable: {e}"));
+    }
+
+    action
 }
 
 fn show_vino(ui: &mut Ui, cfg: &mut MachineConfig) -> ConfigAction {

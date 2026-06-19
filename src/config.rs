@@ -108,6 +108,26 @@ impl Default for NatSubnet {
     }
 }
 
+/// Selects which networking backend the SEEQ Ethernet controller is wired to.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, clap::ValueEnum)]
+#[serde(rename_all = "lowercase")]
+#[value(rename_all = "lowercase")]
+pub enum NetMode {
+    /// Built-in software NAT gateway (ARP/DHCP/DNS/ICMP/TCP/UDP + port forwarding).
+    /// Works without any host privileges or extra libraries. This is the default.
+    Nat,
+    /// Bridge raw Ethernet frames onto a real host interface via libpcap
+    /// (Linux/macOS) or a WinPcap-compatible driver (WinPcap or Npcap) on Windows.
+    /// Requires building with `--features pcap` and elevated privileges at runtime.
+    /// The guest appears as a real L2 host on the physical LAN; NAT services
+    /// (DHCP/DNS/NFS/port-forward) are NOT provided — use the real network's.
+    Pcap,
+}
+
+impl Default for NetMode {
+    fn default() -> Self { NetMode::Nat }
+}
+
 /// Networking parameters extracted from `MachineConfig` for the NAT engine and HPC3.
 #[derive(Debug, Clone, Default)]
 pub struct NetworkConfig {
@@ -115,6 +135,24 @@ pub struct NetworkConfig {
     pub port_forward: Vec<PortForwardConfig>,
     /// Parsed subnet; None means use the built-in default (192.168.0.0/24).
     pub nat_subnet:   Option<NatSubnet>,
+    /// Backend selection: NAT (default) or PCAP bridged.
+    pub mode:         NetMode,
+    /// Host interface name to bridge onto when `mode == Pcap`. None = auto-pick
+    /// the first non-loopback interface that libpcap reports as up/running.
+    pub pcap_interface: Option<String>,
+}
+
+/// `[network]` section: backend selection and PCAP options.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
+pub struct NetworkSection {
+    /// Backend: "nat" (default) or "pcap".
+    #[serde(default)]
+    pub mode: NetMode,
+    /// Host interface to bridge onto in PCAP mode (e.g. "eth0", "en0").
+    /// Run `iris --list-net-interfaces` to enumerate candidates.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pcap_interface: Option<String>,
 }
 
 /// Where VINO's video-in capture should come from.
@@ -208,7 +246,14 @@ mod scsi_keys {
 /// scalar/inline-value field to be emitted before any table or array-of-table
 /// field, so all scalars are declared first and the table-valued fields
 /// (`scsi`, `nfs`, `port_forward`, `vino`) come last.
+///
+/// `deny_unknown_fields` makes typos and misplaced keys a hard parse error
+/// instead of silently ignoring them. This catches a common footgun: writing
+/// `mode = "pcap"` at the top level (because `[network]` was left commented
+/// out) used to be silently dropped, so PCAP never engaged and networking
+/// quietly stayed on NAT.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct MachineConfig {
     /// Path to the PROM ROM image.
     #[serde(default = "default_prom")]
@@ -299,6 +344,10 @@ pub struct MachineConfig {
     /// VINO video-in configuration (IndyCam emulation source).
     #[serde(default)]
     pub vino: VinoConfig,
+
+    /// Networking backend selection (`[network]` section). Defaults to NAT.
+    #[serde(default)]
+    pub network: NetworkSection,
 }
 
 fn default_ci_socket() -> String { "/tmp/iris.sock".to_string() }
@@ -359,6 +408,7 @@ impl Default for MachineConfig {
             ci_display: false,
             serial_log: None,
             vino: VinoConfig::default(),
+            network: NetworkSection::default(),
             mouse_scroll_pixels_per_line: default_scroll_pixels_per_line(),
             lock_aspect_ratio: default_lock_aspect_ratio(),
         }
@@ -368,6 +418,13 @@ impl Default for MachineConfig {
 
 impl MachineConfig {
     /// Load from `iris.toml` if it exists, otherwise return defaults.
+    ///
+    /// A *missing* file is fine (defaults are used). A file that exists but
+    /// fails to parse is **fatal**: previously we silently fell back to
+    /// defaults, which hid config mistakes — e.g. a Windows `pcap_interface`
+    /// with unescaped backslashes would discard the entire config, so the
+    /// emulator would quietly auto-pick a different interface and run with NAT
+    /// instead of the settings the user wrote.
     pub fn load_toml(path: &str) -> Self {
         let Ok(text) = std::fs::read_to_string(path) else {
             return Self::default();
@@ -375,8 +432,19 @@ impl MachineConfig {
         match toml::from_str::<Self>(&text) {
             Ok(cfg) => cfg,
             Err(e) => {
-                eprintln!("Warning: failed to parse {}: {}", path, e);
-                Self::default()
+                eprintln!("Configuration error: failed to parse {}:\n{}", path, e);
+                // Common footgun: backslashes in a double-quoted string (Windows
+                // pcap device names look like \Device\NPF_{GUID}).
+                if text.contains("\\Device\\NPF") || e.to_string().contains("escape") {
+                    eprintln!(
+                        "\nhint: backslashes are escape characters inside a \"double-quoted\" TOML string.\n\
+                         For a Windows pcap interface, either use the numeric index from\n\
+                         `iris --list-net-interfaces` (e.g. pcap_interface = \"1\") or a TOML\n\
+                         'single-quoted' literal string:\n\
+                         \n    pcap_interface = '\\Device\\NPF_{{...}}'\n"
+                    );
+                }
+                std::process::exit(1);
             }
         }
     }
@@ -423,6 +491,8 @@ impl MachineConfig {
             nfs:          self.nfs.clone(),
             port_forward: self.port_forward.clone(),
             nat_subnet,
+            mode:         self.network.mode,
+            pcap_interface: self.network.pcap_interface.clone(),
         }
     }
 
@@ -541,6 +611,21 @@ pub struct Cli {
     #[arg(long = "nat-subnet", value_name = "CIDR")]
     pub nat_subnet: Option<String>,
 
+    /// Networking backend: "nat" (default, software gateway) or "pcap"
+    /// (bridge onto a real host interface; requires --features pcap).
+    #[arg(long = "net-mode", value_name = "MODE")]
+    pub net_mode: Option<NetMode>,
+
+    /// Host interface to bridge onto in PCAP mode (e.g. eth0, en0).
+    /// Implies --net-mode pcap. List candidates with --list-net-interfaces.
+    #[arg(long = "pcap-interface", value_name = "IFACE")]
+    pub pcap_interface: Option<String>,
+
+    /// Print the host network interfaces libpcap can bridge onto, then exit.
+    /// Requires a build with --features pcap.
+    #[arg(long = "list-net-interfaces", default_value_t = false)]
+    pub list_net_interfaces: bool,
+
     /// Enable GDB stub on the given TCP port (e.g. --gdb-port 1234).
     /// Connect with: target remote localhost:<port>
     #[arg(long = "gdb-port", value_name = "PORT")]
@@ -632,6 +717,16 @@ impl Cli {
         if let Some(p) = self.gdb_port { cfg.gdb_port = Some(p); }
         if let Some(ref s) = self.nat_subnet { cfg.nat_subnet = Some(s.clone()); }
 
+        if let Some(m) = self.net_mode { cfg.network.mode = m; }
+        if let Some(ref iface) = self.pcap_interface {
+            cfg.network.pcap_interface = Some(iface.clone());
+            // Specifying an interface implies PCAP mode unless the user also
+            // explicitly asked for NAT.
+            if self.net_mode.is_none() {
+                cfg.network.mode = NetMode::Pcap;
+            }
+        }
+
         cfg
     }
 }
@@ -640,6 +735,22 @@ impl Cli {
 /// Returns (machine_config, window_scale) where window_scale is 1 or 2.
 pub fn load_config() -> (MachineConfig, u32) {
     let cli = Cli::parse();
+
+    // --list-net-interfaces: print candidate PCAP interfaces and exit. Handled
+    // here (before machine construction) since it only needs the parsed CLI.
+    if cli.list_net_interfaces {
+        #[cfg(feature = "pcap")]
+        {
+            print!("{}", crate::net_pcap::format_interfaces());
+            std::process::exit(0);
+        }
+        #[cfg(not(feature = "pcap"))]
+        {
+            eprintln!("iris: --list-net-interfaces requires a build with --features pcap");
+            std::process::exit(1);
+        }
+    }
+
     let toml_cfg = MachineConfig::load_toml(&cli.config);
     let cfg = cli.apply(toml_cfg);
     let scale = cfg.scale;
