@@ -1,7 +1,11 @@
 # Plan: in-core NFSv3-over-UDP server (`src/nfsudp.rs`)
 
-Status: **planning** — no code yet. Replaces the external `unfsd` with a
-synchronous, pure-Rust NFS/UDP server that lives inside the NAT.
+Status: **CODE-COMPLETE** (increments 1–8 landed, ~19 unit tests, builds clean on
+default + appstore). Replaces the external `unfsd` with a synchronous, pure-Rust
+NFS/UDP server that lives inside the NAT. **Pending: real-boot validation** —
+mount from IRIX 5.3 (v2) and 6.x (v3), read/write, and large transfers
+(fragmentation/reassembly). Code: `src/nfsudp.rs` (backend, XDR/RPC, NFSv2+v3,
+MOUNT, DRC, NfsServer) + `src/net.rs` (handle_udp intercept, inbound reassembly).
 
 ## Decisions (locked 2026-06-18)
 

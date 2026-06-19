@@ -188,22 +188,15 @@ grep -v '^#' /etc/inetd.conf | grep -E 'tcp|udp'
 
 ## NFS file sharing
 
-IRIS can export a host directory to IRIX over NFS using
-[unfs3](https://github.com/unfs3/unfs3) as the NFS server.  The emulator
-handles portmap (port 111) internally and NATs NFS/mountd traffic to a
-localhost unfsd instance — no root privileges required.
+IRIS exports a host directory to IRIX over NFS using a **built-in, pure-Rust NFS
+server** (`src/nfsudp.rs`). It runs entirely inside the NAT — the emulator
+answers portmap (port 111) and the MOUNT/NFS RPC itself and injects the replies
+as virtual-network frames. **Nothing to install** (no external `unfsd`), **no
+host sockets**, and it works the same on Linux, macOS, and Windows. The only
+host interaction is reading/writing files in the folder you export.
 
-### Requirements
-
-Install unfs3 and make sure `unfsd` is in your `PATH`:
-
-```bash
-# Debian / Ubuntu
-apt install unfs3
-
-# Or build from source
-git clone https://github.com/unfs3/unfs3 && cd unfs3 && ./autogen.sh && ./configure && make
-```
+It speaks **NFSv2 (IRIX 5.3)** and **NFSv3 (IRIX 6.x)** and answers whichever the
+guest mounts with.
 
 ### Configuration
 
@@ -211,39 +204,30 @@ Add an `[nfs]` section to `iris.toml`:
 
 ```toml
 [nfs]
-shared_dir = "./shared"       # directory to export (resolved to absolute path at startup)
-# unfsd = "unfsd"             # path to unfsd binary [default: unfsd]
-# nfs_host_port = 12049       # host port for NFS [default: 12049]
-# mountd_host_port = 11234    # host port for mountd [default: 11234]
+shared_dir = "./shared"   # directory to export (created on demand)
+# version = "auto"        # "auto" (default), "v2", or "v3"
 ```
 
-Or use the command-line flag to enable it without editing the config:
+Or enable it from the command line:
 
 ```bash
 iris --nfs-dir /path/to/share
-iris --nfs-dir /path/to/share --nfs-port 12049 --mountd-port 11234 --unfsd /usr/sbin/unfsd
 ```
 
-IRIS will start unfsd automatically on launch and kill it on exit.  The shared
-directory must exist before starting the emulator.
+(The GUI exposes the same under Configuration → Networking → NFS share.)
 
 ### Mounting from IRIX
 
-The emulator prints the export path at startup:
-
-```
-iris: unfsd started (pid 1234) nfs=127.0.0.1:12049 mountd=127.0.0.1:11234 dir=/absolute/path/to/shared
-```
-
-From IRIX, mount using that absolute path:
+The export is a single root, so mount it as `/`:
 
 ```
 # mkdir /shared
-# mount 192.168.0.1:/absolute/path/to/shared /shared
+# mount 192.168.0.1:/ /shared
 # ls /shared
 ```
 
-NFS version 3 is used by default; IRIX will fall back to version 2 automatically if needed.
+Use the gateway address shown in the GUI (it tracks your NAT subnet). The server
+fakes uid/gid/mode so the export behaves the same regardless of the host OS.
 
 ### Checking network status from the monitor
 
