@@ -63,6 +63,19 @@ chd = ["dep:libchdman-rs"]
 #   Windows — nokhwa MediaFoundation (dep:nokhwa)
 # Off by default — enable with `cargo build --features camera`.
 camera = ["dep:nokhwa", "dep:v4l"]
+# PCAP/bridged networking backend: instead of the built-in software NAT gateway,
+# bridge the guest's raw Ethernet frames onto a real host interface via libpcap.
+# Lets the guest appear as a real L2 host on the physical LAN. Requires a pcap
+# library at build+run time and elevated privileges (root / CAP_NET_RAW /
+# Administrator) to capture and inject.
+#   Linux/macOS : libpcap (headers+lib).
+#   Windows     : the `pcap` crate links the generic `wpcap` import library, so
+#                 it works with the BSD-licensed WinPcap Developer Pack as well
+#                 as Npcap. IRIS links dynamically and never bundles the driver,
+#                 so the runtime driver's license does not attach to IRIS.
+# Off by default — enable with `cargo build --features pcap`. Select at runtime
+# with `[network] mode = "pcap"` in iris.toml.
+pcap = ["dep:pcap"]
 
 [dependencies]
 clap = { version = "4", features = ["derive"] }
@@ -95,6 +108,7 @@ cranelift-module     = { version = "0.116", optional = true }
 cranelift-native     = { version = "0.116", optional = true }
 target-lexicon       = { version = "0.13",  optional = true }
 libchdman-rs = { version = "0.287.0-l7", features = ["prebuilt"], optional = true }
+pcap = { version = "2", optional = true }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 nokhwa = { version = "0.10", features = ["input-avfoundation"], optional = true }

@@ -127,3 +127,37 @@ bind       = "localhost"
 
 #[vino]
 #source = "camera"
+
+# ── Networking backend ────────────────────────────────────────────────────────
+# mode = "nat"  (default) : built-in software NAT gateway (DHCP/DNS/ICMP/TCP/UDP
+#                           + the [[port_forward]] rules above). No host
+#                           privileges or extra libraries needed.
+# mode = "pcap"           : bridge the guest's raw Ethernet frames onto a real
+#                           host interface (requires building with --features
+#                           pcap and elevated privileges). The guest becomes a
+#                           real L2 host on your LAN; NAT services and port
+#                           forwarding do NOT apply in this mode.
+#
+# List candidate interfaces:  iris --list-net-interfaces
+#   (or, in the monitor:      net interfaces)
+#
+# pcap_interface accepts EITHER:
+#   - a 1-based index from --list-net-interfaces, e.g. "1"  (easiest, esp. Windows)
+#   - an exact device name, e.g. "eth0" / "en0"
+#   - omit it entirely: if launched from a terminal you'll get an interactive
+#     menu to pick the interface; if there's no console (headless/CI) it
+#     auto-picks the first up, non-loopback NIC.
+#
+# IMPORTANT (Windows): device names look like \Device\NPF_{GUID}. Backslashes are
+# escape characters inside a normal "double-quoted" TOML string, so you MUST use a
+# 'single-quoted' TOML *literal* string (no escaping), or just use the index.
+#
+# NOTE: the [network] header below is REQUIRED. If you uncomment `mode`/
+# `pcap_interface` but leave `[network]` commented out, the keys land in the
+# top-level table and are rejected as unknown (the emulator will refuse to
+# start) — they only take effect under the [network] table.
+[network]
+mode           = "nat"
+#pcap_interface = "1"                                          # by index (recommended)
+#pcap_interface = "wlan0"                                     # by name (Linux/macOS)
+#pcap_interface = '\Device\NPF_{385F30D0-9166-45D3-BBC6-F1D9C5300AF9}'  # Windows (literal '...' string!)
