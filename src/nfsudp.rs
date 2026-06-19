@@ -750,6 +750,14 @@ fn nfs3_readdir(call: &RpcCall, args: &mut Cur, b: &mut NfsBacking, plus: bool) 
     if args.fixed(8).is_none() {
         return garbage(call.xid); // cookieverf
     }
+    // Honor the client's reply-size limit so we never overrun its decode buffer
+    // (the v2 path documents the "Can't decode result" failure this avoids).
+    // READDIR carries `maxcount`; READDIRPLUS carries `dircount` then `maxcount`.
+    if plus {
+        args.u32(); // dircount
+    }
+    let maxcount = args.u32().unwrap_or(0) as usize;
+    let limit = if maxcount == 0 { 16_000 } else { maxcount.clamp(512, 16_000) };
     let Some(mut entries) = b.readdir(fid) else {
         let mut x = reply(call.xid, accept::SUCCESS);
         x.u32(NFS3ERR_NOTDIR);
@@ -769,7 +777,7 @@ fn nfs3_readdir(call: &RpcCall, args: &mut Cur, b: &mut NfsBacking, plus: bool) 
     while i < entries.len() {
         let (name, id, attr) = &entries[i];
         let est = 40 + name.len() + if plus { 96 } else { 0 };
-        if budget > 0 && budget + est > 16_000 {
+        if budget > 0 && budget + est > limit {
             break; // page is full; client resumes from this cookie
         }
         budget += est;
@@ -1210,7 +1218,7 @@ fn nfs2_readdir(call: &RpcCall, args: &mut Cur, b: &mut NfsBacking) -> Vec<u8> {
     let Some(fid) = get_fh2(args) else { return garbage(call.xid) };
     let Some(cookie_bytes) = args.fixed(4) else { return garbage(call.xid) };
     let cookie = u32::from_be_bytes(cookie_bytes.try_into().unwrap()) as usize;
-    let _count = args.u32();
+    let count = args.u32().unwrap_or(0) as usize;
     let mut x = reply(call.xid, accept::SUCCESS);
     let Some(mut entries) = b.readdir(fid) else {
         x.u32(NFS3ERR_NOTDIR);
@@ -1218,12 +1226,20 @@ fn nfs2_readdir(call: &RpcCall, args: &mut Cur, b: &mut NfsBacking) -> Vec<u8> {
     };
     entries.sort_by(|p, q| p.0.cmp(&q.0));
     x.u32(NFS2_OK);
+    // Page so the reply fits BOTH the client's `count`-sized decode buffer and a
+    // single unfragmented UDP datagram. NFSv2/BSD-derived clients (IRIX) size
+    // their receive buffer to `count`; overrunning it truncates the datagram on
+    // their side and the XDR decode fails ("Can't decode result"). The directory
+    // is continued across calls via the cookie, so a small per-reply budget just
+    // costs a few more READDIR round-trips. 1400 keeps us under the 1472-byte
+    // single-datagram UDP payload after the ~36 bytes of header + terminators.
+    let limit = count.clamp(512, 1400);
     let mut i = cookie;
     let mut budget = 0usize;
     while i < entries.len() {
         let (name, id, _attr) = &entries[i];
         let est = 24 + name.len();
-        if budget > 0 && budget + est > 8000 {
+        if budget > 0 && budget + est > limit {
             break;
         }
         budget += est;
@@ -1815,6 +1831,63 @@ mod tests {
         s.handle(&call2(4, PROC2_WRITE, &a.into_bytes())).unwrap();
         assert_eq!(&std::fs::read(root.join("v2.txt")).unwrap()[..4], b"XYZW");
 
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn v2_readdir_pages_within_one_datagram() {
+        let root = temp_export();
+        // Enough entries that the listing can't fit one UDP datagram, so the
+        // reply MUST be paged. This is the Mac-Downloads case that produced
+        // "NFS2 readdir failed ... Can't decode result": the old fixed 8000-byte
+        // budget overran the client's count-sized buffer and spilled into
+        // multiple IP fragments.
+        let n: usize = 200;
+        for i in 0..n {
+            std::fs::write(root.join(format!("file_{i:03}")), b"x").unwrap();
+        }
+        let mut s = NfsServer::new(&root, NfsVersion::Auto);
+
+        // Decode one v2 READDIR reply: strip the 6-word RPC header + status, walk
+        // the entry list, return (names, last_cookie, eof).
+        fn decode(reply: &[u8]) -> (Vec<Vec<u8>>, [u8; 4], bool) {
+            let mut c = Cur::new(reply);
+            for _ in 0..6 { c.u32(); } // RPC accepted-reply header
+            assert_eq!(c.u32(), Some(NFS2_OK));
+            let mut names = Vec::new();
+            let mut last_cookie = [0u8; 4];
+            while c.u32() == Some(1) { // value_follows; 0 ends the list
+                c.u32(); // fileid
+                names.push(c.opaque().unwrap().to_vec());
+                last_cookie = c.fixed(4).unwrap().try_into().unwrap();
+            }
+            let eof = c.u32() == Some(1);
+            (names, last_cookie, eof)
+        }
+
+        let mut all = Vec::new();
+        let mut cookie = [0u8; 4];
+        let mut pages: u32 = 0;
+        loop {
+            let mut a = Xdr::new();
+            put_fh2(&mut a, ROOT_ID);
+            a.fixed(&cookie); // nfscookie
+            a.u32(8192); // count — a typical IRIX NFSv2 readdir size
+            let r = s.handle(&call2(100 + pages, PROC2_READDIR, &a.into_bytes())).unwrap();
+            // The whole reply must fit one unfragmented UDP datagram (≤ 1472).
+            assert!(r.len() <= 1472, "readdir page {pages} is {} bytes — would fragment", r.len());
+            let (names, last, eof) = decode(&r);
+            assert!(!names.is_empty(), "each page must make progress");
+            all.extend(names);
+            pages += 1;
+            if eof { break; }
+            cookie = last;
+            assert!(pages < 50, "paging should terminate");
+        }
+        assert!(pages > 1, "the listing should have needed multiple pages");
+        all.sort();
+        all.dedup();
+        assert_eq!(all.len(), n, "every entry returned exactly once across pages");
         std::fs::remove_dir_all(&root).ok();
     }
 

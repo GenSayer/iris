@@ -127,6 +127,14 @@ an Auto/v2/v3 dropdown + a live mount hint `mount <gateway>:/ /shared`.
   an RPC client may drop a reply from the wrong port or a bad checksum.
 - **READDIR cookies** — `nfs3_readdir`/`nfs2_readdir` page by a name-sorted index;
   if `ls` loops or truncates, inspect the cookie/eof logic.
+- **READDIR reply size** — *FIXED 2026-06-18.* A large dir (`ls ~/Downloads`)
+  gave `NFS2 readdir failed ... Can't decode result`: the v2 path ignored the
+  request's `count` and used a fixed ~8 KB budget, overrunning the client's
+  count-sized decode buffer *and* fragmenting. Both readdir paths now cap each
+  reply at the client's `count`/`maxcount`; v2 also caps to one unfragmented UDP
+  datagram (paging via the cookie). See
+  `rules/irix/nfs-readdir-must-respect-count-and-fit-one-datagram.md` and the
+  `v2_readdir_pages_within_one_datagram` test. Still needs real-boot confirmation.
 - **DRC over-dedup** — keyed by xid only (256 FIFO). If a legit non-idempotent op is
   wrongly skipped, widen the key (add src) — see `is_idempotent` / `Drc`.
 
