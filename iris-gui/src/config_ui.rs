@@ -5,6 +5,7 @@ use iris::config::{
     ForwardBind, ForwardProto, MachineConfig, NfsConfig, PortForwardConfig,
     ScsiDeviceConfig, VinoSource, VinoStandard, VALID_BANK_SIZES,
 };
+use iris::nfsudp::NfsVersion;
 
 /// Which config tab is focused. Toolbar quick-buttons set this.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -558,72 +559,43 @@ fn show_network(ui: &mut Ui, cfg: &mut MachineConfig, host: &[crate::netplan::Ho
 
     ui.separator();
     ui.strong("NFS share");
-
-    // NFS relies on the external `unfsd` (UNFS3) server. There's no clean native
-    // Windows build (Cygwin only), and macOS bundled / App Store builds neither
-    // ship it nor (in the sandbox) can spawn it — so gate NFS off there and point
-    // at a port forward. Source builds on macOS / Linux keep it.
-    let nfs_supported = !cfg!(target_os = "windows")
-        && !(cfg!(target_os = "macos") && cfg!(feature = "bundled"));
-
-    if !nfs_supported {
-        ui.label(RichText::new(
-            "NFS file sharing isn't available in this build: it needs the external unfsd server, \
-             which isn't shipped here (and the macOS sandbox can't run it). Move files with a port \
-             forward (e.g. the FTP preset above) instead.")
-            .weak());
-        // Let an imported config that still carries NFS be cleared.
-        if cfg.nfs.is_some() && ui.button("Remove NFS from this config").clicked() {
-            cfg.nfs = None;
-            out.changed = true;
-        }
-    } else {
-        ui.label(RichText::new(
-            "The Indy speaks NFS natively: an easy way to move files between your computer and the \
-             emulated machine. IRIS runs the NFS server for you, backed by the folder you pick below; \
-             no NFS setup is needed on the Indy side.")
-            .weak());
-        #[cfg(target_os = "macos")]
-        ui.label(RichText::new(
-            "macOS doesn't ship unfsd, and there's no Homebrew formula for it. Build the UNFS3 server \
-             from source (github.com/unfs3/unfs3: ./bootstrap && ./configure && make), or \
-             'sudo port install unfs3' with MacPorts, then point the unfsd binary field below at it \
-             (or put it on your PATH).")
-            .weak());
-        let mut has_nfs = cfg.nfs.is_some();
-        if ui.checkbox(&mut has_nfs, "Enable NFS").changed() {
-            cfg.nfs = if has_nfs {
-                Some(NfsConfig {
-                    shared_dir: String::new(),
-                    unfsd: "unfsd".into(),
-                    nfs_host_port: 12049,
-                    mountd_host_port: 11234,
+    ui.label(RichText::new(
+        "The Indy speaks NFS natively — the easiest way to move files between your computer and the \
+         emulated machine. IRIS serves NFS itself, in-process, backed by the folder you pick below: \
+         nothing to install on any platform, and no NFS setup on the Indy side.")
+        .weak());
+    let mut has_nfs = cfg.nfs.is_some();
+    if ui.checkbox(&mut has_nfs, "Enable NFS").changed() {
+        cfg.nfs = if has_nfs {
+            Some(NfsConfig { shared_dir: String::new(), version: NfsVersion::Auto })
+        } else { None };
+        out.changed = true;
+    }
+    if let Some(nfs) = cfg.nfs.as_mut() {
+        Grid::new("nfs_grid").num_columns(2).striped(true).show(ui, |ui| {
+            ui.label("Shared dir");
+            path_row(ui, "nfs_shared", &mut nfs.shared_dir, Pick::Dir, ANY_FILTERS);
+            ui.end_row();
+            ui.label("NFS version");
+            ComboBox::from_id_salt("nfs_ver")
+                .selected_text(match nfs.version {
+                    NfsVersion::Auto => "Auto",
+                    NfsVersion::V2 => "v2 (IRIX 5.3)",
+                    NfsVersion::V3 => "v3 (IRIX 6.x)",
                 })
-            } else { None };
-            out.changed = true;
-        }
-        if let Some(nfs) = cfg.nfs.as_mut() {
-            Grid::new("nfs_grid").num_columns(2).striped(true).show(ui, |ui| {
-                ui.label("Shared dir");
-                path_row(ui, "nfs_shared", &mut nfs.shared_dir, Pick::Dir, ANY_FILTERS);
-                ui.end_row();
-                ui.label("unfsd binary");
-                path_row(ui, "nfs_unfsd", &mut nfs.unfsd, Pick::OpenFile, ANY_FILTERS);
-                ui.end_row();
-                ui.label("NFS host port");
-                out.changed |= ui.add(DragValue::new(&mut nfs.nfs_host_port).range(1..=65535)).changed();
-                ui.end_row();
-                ui.label("mountd host port");
-                out.changed |= ui.add(DragValue::new(&mut nfs.mountd_host_port).range(1..=65535)).changed();
-                ui.end_row();
-            });
-            // Live mount command — gateway + folder fill in to match the subnet.
-            let gw = assess.derived.as_ref().map(|d| d.gateway.to_string()).unwrap_or_else(|| "192.168.0.1".into());
-            let dir = if nfs.shared_dir.is_empty() { "/path/to/share".to_string() } else { nfs.shared_dir.clone() };
-            ui.label(RichText::new("Pick a folder, boot the Indy, then mount it:").weak());
-            ui.code(format!("mkdir /shared\nmount {gw}:{dir} /shared"));
-            ui.label(RichText::new("Your files then appear at /shared on the Indy.").weak());
-        }
+                .show_ui(ui, |ui| {
+                    out.changed |= ui.selectable_value(&mut nfs.version, NfsVersion::Auto, "Auto").changed();
+                    out.changed |= ui.selectable_value(&mut nfs.version, NfsVersion::V2, "v2 (IRIX 5.3)").changed();
+                    out.changed |= ui.selectable_value(&mut nfs.version, NfsVersion::V3, "v3 (IRIX 6.x)").changed();
+                });
+            ui.end_row();
+        });
+        // Live mount command — gateway fills in to match the subnet. The export
+        // is the single root, so the path is just "/".
+        let gw = assess.derived.as_ref().map(|d| d.gateway.to_string()).unwrap_or_else(|| "192.168.0.1".into());
+        ui.label(RichText::new("Pick a folder, boot the Indy, then mount it:").weak());
+        ui.code(format!("mkdir /shared\nmount {gw}:/ /shared"));
+        ui.label(RichText::new("Your files then appear at /shared on the Indy.").weak());
     }
 
     out

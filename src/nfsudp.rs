@@ -509,7 +509,7 @@ pub struct RpcCall {
 
 /// Parse the RPC CALL header from one UDP datagram, returning the header and a
 /// cursor positioned at the procedure arguments. `None` if it isn't a v2 CALL.
-pub fn parse_call(msg: &[u8]) -> Option<(RpcCall, Cur)> {
+pub fn parse_call(msg: &[u8]) -> Option<(RpcCall, Cur<'_>)> {
     let mut c = Cur::new(msg);
     let xid = c.u32()?;
     if c.u32()? != MSG_CALL {
@@ -1306,8 +1306,10 @@ pub fn mount_call(call: &RpcCall, args: &mut Cur) -> Vec<u8> {
 // ── server: program/version dispatch + duplicate-request cache ──────────────
 
 /// Which NFS version(s) to serve. `Auto` answers whatever the guest mounts with.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
 pub enum NfsVersion {
+    #[default]
     Auto,
     V2,
     V3,

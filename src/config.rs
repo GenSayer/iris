@@ -70,25 +70,16 @@ pub struct PortForwardConfig {
     pub bind: ForwardBind,
 }
 
-/// NFS share configuration (requires unfsd on the host).
+/// NFS share configuration. NFS is served in-process by the NAT
+/// (`src/nfsudp.rs`) — no external `unfsd`, no host sockets.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct NfsConfig {
     /// Directory to export over NFS.
     pub shared_dir: String,
-    /// Path to the unfsd binary [default: "unfsd"].
-    #[serde(default = "default_unfsd")]
-    pub unfsd: String,
-    /// Host-side port unfsd listens on for NFS (high port, NAT'd to 2049 inside the VM).
-    #[serde(default = "default_nfs_host_port")]
-    pub nfs_host_port: u16,
-    /// Host-side port unfsd listens on for mountd (high port, NAT'd to 1234 inside the VM).
-    #[serde(default = "default_mountd_host_port")]
-    pub mountd_host_port: u16,
+    /// NFS protocol version to serve (Auto answers whatever the guest mounts).
+    #[serde(default)]
+    pub version: crate::nfsudp::NfsVersion,
 }
-
-fn default_unfsd()          -> String { "unfsd".to_string() }
-fn default_nfs_host_port()  -> u16    { 12049 }
-fn default_mountd_host_port() -> u16  { 11234 }
 
 /// Pre-parsed NAT subnet derived from a CIDR string.
 #[derive(Debug, Clone, Copy)]
@@ -524,18 +515,6 @@ pub struct Cli {
     #[arg(long = "nfs-dir", value_name = "DIR")]
     pub nfs_dir: Option<String>,
 
-    /// Path to unfsd binary [default: unfsd]
-    #[arg(long = "unfsd", value_name = "PATH")]
-    pub unfsd: Option<String>,
-
-    /// Host port for unfsd NFS listener [default: 12049]
-    #[arg(long = "nfs-port", value_name = "PORT")]
-    pub nfs_host_port: Option<u16>,
-
-    /// Host port for unfsd mountd listener [default: 11234]
-    #[arg(long = "mountd-port", value_name = "PORT")]
-    pub mountd_host_port: Option<u16>,
-
     /// NAT subnet in CIDR notation (e.g. 192.168.5.0/24).
     /// Gateway gets .1, guest (IRIX) gets .2. Default: 192.168.0.0/24.
     #[arg(long = "nat-subnet", value_name = "CIDR")]
@@ -613,20 +592,13 @@ impl Cli {
         // NB: --ci does NOT imply --headless. REX3 stays alive so screenshots
         // work; main.rs simply skips the host window when ci && !ci_display.
 
-        // NFS: --nfs-dir enables NFS; other flags refine an existing [nfs] section or the defaults.
+        // NFS: --nfs-dir enables the in-core NFS export.
         if let Some(dir) = &self.nfs_dir {
             let base = cfg.nfs.get_or_insert_with(|| NfsConfig {
-                shared_dir:       dir.clone(),
-                unfsd:            default_unfsd(),
-                nfs_host_port:    default_nfs_host_port(),
-                mountd_host_port: default_mountd_host_port(),
+                shared_dir: dir.clone(),
+                version: Default::default(),
             });
             base.shared_dir = dir.clone();
-        }
-        if let Some(ref mut nfs) = cfg.nfs {
-            if let Some(p) = &self.unfsd           { nfs.unfsd            = p.clone(); }
-            if let Some(p) = self.nfs_host_port    { nfs.nfs_host_port    = p; }
-            if let Some(p) = self.mountd_host_port { nfs.mountd_host_port = p; }
         }
 
         if let Some(p) = self.gdb_port { cfg.gdb_port = Some(p); }

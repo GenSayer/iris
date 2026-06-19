@@ -49,7 +49,6 @@ pub fn config_paths(cfg: &MachineConfig) -> Vec<String> {
     }
     if let Some(nfs) = &cfg.nfs {
         add(&nfs.shared_dir);
-        add(&nfs.unfsd);
     }
     out
 }

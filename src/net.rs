@@ -825,7 +825,7 @@ impl NatEngine {
         // Spin up the in-core NFS server if an export is configured.
         let nfs = config.nfs.as_ref().map(|c| {
             eprintln!("iris: in-core NFS server exporting {}", c.shared_dir);
-            crate::nfsudp::NfsServer::new(c.shared_dir.clone(), crate::nfsudp::NfsVersion::Auto)
+            crate::nfsudp::NfsServer::new(c.shared_dir.clone(), c.version)
         });
         Self { config, tx_cons, rx_prod, rx_wake, tx_wake, running, ctl,
                udp_nat: HashMap::new(), tcp_nat: HashMap::new(), tcp_tw: HashMap::new(),
@@ -1512,17 +1512,10 @@ impl NatEngine {
     //
     // IRIX sees the gateway at 192.168.0.1 but that's a virtual address iris
     // doesn't actually bind to, so unmodified TcpStream::connect() fails. We
-    // rewrite any gateway-destined packet to 127.0.0.1. NFS ports additionally
-    // shift to the high host ports where unfsd listens.
+    // rewrite any gateway-destined packet to 127.0.0.1. (NFS no longer goes
+    // through here — it's served in-process by the NAT before this point.)
     fn nfs_remap_dst(&self, dst_ip: Ipv4Addr, dport: u16) -> (Ipv4Addr, u16) {
         if dst_ip != self.config.gateway_ip { return (dst_ip, dport); }
-        if let Some(nfs) = &self.config.nfs {
-            match dport {
-                NFS_VM_PORT    => return (Ipv4Addr::LOCALHOST, nfs.nfs_host_port),
-                MOUNTD_VM_PORT => return (Ipv4Addr::LOCALHOST, nfs.mountd_host_port),
-                _ => {}
-            }
-        }
         // Generic outbound: guest→gateway becomes guest→host loopback on
         // the same port. Lets the guest reach any service the host is
         // running on 127.0.0.1:<dport> (pyftpdlib on 2121, python -m
@@ -1534,10 +1527,6 @@ impl NatEngine {
     // dialed, so replies look like they came from the gateway.
     fn nfs_unmap_src(&self, src_ip: Ipv4Addr, sport: u16) -> (Ipv4Addr, u16) {
         if src_ip != Ipv4Addr::LOCALHOST { return (src_ip, sport); }
-        if let Some(nfs) = &self.config.nfs {
-            if sport == nfs.nfs_host_port    { return (self.config.gateway_ip, NFS_VM_PORT);    }
-            if sport == nfs.mountd_host_port { return (self.config.gateway_ip, MOUNTD_VM_PORT); }
-        }
         // Generic outbound: reply from host-side dport becomes gateway:dport
         // to the guest.
         (self.config.gateway_ip, sport)
