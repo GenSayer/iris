@@ -80,6 +80,7 @@ cargo run --release --features jit                   # enable Cranelift MIPS JIT
 cargo run --release --features ci_clock              # synthetic deterministic CP0 Compare clock (CI/snapshot validator only; loses realtime desktop timing)
 cargo run --release --features chd                   # mount .chd disk/CD-ROM images directly (via libchdman-rs); off by default to keep builds light
 cargo run --release --features camera                # use host camera as the IndyCam video source (macOS AVFoundation via nokhwa). See [vino] in iris.toml.
+cargo run --release --features pcap                  # bridge guest networking onto a real host interface via libpcap instead of the built-in NAT gateway. See [network] in iris.toml.
 ```
 
 ### CHD image support (`--features chd`)
@@ -98,6 +99,84 @@ before.
 
 See [HELP.md](HELP.md) for the full rundown: serial ports, monitor console,
 NVRAM/MAC address setup, disk image prep, and more.
+
+
+## PCAP bridged networking (`--features pcap`)
+
+By default IRIS gives the guest networking through a built-in software NAT
+gateway (DHCP/DNS/TCP/UDP routing + port forwarding). As an alternative you can
+bridge the guest's raw Ethernet frames directly onto a real host interface. The
+guest then appears as an independent L2 host on your physical LAN and can be
+pinged from other machines, use your real DHCP/DNS, etc.
+
+### Library / licensing
+
+The `pcap` crate links the generic `wpcap` import library on Windows (NOT a
+driver-specific one), so IRIS is not tied to any single provider. You can
+build/link against **the BSD-licensed WinPcap Developer Pack** as well as Npcap.
+IRIS links dynamically and never bundles the driver, so the runtime driver's
+license (e.g. Npcap's redistribution terms) does not attach to IRIS.
+
+To point the linker at the WinPcap Developer Pack SDK on Windows:
+```
+set LIBPCAP_LIBDIR=C:\path\to\WpdPack\Lib\x64
+cargo build --release --features pcap
+```
+
+On Linux/macOS you need the libpcap headers and library (e.g. `libpcap-dev` on
+Debian/Ubuntu, or the macOS system libpcap).
+
+### Enabling PCAP mode
+
+1. **Build** with `--features pcap`:
+   ```
+   cargo build --release --features chd,pcap
+   ```
+
+2. **Configure** in `iris.toml` (or pass CLI flags):
+   ```toml
+   [network]
+   mode = "pcap"
+   pcap_interface = "1"    # 1-based index (recommended), or exact name, or omit to auto-pick
+   ```
+
+   On Windows, if you prefer the full device name (`\Device\NPF_{GUID}`), use a
+   TOML *single-quoted* literal string (backslashes are escape characters in
+   `"double-quoted"` strings):
+   ```toml
+   pcap_interface = '\Device\NPF_{8D30ACAE-AC0F-4E05-BF89-F35AD7950663}'
+   ```
+
+3. **List interfaces**:
+   ```
+   iris --list-net-interfaces
+   ```
+   Or from the monitor console:
+   ```
+   net interfaces
+   ```
+
+Alternatively specify on the command line (the index form works here too):
+```
+./target/release/iris --net-mode pcap --pcap-interface 1
+./target/release/iris --net-mode pcap --pcap-interface eth0
+```
+
+Caveats:
+- Requires elevated privileges to open a raw capture: root or `CAP_NET_RAW`
+  on Linux, root on macOS, Administrator + a WinPcap-compatible driver
+  (WinPcap or Npcap) on Windows.
+- No NAT services (DHCP/DNS/NFS/port-forward) are provided in PCAP mode — the
+  guest uses the real network's services. Configure IRIX networking for your
+  LAN accordingly.
+- Wired bridges work best. Many Wi-Fi access points reject the guest's extra
+  MAC address, so bridging onto a wireless interface may not pass traffic.
+- The guest still needs its MAC set in NVRAM (`setenv -f eaddr ...`; see
+  `rules/irix/networking.md`).
+
+Without `--features pcap`, selecting `mode = "pcap"` logs a warning and falls
+back to the NAT gateway, and `--list-net-interfaces` reports that the feature
+is missing.
 
 
 ## R5000 CPU (`--features r5k`)
