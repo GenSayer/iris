@@ -424,14 +424,27 @@ fn worker_loop(
                     *ps2_slot.lock() = None;
                     cycles = None;
                     m.stop();
-                    synced = m
-                        .sync_chd_disks(
-                            &mut |disk, total, fraction| {
-                                let _ = evt_tx.send(Evt::SyncProgress { disk, total, fraction });
-                            },
-                            &|| false,
-                        )
-                        .unwrap_or(0);
+                    synced = match m.sync_chd_disks(
+                        &mut |disk, total, fraction| {
+                            let _ = evt_tx.send(Evt::SyncProgress { disk, total, fraction });
+                        },
+                        &|| false,
+                    ) {
+                        Ok(n) => n,
+                        Err(e) => {
+                            // Don't swallow this. The fold writes a `.synctmp.chd`
+                            // beside the base and atomically renames it over the
+                            // base — both need write access to the *folder*, which
+                            // under the macOS App Sandbox a file-scoped grant (just
+                            // picking the disk image) does not convey. Surfaced so
+                            // the diff isn't silently left unmerged and the disk
+                            // never shrinks.
+                            let _ = evt_tx.send(Evt::Error(format!(
+                                "couldn't compact CHD disks on exit: {e} — grant the disk's \
+                                 folder (File » \"Grant a disk folder…\") so IRIS can write beside it")));
+                            0
+                        }
+                    };
                     // `m` dropped here → fully torn down.
                 }
                 let _ = evt_tx.send(Evt::Stopped);

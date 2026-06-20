@@ -159,6 +159,12 @@ struct App {
     fullscreen: bool,
     stop_modal: Option<StopModal>,
     missing_modal: Option<MissingDiskModal>,
+    /// Set on Start when attached CHDs sit in folders we can't write (App Store
+    /// sandbox) — prompts the user to grant the folder so on-exit fold can work.
+    chd_grant_modal: Option<ChdGrantModal>,
+    /// One-shot: the user chose "Start without compacting", so the next
+    /// `start_emulator` skips the CHD folder-grant preflight. Consumed on read.
+    skip_chd_grant_check: bool,
     /// Set when the user clicks "Use embedded PROM"; drives a confirmation modal.
     confirm_embedded_prom: bool,
     /// Host interface networks (from `if-addrs`), used by the Networking tab for
@@ -172,6 +178,9 @@ struct App {
     /// If true, central panel shows the tabbed config editor; otherwise the
     /// welcome/status summary panel (default — most config lives in menus).
     show_config_editor: bool,
+    /// In-progress name in the "Rename machine" modal (`Some` while it's open).
+    /// Kept as App state, not a per-frame local, so typed input persists.
+    rename_buffer: Option<String>,
     /// Whether the "Check networking" diagnosis window is open.
     show_net_check: bool,
     save_state_name: String,
@@ -219,6 +228,9 @@ struct App {
     /// exactly once on that transition. Reset to true on Start so the initial
     /// idle-at-PROM state doesn't count as a halt.
     prev_cpu_halted: bool,
+    /// Previous frame's `cpu_stopped`, to edge-trigger the auto-consolidation
+    /// when the guest powers itself off (a clean IRIX shutdown).
+    prev_cpu_stopped: bool,
     /// Active "Test Camera" preview (None when the window is closed). Opening it
     /// starts host-camera capture; dropping it releases the device.
     camera_test: Option<camera_test::CameraTest>,
@@ -234,6 +246,9 @@ struct App {
     show_help_info: bool,
     /// Whether the "Mount the shared folder in IRIX" Help window is open.
     show_nfs_help: bool,
+    /// Whether the License / Privacy Help windows are open.
+    show_license: bool,
+    show_privacy: bool,
     /// Active "Synchronizing disks…" job (folding CHD diffs back into bases on a
     /// clean exit); `Some` shows the modal. `None` when no sync is in flight.
     syncing: Option<SyncJob>,
@@ -311,11 +326,61 @@ fn disk_readable(path: &str) -> bool {
     matches!(f.read(&mut probe), Ok(n) if n >= 1)
 }
 
+/// True if we can create (and remove) a file *in* `dir` — i.e. we hold write
+/// access to the directory itself, not merely to the files already inside it.
+///
+/// This matters for the exit-time CHD fold ("Synchronizing disks…"): it writes
+/// a `.synctmp.chd` beside the base and atomically renames it over the base,
+/// both of which need directory write access. Under the macOS App Sandbox a
+/// *file*-scoped grant (the user picking a disk image) does NOT convey that —
+/// only a folder grant (a directory security-scoped bookmark) does. We probe a
+/// real create because, as with [`disk_readable`], the sandbox can let a path
+/// `stat()` yet deny the write. The probe file is uniquely named and removed
+/// immediately.
+fn dir_writable(dir: &std::path::Path) -> bool {
+    let probe = dir.join(format!(".iris-write-probe-{}", std::process::id()));
+    match std::fs::File::create(&probe) {
+        Ok(_) => {
+            let _ = std::fs::remove_file(&probe);
+            true
+        }
+        Err(_) => false,
+    }
+}
+
+/// True if a granted folder is currently *reachable* — we can list it. Under the
+/// sandbox this is gated by an active security-scoped grant, so it's a cheap,
+/// non-writing liveness check (unlike [`dir_writable`], safe to call every frame
+/// while a menu is open). Since we only ever mint recursive read-write directory
+/// grants, "reachable" implies "writable", so this tells the user whether a
+/// recorded folder grant is actually in effect right now.
+fn folder_accessible(path: &str) -> bool {
+    std::fs::read_dir(path).is_ok()
+}
+
 /// Modal shown when one or more SCSI image files are missing on Start.
 /// `Machine::new` would otherwise call `std::process::exit(1)` and take
 /// the whole GUI down with it.
 struct MissingDiskModal {
     missing: Vec<MissingDisk>,
+}
+
+/// One attached CHD whose containing folder the app can't write to, so its
+/// exit-time fold would be denied (see [`dir_writable`]).
+struct ChdNeedsGrant {
+    id: u8,
+    path: String,
+    /// Absolute parent directory that needs a folder grant.
+    dir: String,
+}
+
+/// Modal shown on Start (App Store build) when attached CHD disks live in
+/// folders the sandbox hasn't granted directory write access to. Without that
+/// grant the copy-on-write `.diff.chd` can never be folded back into the base on
+/// exit, so the disk's footprint only ever grows. Lets the user grant the
+/// folder(s) up front, or start anyway and forgo on-exit compaction.
+struct ChdGrantModal {
+    disks: Vec<ChdNeedsGrant>,
 }
 
 impl App {
@@ -381,12 +446,15 @@ impl App {
             toast: None,
             stop_modal: None,
             missing_modal: None,
+            chd_grant_modal: None,
+            skip_chd_grant_check: false,
             confirm_embedded_prom: false,
             net_ifaces: netplan::gather_host_ifaces(),
             net_sanity_modal: None,
             new_machine,
             create_disk: CreateDiskDialog::default(),
             show_config_editor: false,
+            rename_buffer: None,
             show_net_check: false,
             save_state_name: "snap1".into(),
             restore_state_name: "snap1".into(),
@@ -397,6 +465,7 @@ impl App {
             pending_fb_snap: false,
             input_state: input::InputState::default(),
             prev_cpu_halted: true,
+            prev_cpu_stopped: false,
             camera_test: None,
             camera_test_tex: None,
             camera_test_seq: 0,
@@ -404,6 +473,8 @@ impl App {
             serial_input: String::new(),
             show_help_info: false,
             show_nfs_help: false,
+            show_license: false,
+            show_privacy: false,
             syncing: None,
             sync_then_close: false,
             cow_discard_confirm: None,
@@ -506,6 +577,19 @@ impl App {
             self.missing_modal = Some(MissingDiskModal { missing });
             return;
         }
+        // Preflight: under the App Sandbox, folding a compressed CHD's `.diff.chd`
+        // back into its base on exit needs write access to the disk's *folder*,
+        // which picking the disk file alone doesn't grant. If any attached CHD is
+        // in a folder we can't write, prompt the user to grant it now — otherwise
+        // the disk silently never shrinks. "Start without compacting" sets the
+        // one-shot bypass so the user can proceed regardless.
+        if !std::mem::take(&mut self.skip_chd_grant_check) {
+            let needs_grant = self.chd_dirs_needing_grant();
+            if !needs_grant.is_empty() {
+                self.chd_grant_modal = Some(ChdGrantModal { disks: needs_grant });
+                return;
+            }
+        }
         // Surface the embedded-PROM fallback so it's clear the start did
         // happen (iris::prom::Prom::from_file_or_embedded handles this
         // transparently — we just echo it to the toast).
@@ -536,6 +620,9 @@ impl App {
         // Assume halted at boot (idle at the PROM) so the auto-release only
         // fires on a later running→halted transition, not at startup.
         self.prev_cpu_halted = true;
+        // Fresh run isn't powered off; a later running→stopped edge means the
+        // guest shut itself down (drives the auto-consolidation below).
+        self.prev_cpu_stopped = false;
         // If the NVRAM has no Ethernet MAC, IRIX won't attach ec0 — networking,
         // System Manager, and Disk Manager all fail. Offer to set one up, and
         // hold the machine at the PROM by interrupting autoboot (see the Esc
@@ -598,7 +685,18 @@ impl App {
     /// shared subfolder under it are all accessible from one grant. Persists a
     /// directory security-scoped bookmark and asserts access immediately.
     fn grant_disk_folder(&mut self) {
-        if let Some(dir) = rfd::FileDialog::new().pick_folder() {
+        self.grant_disk_folder_at(None);
+    }
+
+    /// As [`grant_disk_folder`](Self::grant_disk_folder), but opens the picker
+    /// already pointed at `start_dir` (e.g. the folder of a CHD that needs a
+    /// grant), so the user just confirms it.
+    fn grant_disk_folder_at(&mut self, start_dir: Option<&str>) {
+        let mut dialog = rfd::FileDialog::new();
+        if let Some(d) = start_dir {
+            if !d.is_empty() { dialog = dialog.set_directory(d); }
+        }
+        if let Some(dir) = dialog.pick_folder() {
             let path = dir.to_string_lossy().into_owned();
             if !self.prefs.disk_folders.contains(&path) {
                 self.prefs.disk_folders.push(path.clone());
@@ -606,6 +704,43 @@ impl App {
             let _ = self.prefs.save(); // mints the directory bookmark
             macos_sandbox::restore(&self.prefs.bookmarks); // start accessing now
             self.toast(format!("granted disk folder: {path}"));
+        }
+    }
+
+    /// App Store preflight: attached CHD disks (non-scratch HDDs) whose folder
+    /// we can't write, so their on-exit `.diff.chd` fold would be denied. Empty
+    /// off the sandbox build, where folders are reachable directly.
+    fn chd_dirs_needing_grant(&self) -> Vec<ChdNeedsGrant> {
+        if !cfg!(feature = "appstore") {
+            return Vec::new();
+        }
+        let mut out = Vec::new();
+        for (&id, dev) in &self.cfg.scsi {
+            // CD-ROM CHDs are read-only (no diff); scratch disks live in the
+            // writable container. Only writable HDD CHDs ever get folded.
+            if dev.scratch || dev.cdrom { continue; }
+            if !dev.path.ends_with(".chd") { continue; }
+            let Some(parent) = std::path::Path::new(&dev.path).parent() else { continue };
+            if !dir_writable(parent) {
+                out.push(ChdNeedsGrant {
+                    id,
+                    path: dev.path.clone(),
+                    dir: parent.to_string_lossy().into_owned(),
+                });
+            }
+        }
+        out.sort_by_key(|c| c.id);
+        out
+    }
+
+    /// Pop the folder-grant modal if any attached CHD is in a folder we can't
+    /// write. Called right after a disk is assigned (Browse pick), so the user
+    /// resolves permissions up front. No-op if already prompting or all good.
+    fn check_chd_folder_grants(&mut self) {
+        if self.chd_grant_modal.is_some() { return; }
+        let needs = self.chd_dirs_needing_grant();
+        if !needs.is_empty() {
+            self.chd_grant_modal = Some(ChdGrantModal { disks: needs });
         }
     }
 
@@ -740,34 +875,27 @@ impl App {
                     }
                     let mut want_switch: Option<String> = None;
                     for name in names {
-                        let marker = if active.as_deref() == Some(&name) { "● " } else { "  " };
-                        if ui.button(format!("{marker}{name}")).clicked() {
+                        // selectable_label highlights the active machine — no
+                        // marker glyph (a leading ● rendered as tofu).
+                        let is_active = active.as_deref() == Some(name.as_str());
+                        if ui.selectable_label(is_active, name.as_str()).clicked() {
                             want_switch = Some(name);
                             ui.close_menu();
                         }
                     }
                     if let Some(n) = want_switch { self.switch_to(&n); }
                 });
-                ui.menu_button("Rename current…", |ui| {
-                    let cur = self.prefs.active_machine.clone();
-                    if let Some(name) = cur {
-                        ui.label(format!("Current: {name}"));
-                        let mut new_name = name.clone();
-                        ui.text_edit_singleline(&mut new_name);
-                        if ui.button("Rename").clicked() && !new_name.trim().is_empty() && new_name != name {
-                            let n = self.prefs.unique_name(new_name.trim());
-                            if let Some(cfg) = self.prefs.machines.remove(&name) {
-                                self.prefs.machines.insert(n.clone(), cfg);
-                                self.prefs.active_machine = Some(n.clone());
-                                let _ = self.prefs.save();
-                                self.toast(format!("renamed -> '{n}'"));
-                            }
-                            ui.close_menu();
-                        }
-                    } else {
-                        ui.label(RichText::new("(no active machine)").weak());
-                    }
-                });
+                if ui.add_enabled(self.prefs.active_machine.is_some(),
+                        egui::Button::new("Rename current…"))
+                    .on_disabled_hover_text("No active machine")
+                    .clicked()
+                {
+                    // Open the rename modal seeded with the current name. (A
+                    // text box inside the menu can't work — the menu closure
+                    // re-runs each frame and would reset the buffer.)
+                    self.rename_buffer = self.prefs.active_machine.clone();
+                    ui.close_menu();
+                }
                 let active = self.prefs.active_machine.clone();
                 if ui.add_enabled(active.is_some(), egui::Button::new("Delete current machine")).clicked() {
                     if let Some(name) = active {
@@ -828,13 +956,27 @@ impl App {
                         ui.close_menu();
                     }
                     let folders = self.prefs.disk_folders.clone();
+                    if folders.is_empty() {
+                        ui.label(RichText::new("(no folders granted yet)").weak().small());
+                    }
                     for f in &folders {
                         ui.horizontal(|ui| {
+                            // Live access state: green bullet if the grant is in
+                            // effect this session, red if it lapsed (re-grant to
+                            // fix). U+2022 (bullet) renders; U+25CF (●) and the
+                            // check/cross dingbats are tofu in egui's label font.
+                            let live = folder_accessible(f);
+                            let (color, tip) = if live {
+                                (Color32::from_rgb(120, 200, 120), "Access is active — IRIS can read/write here")
+                            } else {
+                                (Color32::from_rgb(220, 140, 90), "No access right now — re-grant this folder")
+                            };
+                            ui.label(RichText::new("\u{2022}").size(15.0).color(color)).on_hover_text(tip);
                             ui.label(RichText::new(f).weak());
                             if ui.small_button("📂").on_hover_text("Reveal in Finder").clicked() {
                                 config_ui::reveal_in_file_manager(f);
                             }
-                            if ui.small_button("✕").on_hover_text("Revoke").clicked() {
+                            if ui.small_button("\u{00D7}").on_hover_text("Revoke").clicked() {
                                 self.prefs.disk_folders.retain(|x| x != f);
                                 self.prefs.bookmarks.remove(f);
                                 let _ = self.prefs.save();
@@ -1004,7 +1146,7 @@ impl App {
                     self.open_camera_test();
                     ui.close_menu();
                 }
-                if ui.add_enabled(running, egui::Button::new("🌐 Network test (serial console)…"))
+                if ui.add_enabled(running, egui::Button::new("Serial console…"))
                     .on_hover_text("Connect to the emulator's loopback serial server (127.0.0.1:8881)")
                     .on_disabled_hover_text("Start a machine first")
                     .clicked()
@@ -1016,11 +1158,24 @@ impl App {
                     self.show_help_info = true;
                     ui.close_menu();
                 }
-                if ui.button("🗂 Mount the shared folder in IRIX…")
+                if ui.button("📂 Mount the shared folder in IRIX…")
                     .on_hover_text("The exact mount command for the NFS share")
                     .clicked()
                 {
                     self.show_nfs_help = true;
+                    ui.close_menu();
+                }
+                ui.separator();
+                ui.label(RichText::new("Legal").strong());
+                if ui.button("Licenses…")
+                    .on_hover_text("BSD 3-Clause (IRIS) — plus GPL-3.0 for the CHD backend when built in")
+                    .clicked()
+                {
+                    self.show_license = true;
+                    ui.close_menu();
+                }
+                if ui.button("Privacy policy…").clicked() {
+                    self.show_privacy = true;
                     ui.close_menu();
                 }
                 ui.separator();
@@ -1041,8 +1196,15 @@ impl App {
                 use iris::build_features as bf;
                 ui.label(format!("  chd:       {}", if bf::CHD { "on" } else { "off" }));
                 ui.label(format!("  camera:    {}", if bf::CAMERA { "on" } else { "off" }));
-                ui.label(format!("  jit:       {}", if bf::JIT { "on" } else { "off" }));
-                ui.label(format!("  rex-jit:   {}", if bf::REX_JIT { "on" } else { "off" }));
+                // jit/rex-jit are compile-time features, but the sandbox (App
+                // Store) build forces interpreter-only at runtime via IRIS_NO_JIT
+                // (Cranelift's non-MAP_JIT pages get killed under the sandbox).
+                // Report the runtime reality so a compiled-in "jit: on" doesn't
+                // read as "the JIT is running" when it can't be.
+                let jit_off = std::env::var_os("IRIS_NO_JIT").is_some();
+                let jit_state = |feat: bool| if jit_off { "off (sandbox)" } else if feat { "on" } else { "off" };
+                ui.label(format!("  jit:       {}", jit_state(bf::JIT)));
+                ui.label(format!("  rex-jit:   {}", jit_state(bf::REX_JIT)));
                 ui.label(format!("  lightning: {}", if bf::LIGHTNING { "on (no debug)" } else { "off" }));
             });
         });
@@ -1108,6 +1270,7 @@ impl App {
         if self.input_state.captured {
             ui.label(RichText::new("Mouse/Keyboard Captured").color(Color32::LIGHT_GREEN));
             ui.label(RichText::new("To disable: Ctrl+Alt+Esc").weak());
+            ui.label(RichText::new("Send F11 to IRIX: Ctrl+Alt+F11").weak());
         } else {
             ui.label(RichText::new("Mouse/Keyboard Capture Disabled").weak());
             if ui
@@ -1310,7 +1473,11 @@ impl App {
         };
         let mut want_check = false;
         ui.horizontal(|ui| {
-            ui.label(RichText::new("\u{25CF}").color(net_color)).on_hover_text(net_tip);
+            // U+2022 (bullet), sized up as a status light. NOT U+25CF (●),
+            // which renders as tofu — egui's label font chain (Ubuntu-Light →
+            // NotoEmoji → emoji-icon-font) has no filled circle; U+25CF is only
+            // in Hack, which is monospace-only. See rules/gui/egui-…-tofu.md.
+            ui.label(RichText::new("\u{2022}").size(18.0).color(net_color)).on_hover_text(net_tip);
             ui.label("NET").on_hover_text(net_tip);
             if running && ui.small_button("check").on_hover_text("Diagnose guest networking").clicked() {
                 want_check = true;
@@ -1490,6 +1657,7 @@ impl App {
                 new_fb_scale = size.y * zoom / tex_size.y;
             }
             let mut fb_rect = None;
+            let captured = self.input_state.captured;
             ui.centered_and_justified(|ui| {
                 let response = ui.add(
                     egui::Image::new((tex.id(), size)).fit_to_exact_size(size).sense(egui::Sense::click())
@@ -1498,6 +1666,27 @@ impl App {
                 // to us instead of routing them to other widgets when
                 // the user clicks into the FB.
                 if response.clicked() { response.request_focus(); fb_clicked = true; }
+                // While captured, keep focus pinned to the framebuffer and claim
+                // the focus-navigation keys. By default egui's focus engine
+                // treats Tab / arrow keys / Esc as widget navigation: it moves
+                // focus off the framebuffer (and the widget it lands on can then
+                // swallow later keystrokes), so those keys never reach the guest.
+                // Locking the filter tells egui they belong to us — they stay in
+                // the event stream and pump() forwards them. Plain Esc still
+                // reaches the guest; the Ctrl+Alt+Esc release chord is detected
+                // globally in pump(), before any key is forwarded.
+                if captured {
+                    if !response.has_focus() { response.request_focus(); }
+                    ui.memory_mut(|m| m.set_focus_lock_filter(
+                        response.id,
+                        egui::EventFilter {
+                            tab: true,
+                            horizontal_arrows: true,
+                            vertical_arrows: true,
+                            escape: true,
+                        },
+                    ));
+                }
                 fb_rect = Some(response.rect);
             });
 
@@ -1514,7 +1703,7 @@ impl App {
                     p.text(
                         rect.center(),
                         egui::Align2::CENTER_CENTER,
-                        "⏻ Powered off",
+                        "Powered off",
                         egui::FontId::proportional(26.0),
                         Color32::from_rgba_unmultiplied(235, 235, 235, 235),
                     );
@@ -1536,6 +1725,26 @@ impl App {
         }
         self.prev_cpu_halted = halted;
 
+        // Auto-consolidate on a clean guest power-off. A guest `poweroff` stops
+        // the CPU thread (`cpu_stopped`) while the GUI still considers the
+        // machine running — the worker isn't told, and only a user STOP sets
+        // `running=false`, so `running && cpu_stopped` uniquely identifies "the
+        // guest shut itself down". Fold any pending CHD overlay back into its
+        // base NOW so consolidation happens even when the user later quits via
+        // Cmd+Q (which bypasses the close-time fold — winit 0.29 doesn't hook
+        // applicationShouldTerminate). Edge-triggered → fires once per power-off.
+        // (`Evt::PowerOff` is never emitted — it awaits a core subscribe API — so
+        // we key off the status-derived `cpu_stopped`, same as the overlay.)
+        let stopped = self.emu.status.cpu_stopped;
+        if stopped && !self.prev_cpu_stopped && self.emu.is_running()
+            && self.emu.has_pending_chd_sync() && self.syncing.is_none()
+        {
+            self.toast("guest powered off — synchronizing disks…");
+            self.syncing = Some(SyncJob { disk: 0, total: 0, fraction: 0.0 });
+            self.emu.send(Cmd::SyncDisks);
+        }
+        self.prev_cpu_stopped = stopped;
+
         // Pump egui input → PS/2 controller. Mouse/keyboard only reach the
         // guest while captured (click the framebuffer to capture, Ctrl+Alt+Esc
         // to release), so menu clicks and config typing don't leak in.
@@ -1544,6 +1753,38 @@ impl App {
             input::pump(ui.ctx(), fb_clicked, &ps2, &mut self.input_state, self.cfg.mouse_scroll_pixels_per_line);
         }
 
+    }
+
+    /// Apply a rename of the active machine to `new_name` (from the modal).
+    /// No-op for an empty/unchanged name or when there's no active machine.
+    fn apply_rename(&mut self, new_name: &str) {
+        let new = new_name.trim();
+        let Some(old) = self.prefs.active_machine.clone() else { return; };
+        if new.is_empty() || new == old { return; }
+        let n = self.prefs.unique_name(new);
+        if let Some(cfg) = self.prefs.machines.remove(&old) {
+            self.prefs.machines.insert(n.clone(), cfg);
+            self.prefs.active_machine = Some(n.clone());
+            let _ = self.prefs.save();
+            self.toast(format!("renamed to '{n}'"));
+        }
+    }
+
+    /// Heading + tabbed config editor body, used both as the right side panel
+    /// (while a machine runs) and full-width in the central panel (while idle).
+    /// The header names the active machine ("default" if unset).
+    fn config_editor_panel(&mut self, ui: &mut egui::Ui) {
+        let machine = self.prefs.active_machine.as_deref().unwrap_or("default").to_string();
+        ui.horizontal(|ui| {
+            ui.heading(format!("Configuration — {machine}"));
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if ui.button("×").on_hover_text("Hide config editor").clicked() {
+                    self.show_config_editor = false;
+                }
+            });
+        });
+        ui.separator();
+        egui::ScrollArea::vertical().show(ui, |ui| self.central_tabs(ui));
     }
 
     fn central_tabs(&mut self, ui: &mut egui::Ui) {
@@ -1572,6 +1813,11 @@ impl App {
             ConfigAction::RefreshPcapIfaces => self.refresh_pcap_ifaces(),
             ConfigAction::None => {}
         }
+        if out.disks_changed { self.mark_dirty(); }
+        // A disk image was just picked: check up front whether its folder is
+        // grantable, so the user handles permissions at assignment time rather
+        // than discovering at exit that the disk can't be compacted.
+        if out.disk_picked { self.check_chd_folder_grants(); }
         if out.net.changed { self.mark_dirty(); }
         if out.net.forwards_changed && self.emu.is_running() {
             // Rebind the running NAT's listeners so a forward added/removed now
@@ -1696,7 +1942,7 @@ impl App {
                         ui.colored_label(Color32::from_rgb(200, 80, 80), e);
                     } else if connected {
                         ui.colored_label(Color32::from_rgb(90, 170, 90),
-                            format!("● connected to {}", serial_console::SERIAL_ADDR));
+                            format!("\u{2022} connected to {}", serial_console::SERIAL_ADDR));
                     } else {
                         ui.label("disconnected");
                     }
@@ -1753,9 +1999,84 @@ impl App {
         }
     }
 
+    /// License + privacy texts, embedded at compile time so they're viewable in
+    /// the sandboxed App Store build (which can't read repo files at runtime).
+    /// Paths are relative to this source file (`iris-gui/src/main.rs`).
+    fn license_window(&mut self, ctx: &egui::Context) {
+        const LICENSE_BSD: &str = include_str!("../../LICENSE");
+        // The CHD backend (libchdman-rs) is GPL-3.0, so any CHD build is conveyed
+        // under GPL-3.0 — mirrors the release pipeline shipping LICENSE-GPL3.txt
+        // alongside LICENSE. Shown only when CHD support is actually built in.
+        const LICENSE_GPL3: &str = include_str!("../../LICENSE-GPL3.txt");
+        if !self.show_license { return; }
+        let chd = iris::build_features::CHD;
+        let mut open = true;
+        egui::Window::new("License")
+            .open(&mut open)
+            .default_width(640.0)
+            .default_height(520.0)
+            .collapsible(false)
+            .resizable(true)
+            .show(ctx, |ui| {
+                ui.label("IRIS itself is licensed under the BSD 3-Clause License.");
+                if chd {
+                    ui.label(
+                        "This build includes CHD disk support via libchdman-rs, which is licensed \
+                         under the GNU GPL-3.0 — so the combined binary is conveyed under GPL-3.0. \
+                         Both licenses apply and are shown below.");
+                }
+                ui.add_space(4.0);
+                ui.horizontal(|ui| {
+                    ui.label("Source:");
+                    ui.hyperlink_to("danifunker/iris", "https://github.com/danifunker/iris");
+                    if chd {
+                        ui.label("·");
+                        ui.hyperlink_to("libchdman-rs", "https://crates.io/crates/libchdman-rs");
+                    }
+                });
+                ui.separator();
+                egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
+                    ui.label(RichText::new("IRIS — BSD 3-Clause License").strong());
+                    ui.add_space(2.0);
+                    ui.label(RichText::new(LICENSE_BSD).monospace());
+                    if chd {
+                        ui.add_space(12.0);
+                        ui.separator();
+                        ui.label(RichText::new("CHD backend (libchdman-rs) — GNU GPL-3.0").strong());
+                        ui.horizontal(|ui| {
+                            ui.label("Full text also at");
+                            ui.hyperlink_to("gnu.org/licenses/gpl-3.0",
+                                "https://www.gnu.org/licenses/gpl-3.0.html");
+                        });
+                        ui.add_space(2.0);
+                        ui.label(RichText::new(LICENSE_GPL3).monospace());
+                    }
+                });
+            });
+        if !open { self.show_license = false; }
+    }
+
+    fn privacy_window(&mut self, ctx: &egui::Context) {
+        const PRIVACY_TEXT: &str = include_str!("../../PRIVACY.md");
+        if !self.show_privacy { return; }
+        let mut open = true;
+        egui::Window::new("Privacy policy")
+            .open(&mut open)
+            .default_width(560.0)
+            .default_height(440.0)
+            .collapsible(false)
+            .resizable(true)
+            .show(ctx, |ui| {
+                egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
+                    ui.label(PRIVACY_TEXT);
+                });
+            });
+        if !open { self.show_privacy = false; }
+    }
+
     /// Explains the camera (IndyCam) and networking features — what they do and
-    /// how to use them (for end users), and what host capabilities they use and
-    /// why (for App Review). Opened from Help → "How camera & networking work".
+    /// how to use them, and what host capabilities they use and why. Opened from
+    /// Help → "How camera & networking work".
     fn help_info_window(&mut self, ctx: &egui::Context) {
         if !self.show_help_info {
             return;
@@ -1782,7 +2103,7 @@ impl App {
                     ui.label("• Or set Video-In > Source = camera, boot IRIX, and run an IndyCam app like vino/cam.");
                     ui.label("• On first use macOS asks for camera permission. Closing the preview releases the camera.");
                     ui.add_space(6.0);
-                    ui.label(RichText::new("Privacy / for App Review").strong());
+                    ui.label(RichText::new("Privacy").strong());
                     ui.label(
                         "Camera frames are used only as the emulated video input — IRIS never records, \
                          stores, or transmits them. It uses the public AVFoundation API with the \
@@ -1799,10 +2120,14 @@ impl App {
                     );
                     ui.add_space(6.0);
                     ui.label(RichText::new("How to use it").strong());
-                    ui.label("• The guest serial console (ttyd1) and PROM monitor are exposed on loopback");
-                    ui.label("   TCP (127.0.0.1:8881 / 8888) so you can attach a terminal.");
-                    ui.label("• Help > Diagnostics > Network test opens an in-app viewer of that console.");
-                    ui.label("• Optional inbound port-forwards (Networking tab) let you reach guest services.");
+                    ui.label("• Inbound port-forwards (Networking tab) let you reach guest network services.");
+                    ui.add_space(6.0);
+                    ui.label(RichText::new("The serial console is NOT the network").strong());
+                    ui.label("• Help > Diagnostics > Serial console is the guest's serial terminal — for login");
+                    ui.label("   and the PROM monitor — and works the same with or without guest networking.");
+                    ui.label("• It's carried over host loopback TCP (127.0.0.1:8881 = console, 8888 = PROM");
+                    ui.label("   monitor) only as the in-app viewer's transport; that loopback is not the");
+                    ui.label("   guest's network connection.");
                     ui.add_space(6.0);
                     ui.label(RichText::new("Guest IP & subnets").strong());
                     ui.label("• IRIS's NAT is a router on one subnet; the gateway is the .1 of that subnet");
@@ -1813,7 +2138,7 @@ impl App {
                     ui.label("• No port-forwards exist by default; '+ Add forward' maps a host port to a guest");
                     ui.label("   port (inbound, host to guest) — e.g. to telnet into the guest.");
                     ui.add_space(6.0);
-                    ui.label(RichText::new("Privacy / for App Review").strong());
+                    ui.label(RichText::new("Privacy").strong());
                     ui.label(
                         "Outbound guest traffic uses com.apple.security.network.client. The loopback \
                          serial/monitor servers and any inbound port-forwards use \
@@ -1870,7 +2195,7 @@ impl App {
                         ui.label(RichText::new("NFS file sharing isn't enabled yet.").strong());
                         ui.add_space(4.0);
                         ui.label(
-                            "Turn it on under Configuration → Networking → NFS share, pick a folder \
+                            "Turn it on under Configuration » Networking » NFS share, pick a folder \
                              to share, then reopen this window for the exact mount command.");
                         return;
                     };
@@ -1883,7 +2208,7 @@ impl App {
 
                     if nfs.shared_dir.trim().is_empty() {
                         ui.label(RichText::new(
-                            "No folder is selected yet — pick one under Configuration → Networking → \
+                            "No folder is selected yet — pick one under Configuration » Networking » \
                              NFS share first.").color(Color32::from_rgb(0xd9, 0x4a, 0x3d)));
                     } else {
                         ui.label(RichText::new(format!("Sharing: {}", nfs.shared_dir)).weak());
@@ -1932,7 +2257,7 @@ impl App {
                     ui.code(format!("mount -o {pin} {gw}:/ /shared"));
                     ui.add_space(4.0);
                     ui.label(RichText::new(
-                        "Still stuck? Use Help → \"How camera & networking work\" and the NET light's \
+                        "Still stuck? Use Help » \"How camera & networking work\" and the NET light's \
                          Check button to confirm the guest is on IRIS's subnet first — NFS can't mount \
                          until networking is up.").weak());
 
@@ -2194,8 +2519,11 @@ impl eframe::App for App {
             }
         }
 
-        // F11 toggles fullscreen.
-        if ctx.input(|i| i.key_pressed(egui::Key::F11)) {
+        // F11 toggles fullscreen — except Ctrl+Alt+F11, which is reserved as the
+        // way to send a real F11 keystroke through to the guest (plain F11 never
+        // reaches IRIX because this toggle eats it). input::pump forwards that
+        // chord to the guest while captured.
+        if ctx.input(|i| i.key_pressed(egui::Key::F11) && !(i.modifiers.ctrl && i.modifiers.alt)) {
             self.fullscreen = !self.fullscreen;
             ctx.send_viewport_cmd(ViewportCommand::Fullscreen(self.fullscreen));
         }
@@ -2222,25 +2550,17 @@ impl eframe::App for App {
             .show(ctx, |ui| self.control_panel(ui, ctx));
         self.network_check_window(ctx);
 
-        // Config editor lives in a collapsible side panel so the emulator
-        // screen (central panel) is never hidden by it. The toolbar's
-        // "Edit config… / Hide config editor" toggle drives the collapse;
-        // `show_animated` slides it in/out.
+        // Config editor placement depends on whether a machine is running:
+        //  - RUNNING: a resizable right side panel, so you can edit alongside
+        //    the live emulator screen (which stays visible in the centre).
+        //  - IDLE: it takes the WHOLE central area instead (below), hiding the
+        //    welcome/info screen — no cramped split when there's nothing to
+        //    watch. The toolbar's "Edit config…" toggle drives both.
+        let config_in_side_panel = self.show_config_editor && self.emu.is_running();
         egui::SidePanel::right("config_editor")
             .resizable(true)
             .default_width(420.0)
-            .show_animated(ctx, self.show_config_editor, |ui| {
-                ui.horizontal(|ui| {
-                    ui.heading("Configuration");
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        if ui.button("×").on_hover_text("Hide config editor").clicked() {
-                            self.show_config_editor = false;
-                        }
-                    });
-                });
-                ui.separator();
-                egui::ScrollArea::vertical().show(ui, |ui| self.central_tabs(ui));
-            });
+            .show_animated(ctx, config_in_side_panel, |ui| self.config_editor_panel(ui));
 
         // Zero the central panel's inner margin so the emulated display reaches
         // the window edges — every reclaimed pixel makes the (tall, 5:4) picture
@@ -2249,11 +2569,15 @@ impl eframe::App for App {
         let central_frame = egui::Frame::central_panel(&ctx.style())
             .inner_margin(egui::Margin::ZERO);
         egui::CentralPanel::default().frame(central_frame).show(ctx, |ui| {
-            // The central panel always shows the emulator screen when the
-            // machine is running (the REX3 framebuffer), falling back to the
-            // welcome / status summary when idle. The config editor no longer
-            // takes this space — it's the side panel above.
-            if self.emu.is_running() {
+            if self.show_config_editor && !self.emu.is_running() {
+                // Idle + editing: config fills the whole pane (welcome hidden).
+                // A small margin gives it breathing room (the central frame is
+                // edge-to-edge for the framebuffer).
+                input::force_release(ui.ctx(), &mut self.input_state);
+                egui::Frame::none()
+                    .inner_margin(egui::Margin::symmetric(10.0, 8.0))
+                    .show(ui, |ui| self.config_editor_panel(ui));
+            } else if self.emu.is_running() {
                 self.framebuffer_panel(ui);
             } else {
                 // Size the window for the standard 1280×1024 display at the
@@ -2273,6 +2597,36 @@ impl eframe::App for App {
                 self.welcome_panel(ui);
             }
         });
+
+        // Rename-machine modal: a text box + OK/Cancel. The buffer is App state
+        // (`rename_buffer`), so typed input persists across frames — a text box
+        // inside the menu can't, because the menu closure resets it each frame.
+        let mut rename_result: Option<Option<String>> = None; // outer Some=action; inner Some=new name, None=cancel
+        if let Some(buf) = &mut self.rename_buffer {
+            egui::Window::new("Rename machine")
+                .collapsible(false)
+                .resizable(false)
+                .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+                .show(ctx, |ui| {
+                    ui.label("New machine name:");
+                    let resp = ui.add(egui::TextEdit::singleline(buf).desired_width(260.0));
+                    resp.request_focus();
+                    let entered = resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+                    ui.add_space(6.0);
+                    ui.horizontal(|ui| {
+                        let ok = ui.add(egui::Button::new("OK").fill(Color32::from_rgb(60, 90, 140))).clicked();
+                        if (ok || entered) && !buf.trim().is_empty() {
+                            rename_result = Some(Some(buf.clone()));
+                        }
+                        if ui.button("Cancel").clicked() { rename_result = Some(None); }
+                    });
+                });
+        }
+        match rename_result {
+            Some(Some(name)) => { self.apply_rename(&name); self.rename_buffer = None; }
+            Some(None)       => { self.rename_buffer = None; }
+            None             => {}
+        }
 
         // New machine dialog.
         self.new_machine.show(ctx);
@@ -2306,6 +2660,8 @@ impl eframe::App for App {
 
         // Help → "How camera & networking work" explainer.
         self.help_info_window(ctx);
+        self.license_window(ctx);
+        self.privacy_window(ctx);
 
         // Help → "Mount the shared folder in IRIX" — the NFS mount command.
         self.nfs_help_window(ctx);
@@ -2479,6 +2835,78 @@ impl eframe::App for App {
                     .unwrap_or_default();
                 self.missing_modal = None;
                 self.detach_and_start(&ids);
+            }
+        }
+
+        // CHD folder-grant modal (App Store): attached CHDs sit in folders we
+        // can't write, so their on-exit fold would be denied. Offer to grant
+        // each folder, or start anyway and forgo compaction.
+        enum ChdGrantChoice { None, Cancel, StartAnyway, Grant(String) }
+        let mut chd_choice = ChdGrantChoice::None;
+        if let Some(modal) = &self.chd_grant_modal {
+            egui::Window::new("Grant folder access to compact disks")
+                .collapsible(false)
+                .resizable(false)
+                .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+                .show(ctx, |ui| {
+                    ui.label(RichText::new("These CHD disks are in folders IRIS can't write to:").strong());
+                    for d in &modal.disks {
+                        ui.label(format!("• scsi{}: {}", d.id, d.path));
+                    }
+                    ui.add_space(8.0);
+                    ui.label(RichText::new(
+                        "A compressed CHD records changes in a sidecar while running, then folds \
+                         them back into the disk when you quit (\"Synchronizing disks…\"). That \
+                         fold needs write access to the disk's folder — not just the file — so \
+                         without it the sidecar only grows and the disk never shrinks.").weak());
+                    ui.add_space(6.0);
+                    ui.label(RichText::new(
+                        "Tip: a folder grant is recursive — IRIS gains access to everything in \
+                         that folder for as long as it's granted. To keep that exposure minimal, \
+                         put each disk image in its own dedicated folder and grant only that.")
+                        .italics().weak());
+                    ui.add_space(6.0);
+                    ui.label(RichText::new("Grant the containing folder so IRIS can compact it on exit:").weak());
+                    // One button per distinct folder — a recursive grant covers
+                    // every disk under it.
+                    let mut dirs: Vec<&str> = modal.disks.iter().map(|d| d.dir.as_str()).collect();
+                    dirs.sort_unstable();
+                    dirs.dedup();
+                    for dir in dirs {
+                        if ui.button(format!("Grant \"{dir}\"…")).clicked() {
+                            chd_choice = ChdGrantChoice::Grant(dir.to_string());
+                        }
+                    }
+                    ui.add_space(4.0);
+                    ui.horizontal(|ui| {
+                        if ui.button("Cancel").clicked() { chd_choice = ChdGrantChoice::Cancel; }
+                        if ui.add(egui::Button::new("Start without compacting")
+                            .fill(Color32::from_rgb(60, 90, 140))).clicked()
+                        {
+                            chd_choice = ChdGrantChoice::StartAnyway;
+                        }
+                    });
+                });
+        }
+        match chd_choice {
+            ChdGrantChoice::None => {}
+            ChdGrantChoice::Cancel => { self.chd_grant_modal = None; }
+            ChdGrantChoice::StartAnyway => {
+                self.chd_grant_modal = None;
+                self.skip_chd_grant_check = true; // one-shot bypass
+                self.start_emulator();
+            }
+            ChdGrantChoice::Grant(dir) => {
+                self.grant_disk_folder_at(Some(&dir));
+                // Re-probe: drop disks whose folder is now writable. When all are
+                // satisfied, dismiss and start; otherwise leave the rest listed.
+                if let Some(modal) = &mut self.chd_grant_modal {
+                    modal.disks.retain(|d| !dir_writable(std::path::Path::new(&d.dir)));
+                    if modal.disks.is_empty() {
+                        self.chd_grant_modal = None;
+                        self.start_emulator();
+                    }
+                }
             }
         }
 

@@ -64,6 +64,7 @@ pub fn pump(ctx: &egui::Context, fb_clicked: bool, ps2: &Ps2Controller, state: &
     let mut buttons = state.last_buttons;
     let mut mods = state.last_mods;
     let mut keys: Vec<(KeyCode, bool)> = Vec::new();
+    let mut f11_to_guest = false;
 
     ctx.input(|i| {
         if !state.captured {
@@ -90,9 +91,31 @@ pub fn pump(ctx: &egui::Context, fb_clicked: bool, ps2: &Ps2Controller, state: &
             match ev {
                 // Raw relative motion (eframe → DeviceEvent::MouseMotion).
                 Event::MouseMoved(d) => { dx += d.x; dy += d.y; }
-                Event::Key { key, pressed, .. } => {
-                    if let Some(kc) = map_key(*key) { keys.push((kc, *pressed)); }
+                Event::Key { key, pressed, repeat, .. } => {
+                    if *key == Key::F11 {
+                        // Plain F11 is the GUI's fullscreen toggle and is never
+                        // forwarded. Ctrl+Alt+F11 is the escape hatch that delivers
+                        // a real F11 to IRIX — recorded here on the press edge and
+                        // sent (as a bare F11) after the modifier diff below.
+                        if *pressed && !*repeat && i.modifiers.ctrl && i.modifiers.alt {
+                            f11_to_guest = true;
+                        }
+                    } else if let Some(kc) = map_key(*key) {
+                        keys.push((kc, *pressed));
+                    }
                 }
+                // egui-winit swallows Ctrl/Cmd + C/X/V into clipboard *commands*
+                // (Cut/Copy/Paste) and never emits the underlying Key event — so
+                // on Linux and Windows, where `command == ctrl`, the guest would
+                // never see Ctrl+C (SIGINT in a shell), Ctrl+X, or Ctrl+V. Re-
+                // synthesise the bare letter as a tap; the held Ctrl is already
+                // sent by the modifier diff below, so the guest forms the full
+                // chord. Gated on `ctrl` so macOS Cmd+C/X/V — where real Ctrl+C
+                // still arrives as a normal Key, and the Cmd combo has no guest
+                // meaning — is left to the host clipboard.
+                Event::Copy     if i.modifiers.ctrl => { keys.push((KeyCode::KeyC, true)); keys.push((KeyCode::KeyC, false)); }
+                Event::Cut      if i.modifiers.ctrl => { keys.push((KeyCode::KeyX, true)); keys.push((KeyCode::KeyX, false)); }
+                Event::Paste(_) if i.modifiers.ctrl => { keys.push((KeyCode::KeyV, true)); keys.push((KeyCode::KeyV, false)); }
                 Event::MouseWheel { unit, delta, .. } => {
                     let lines = match unit {
                         MouseWheelUnit::Line => delta.y,
@@ -155,6 +178,26 @@ pub fn pump(ctx: &egui::Context, fb_clicked: bool, ps2: &Ps2Controller, state: &
 
     // ---- key events ----
     for (kc, pressed) in keys { ps2.push_kb(kc, pressed); }
+
+    // Ctrl+Alt+F11 → a *bare* F11 to the guest. Plain F11 is swallowed by the
+    // GUI's fullscreen toggle, so this chord is the only path for F11 into IRIX.
+    // The modifier diff above has left the chord's Ctrl+Alt (and any Shift/Cmd)
+    // pressed in the guest, so lift whatever is held, tap F11, then re-press —
+    // IRIX sees an unmodified F11. `state.last_mods` is left untouched, so the
+    // next frame's diff stays consistent (no spurious modifier press/release).
+    if f11_to_guest {
+        let held = state.last_mods;
+        if held.shift   { ps2.push_kb(KeyCode::ShiftLeft, false); }
+        if held.ctrl    { ps2.push_kb(KeyCode::ControlLeft, false); }
+        if held.alt     { ps2.push_kb(KeyCode::AltLeft, false); }
+        if held.mac_cmd { ps2.push_kb(KeyCode::SuperLeft, false); }
+        ps2.push_kb(KeyCode::F11, true);
+        ps2.push_kb(KeyCode::F11, false);
+        if held.shift   { ps2.push_kb(KeyCode::ShiftLeft, true); }
+        if held.ctrl    { ps2.push_kb(KeyCode::ControlLeft, true); }
+        if held.alt     { ps2.push_kb(KeyCode::AltLeft, true); }
+        if held.mac_cmd { ps2.push_kb(KeyCode::SuperLeft, true); }
+    }
 
     // ---- mouse: raw per-frame delta + button diff + scroll. ----
     let (mdx, mdy, mdz) = (dx as i32, dy as i32, dz as i32);
@@ -295,11 +338,12 @@ fn map_key(k: Key) -> Option<KeyCode> {
         // guest forms '|' and '?'). Without them those keys send nothing.
         Key::Pipe         => KeyCode::Backslash,
         Key::Questionmark => KeyCode::Slash,
-        // F-keys (egui has no F5; iris likely doesn't need F13+ either)
-        Key::F1 => KeyCode::F1, Key::F2 => KeyCode::F2,  Key::F3  => KeyCode::F3,
-        Key::F4 => KeyCode::F4, Key::F6 => KeyCode::F6,  Key::F7  => KeyCode::F7,
-        Key::F8 => KeyCode::F8, Key::F9 => KeyCode::F9,  Key::F10 => KeyCode::F10,
-        // F11 is consumed by the GUI (fullscreen toggle); don't forward.
+        // F-keys. F11 is reserved by the GUI (fullscreen toggle), so it isn't
+        // forwarded; iris's PS/2 scancode set stops at F12, so F13+ are dropped.
+        Key::F1 => KeyCode::F1, Key::F2 => KeyCode::F2, Key::F3  => KeyCode::F3,
+        Key::F4 => KeyCode::F4, Key::F5 => KeyCode::F5, Key::F6  => KeyCode::F6,
+        Key::F7 => KeyCode::F7, Key::F8 => KeyCode::F8, Key::F9  => KeyCode::F9,
+        Key::F10 => KeyCode::F10,
         Key::F12 => KeyCode::F12,
         _ => return None,
     })

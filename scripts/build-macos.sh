@@ -9,6 +9,15 @@
 # Usage:
 #   ./scripts/build-macos.sh            # standard build
 #   ./scripts/build-macos.sh lightning  # enable iris/lightning feature
+#   ./scripts/build-macos.sh appstore   # SANDBOXED build (App Store parity)
+#
+# The `appstore` variant compiles `--features appstore` (so the real
+# security-scoped bookmark code + IRIS_CHD_DIFF_DIR are active, not the
+# off-sandbox stubs) and signs with installer/iris-gui-sandbox-local.entitlements
+# (app-sandbox = true). The result is a genuinely sandboxed IRIS.app you can run
+# locally — no App Store round-trip — to test the folder-grant / CHD-fold flow.
+# Ad-hoc signing by default; set CODESIGN_IDENTITY="Developer ID Application: …"
+# to get persistent app-scoped bookmarks (see the entitlements file's caveat).
 #
 # After it finishes:
 #   open IRIS.app
@@ -49,6 +58,11 @@ echo "  Bundle ID: $BUNDLE_ID"
 
 if [ "$VARIANT" = "lightning" ]; then
     cargo build --release --target "$TARGET" -p iris-gui --features iris/lightning
+elif [ "$VARIANT" = "appstore" ] || [ "$VARIANT" = "sandbox" ]; then
+    # Sandbox parity: enable the bookmark code + container diff redirect.
+    # lightning gives a usable interpreter (the appstore feature forces
+    # IRIS_NO_JIT, so the MIPS/REX JITs are off regardless).
+    cargo build --release --target "$TARGET" -p iris-gui --features appstore,iris/lightning
 else
     cargo build --release --target "$TARGET" -p iris-gui
 fi
@@ -93,11 +107,25 @@ EOF
 
 # ── Sign ────────────────────────────────────────────────────────────────────
 
-echo "Signing bundle..."
-if [ -f "installer/iris-gui.entitlements" ]; then
-    codesign --force --deep --sign - --entitlements installer/iris-gui.entitlements "${BUNDLE}"
+# The sandboxed variant signs with the local sandbox entitlements (app-sandbox);
+# other variants keep the existing behaviour. CODESIGN_IDENTITY overrides the
+# default ad-hoc identity (e.g. a Developer ID for persistent bookmarks).
+SIGN_ID="${CODESIGN_IDENTITY:--}"
+if [ "$VARIANT" = "appstore" ] || [ "$VARIANT" = "sandbox" ]; then
+    ENTITLEMENTS="installer/iris-gui-sandbox-local.entitlements"
 else
-    codesign --force --deep --sign - "${BUNDLE}"
+    ENTITLEMENTS="installer/iris-gui.entitlements"
+fi
+
+echo "Signing bundle (identity: ${SIGN_ID}, entitlements: ${ENTITLEMENTS})..."
+if [ -f "$ENTITLEMENTS" ]; then
+    # Validate first: codesign's entitlements parser is strict (and an XML
+    # comment may not contain a double hyphen), and a parse failure would
+    # otherwise leave the bundle unsigned / un-sandboxed without an obvious error.
+    plutil -lint "$ENTITLEMENTS" >/dev/null
+    codesign --force --deep --sign "$SIGN_ID" --entitlements "$ENTITLEMENTS" "${BUNDLE}"
+else
+    codesign --force --deep --sign "$SIGN_ID" "${BUNDLE}"
 fi
 
 echo ""
@@ -107,3 +135,16 @@ echo "Launch without Terminal:"
 echo "  open ${BUNDLE}"
 echo ""
 echo "Or double-click IRIS.app in Finder."
+
+if [ "$VARIANT" = "appstore" ] || [ "$VARIANT" = "sandbox" ]; then
+    echo ""
+    echo "This is a SANDBOXED build. Verify the sandbox is actually on:"
+    echo "  codesign -d --entitlements - ${BUNDLE} 2>/dev/null | grep -A1 app-sandbox"
+    echo "  ls ~/Library/Containers/${BUNDLE_ID}/   # created on first launch"
+    echo ""
+    echo "Test the CHD folder-grant / fold: attach a compressed .chd from a"
+    echo "folder you have NOT granted -> the grant modal should appear; grant the"
+    echo "folder, boot, then quit -> the .diff.chd should fold away and the disk"
+    echo "shrink. (Ad-hoc bookmarks may not persist across relaunches; the"
+    echo "within-session fold does not depend on that.)"
+fi
