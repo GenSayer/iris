@@ -44,6 +44,12 @@ bundled = []
 # the CI/Automation config tab (the iris-ci socket is a developer automation
 # feature unusable in the sandbox). Set by .github/workflows/appstore.yml.
 appstore = ["bundled"]
+# PCAP bridged networking. Off by default because it adds a hard build-time
+# dependency on a pcap library (libpcap headers on Unix, a WinPcap-compatible
+# `wpcap` SDK on Windows). When enabled, the Network tab can enumerate host
+# interfaces in a dropdown and the in-process VM can actually bridge onto them.
+# Build with: cargo build -p iris-gui --features pcap
+pcap = ["iris/pcap"]
 
 [dependencies]
 # Group A (additive) features are always on for iris-gui so the user can
