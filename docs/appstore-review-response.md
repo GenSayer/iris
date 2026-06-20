@@ -1,10 +1,45 @@
-# App Store review response — IRIS (Submission 2ed07ab1…)
+# App Store review response — IRIS
 
-Covers the two issues raised on the 1.0 (20260610.2118) review (June 16, 2026):
+> **Paste-ready version → `docs/appstore-review-notes.txt`** (3,915 chars, under
+> the field's 4,000 limit). Copy it verbatim into **App Review Information →
+> Notes** in App Store Connect; leave the **App Sandbox Information** section
+> blank. That file is the *superset* actually submitted: it adds the
+> IRIX-media / IP disclaimer, "the app contacts no external services," the
+> inbound port-mapping / FTP use case, and the full entitlement list (all seven
+> keys, incl. the honest `allow-jit` note — see below). This markdown file is the
+> working/source document (rationale, history, verification commands).
+
+Originally written for the 1.0 (20260610.2118) review (June 16, 2026), which
+raised two issues:
 
 1. **Guideline 2.5.1** — private API `_CGSSetWindowBackgroundBlurRadius`.
 2. **Guideline 2.4.5(i)** — entitlements without obvious matching functionality
    (`com.apple.security.device.camera`, `com.apple.security.network.server`).
+
+## App Sandbox Information screen — N/A
+
+The App Store Connect **App Sandbox Information** screen is *only* for
+temporary-exception entitlements (`com.apple.security.temporary-exception.*`).
+IRIS uses none, so that screen stays blank. The entitlement justifications below
+go in **App Review Information → Notes**, not there.
+
+No entitlement has been added since the original submission — the later features
+(per-disk CHD copy-on-write + exit-time fold, the in-core pure-Rust NFS server,
+the Networking-tab redesign / FTP ALG / in-app file bridge) all run inside the
+existing grants. The in-core NFS server in particular opens **zero host sockets**
+(it lives entirely in the user-mode NAT), so it does not even rely on
+`network.server`. PCAP capture is sandbox-incompatible and ships only in the
+non-App-Store release builds, never under the `appstore` feature.
+
+### `com.apple.security.cs.allow-jit` — kept, described honestly
+
+The `appstore` feature force-sets `IRIS_NO_JIT=1` (`iris-gui/src/main.rs:111`), so
+the App Store build runs the MIPS CPU interpreter-only — JIT is never allocated
+(the binary would otherwise `SIGKILL` on the first JITed page under MAS signing,
+since `allow-unsigned-executable-memory` is rejected). The entitlement is left in
+place for parity with the Developer-ID builds, and the notes describe it
+truthfully as present-but-disabled rather than claiming the build uses JIT.
+(Decision 2026-06-20: keep + describe honestly, over removing it outright.)
 
 ---
 
@@ -45,9 +80,11 @@ hardware. When the user selects the host camera as the video source, IRIS
 captures live frames from the Mac's camera (AVFoundation) and feeds them to the
 emulated VINO device. The matching `NSCameraUsageDescription` is in `Info.plist`.
 
-**How to test (reviewer steps):**
-1. Launch IRIS. In the launcher, open the **Video-In** tab.
-2. Click **📷 Test Camera**.
+**How to test (reviewer steps):** *(no boot or login required)*
+1. Launch IRIS. In the left column click **Edit config…**, then click the
+   **Video-In** button that appears below it.
+2. Click **📷 Test Camera**. (The same test is also under **Help ▶ →
+   Diagnostics → Test Camera…**, which requires a running machine.)
 3. macOS shows the camera-permission prompt; allow it.
 4. A live preview from the Mac camera appears, with a status line showing the
    capture resolution and a rising frame count. Closing the window releases the
@@ -79,7 +116,8 @@ genuine server features above.)
 
 **How to test (reviewer steps):**
 1. Launch IRIS and **Start** a machine (the bundled config boots to the PROM).
-2. Open **Machine → Serial console…**.
+2. Open **Machine ▶ → Serial console…** (also under **Help ▶ → Diagnostics →
+   Serial console…**).
 3. The window shows "● connected to 127.0.0.1:8881" and streams the live guest
    serial console. Typing a line and pressing Enter sends it to the guest.
    This confirms the app's loopback serial **server** is live and accepting a
