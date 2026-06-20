@@ -501,7 +501,9 @@ impl MipsTlb {
         let tag = entry_idx as u8;
         let mask = old.page_mask | 0x1FFF;
         let count = ((mask + 1) >> 13).max(1) as usize;
-        let vpn2 = ((old.entry_hi as u32) >> 13) as usize; // VA[31:13] of even page
+        // Align down: entry_hi bits [14:13] are offset bits for large pages and may
+        // be non-zero (MIPS spec doesn't require software to clear them).
+        let vpn2 = (((old.entry_hi as u32) >> 13) as usize) & !(count - 1);
         for i in 0..count {
             let slot = vpn2.wrapping_add(i);
             if slot < VMAP_SIZE && self.vmap[slot] == tag {
@@ -518,7 +520,9 @@ impl MipsTlb {
         let entry = &self.entries[entry_idx];
         let mask = entry.page_mask | 0x1FFF;
         let count = ((mask + 1) >> 13).max(1) as usize;
-        let vpn2 = ((entry.entry_hi as u32) >> 13) as usize;
+        // Align down: entry_hi bits [14:13] are offset bits for large pages and may
+        // be non-zero (MIPS spec doesn't require software to clear them).
+        let vpn2 = (((entry.entry_hi as u32) >> 13) as usize) & !(count - 1);
         let tag = entry_idx as u8;
         for i in 0..count {
             let slot = vpn2.wrapping_add(i);
