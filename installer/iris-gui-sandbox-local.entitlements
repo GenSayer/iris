@@ -1,0 +1,57 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <!-- LOCAL sandbox test entitlements (NOT the Mac App Store).
+
+         Purpose: reproduce the App Sandbox locally so the security-scoped
+         bookmark / folder-grant flow (iris-gui/src/macos_sandbox.rs) can be
+         exercised without an App Store round-trip. The sandbox is enforced by
+         the app-sandbox entitlement at signing time; App Store distribution is
+         not required to get a sandboxed process.
+
+         Build with:  ./scripts/build-macos.sh appstore
+         (it compiles the "appstore" feature, so the real bookmark code and
+         IRIS_CHD_DIFF_DIR are active, not the off-sandbox stubs).
+
+         This file deliberately OMITS the MAS-only keys present in
+         iris-gui.entitlements (com.apple.application-identifier,
+         com.apple.developer.team-identifier): those require an embedded
+         provisioning profile and a real team signing identity, which ad-hoc
+         signing cannot satisfy.
+
+         CAVEAT, bookmark persistence: app-scoped security-scoped bookmarks key
+         on a stable code-signing identity. Under ad-hoc signing the identity is
+         the binary hash, so a bookmark minted by one build may not resolve in
+         the next, and may not persist across relaunches. The within-session
+         flow still works fully (the open-panel folder pick grants access for the
+         whole process lifetime), so the exit-time CHD fold (grant a folder, run,
+         quit) is faithfully testable ad-hoc. For cross-launch persistence
+         testing, sign with a Developer ID via CODESIGN_IDENTITY instead. -->
+    <key>com.apple.security.app-sandbox</key>
+    <true/>
+
+    <!-- Cranelift JIT: present for parity. The appstore feature forces
+         interpreter-only via IRIS_NO_JIT, so it is unused at runtime. -->
+    <key>com.apple.security.cs.allow-jit</key>
+    <true/>
+
+    <!-- IndyCam (VINO) host-camera capture. -->
+    <key>com.apple.security.device.camera</key>
+    <true/>
+
+    <!-- User-selected disk images / PROMs / ISOs, and persisting access to them
+         via app-scoped security-scoped bookmarks (see macos_sandbox.rs). These
+         are what the folder-grant flow depends on. -->
+    <key>com.apple.security.files.user-selected.read-write</key>
+    <true/>
+    <key>com.apple.security.files.bookmarks.app-scope</key>
+    <true/>
+
+    <!-- Guest networking (user-mode NAT) plus loopback serial-console viewer. -->
+    <key>com.apple.security.network.client</key>
+    <true/>
+    <key>com.apple.security.network.server</key>
+    <true/>
+</dict>
+</plist>

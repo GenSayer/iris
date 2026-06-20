@@ -172,6 +172,11 @@ pub enum ConfigAction {
 pub struct TabOutcome {
     pub action: ConfigAction,
     pub net: NetworkOutcome,
+    /// A SCSI image/disc path changed this frame (typed or picked) — mark dirty.
+    pub disks_changed: bool,
+    /// A SCSI image/disc path was just assigned via the Browse picker — the cue
+    /// to (re)check CHD folder-grant permissions (see `check_chd_folder_grants`).
+    pub disk_picked: bool,
 }
 
 pub fn show_tab(
@@ -185,10 +190,10 @@ pub fn show_tab(
 ) -> TabOutcome {
     ScrollArea::vertical().show(ui, |ui| match tab {
         Tab::General => TabOutcome { action: show_general(ui, cfg), ..Default::default() },
-        Tab::Disks   => { show_disks(ui, cfg); TabOutcome::default() }
+        Tab::Disks   => { let e = show_disks(ui, cfg); TabOutcome { disks_changed: e.changed, disk_picked: e.picked, ..Default::default() } }
         Tab::Network => {
             let net = show_network(ui, cfg, host, disk_folders, pcap_ifaces);
-            TabOutcome { action: net.action, net }
+            TabOutcome { action: net.action, net, ..Default::default() }
         }
         Tab::Memory  => { show_memory(ui, cfg); TabOutcome::default() }
         Tab::Display => { show_display(ui, cfg); TabOutcome::default() }
@@ -279,7 +284,8 @@ fn show_display(ui: &mut Ui, cfg: &mut MachineConfig) {
     });
 }
 
-fn show_disks(ui: &mut Ui, cfg: &mut MachineConfig) {
+fn show_disks(ui: &mut Ui, cfg: &mut MachineConfig) -> PathEdit {
+    let mut edit = PathEdit::default();
     ui.heading("SCSI devices");
     ui.horizontal(|ui| {
         ui.label("IDs 1–7. CD-ROMs typically use 4–6.");
@@ -314,15 +320,39 @@ fn show_disks(ui: &mut Ui, cfg: &mut MachineConfig) {
         if let Some(dev) = cfg.scsi.get_mut(&id) {
             Grid::new(("scsi_grid", id)).num_columns(2).striped(true).show(ui, |ui| {
                 ui.label("Image path");
-                path_row(ui, ("scsi_path", id), &mut dev.path,
+                let e = path_row(ui, ("scsi_path", id), &mut dev.path,
                     if dev.scratch { Pick::SaveFile } else { Pick::OpenFile },
                     DISK_FILTERS);
+                edit.changed |= e.changed;
+                edit.picked |= e.picked;
                 ui.end_row();
                 if dev.path.ends_with(".chd") && !build_features::CHD {
                     ui.label("");
                     ui.label(RichText::new("⚠ .chd path but this build lacks CHD support — rebuild with --features chd")
                         .color(Color32::from_rgb(230, 140, 70)));
                     ui.end_row();
+                }
+                // Active copy-on-write overlay for a compressed CHD: show exactly
+                // which `.diff.chd` is in use (the path honours IRIS_CHD_DIFF_DIR,
+                // so on the sandbox build this is the container sidecar) and its
+                // size, so it's unambiguous that changes are landing here and that
+                // this is the file folded back into the disk on a clean exit.
+                if build_features::CHD && dev.path.ends_with(".chd") {
+                    let diff = iris::chd_disk::diff_path_for(Path::new(&dev.path));
+                    if let Ok(meta) = std::fs::metadata(&diff) {
+                        let mb = meta.len() as f64 / (1024.0 * 1024.0);
+                        ui.label("Active overlay");
+                        ui.horizontal(|ui| {
+                            ui.label(RichText::new(format!("{}  ({mb:.1} MB)", diff.display()))
+                                .weak().small())
+                                .on_hover_text("This CHD's session changes accumulate here until they're \
+                                                folded back into the disk on a clean exit.");
+                            if ui.small_button("📂").on_hover_text("Reveal in file manager").clicked() {
+                                reveal_in_file_manager(&diff.to_string_lossy());
+                            }
+                        });
+                        ui.end_row();
+                    }
                 }
 
                 ui.label("Type");
@@ -379,7 +409,9 @@ fn show_disks(ui: &mut Ui, cfg: &mut MachineConfig) {
                 let mut drop_idx: Option<usize> = None;
                 for (i, disc) in dev.discs.iter_mut().enumerate() {
                     ui.horizontal(|ui| {
-                        path_row(ui, ("disc", id, i), disc, Pick::OpenFile, DISK_FILTERS);
+                        let e = path_row(ui, ("disc", id, i), disc, Pick::OpenFile, DISK_FILTERS);
+                        edit.changed |= e.changed;
+                        edit.picked |= e.picked;
                         if ui.button("×").clicked() { drop_idx = Some(i); }
                     });
                 }
@@ -391,6 +423,7 @@ fn show_disks(ui: &mut Ui, cfg: &mut MachineConfig) {
         }
     }
     if let Some(id) = to_delete { cfg.scsi.remove(&id); }
+    edit
 }
 
 /// A soft-invalid subnet the user just entered, surfaced to the app so it can
@@ -696,7 +729,7 @@ fn show_network(
     if let Some(nfs) = cfg.nfs.as_mut() {
         Grid::new("nfs_grid").num_columns(2).striped(true).show(ui, |ui| {
             ui.label("Shared dir");
-            out.changed |= path_row(ui, "nfs_shared", &mut nfs.shared_dir, Pick::Dir, ANY_FILTERS);
+            out.changed |= path_row(ui, "nfs_shared", &mut nfs.shared_dir, Pick::Dir, ANY_FILTERS).changed;
             ui.end_row();
             ui.label("NFS version");
             ComboBox::from_id_salt("nfs_ver")
@@ -722,7 +755,7 @@ fn show_network(
             if disk_folders.is_empty() {
                 ui.label(RichText::new(
                     "On the App Store build the shared folder must live somewhere the app has been \
-                     granted. Grant a disk folder first (File → \"Grant a disk folder…\"), then create \
+                     granted. Grant a disk folder first (File » \"Grant a disk folder…\"), then create \
                      a shared folder inside it here — or pick any folder above to grant it directly.")
                     .weak());
             } else {
@@ -1024,20 +1057,29 @@ pub fn reveal_in_file_manager(path: &str) {
     }
 }
 
-/// A TextEdit + 📁 Browse button that updates `value` in place. Returns whether
-/// `value` changed this frame, so callers can mark the config dirty (typed text
-/// or a Browse pick — both must persist).
+/// Outcome of a [`path_row`]: whether `value` changed this frame (typed text or
+/// a Browse pick — both must persist), and whether the change specifically came
+/// from the Browse *picker*. The latter is the "assignment" moment — the only
+/// safe time to (re)check folder-grant permissions, since reacting to every
+/// keystroke would pop a dialog mid-typing.
+#[derive(Default, Clone, Copy)]
+struct PathEdit {
+    changed: bool,
+    picked: bool,
+}
+
+/// A TextEdit + 📁 Browse button that updates `value` in place. See [`PathEdit`].
 fn path_row(
     ui: &mut Ui,
     id: impl std::hash::Hash,
     value: &mut String,
     mode: Pick,
     filters: &[(&str, &[&str])],
-) -> bool {
-    let mut changed = false;
+) -> PathEdit {
+    let mut out = PathEdit::default();
     ui.push_id(id, |ui| {
         ui.horizontal(|ui| {
-            changed |= ui.add(TextEdit::singleline(value).desired_width(320.0)).changed();
+            out.changed |= ui.add(TextEdit::singleline(value).desired_width(320.0)).changed();
             if ui.button("📁").on_hover_text("Browse…").clicked() {
                 let mut d = rfd::FileDialog::new();
                 // Start the dialog in the existing path's directory if any.
@@ -1064,7 +1106,8 @@ fn path_row(
                 };
                 if let Some(p) = picked {
                     *value = p.to_string_lossy().into_owned();
-                    changed = true;
+                    out.changed = true;
+                    out.picked = true;
                 }
             }
             // Reveal an existing path in the host file manager (Finder, Explorer,
@@ -1076,7 +1119,7 @@ fn path_row(
             }
         });
     });
-    changed
+    out
 }
 
 /// Same as `path_row` but for `Option<String>` — Browse populates Some,
