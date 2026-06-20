@@ -39,7 +39,7 @@ use parking_lot::{Condvar, Mutex};
 
 use crate::config::NetMode;
 use crate::devlog::LogModule;
-use crate::net::{eth_summary, mac_str, GatewayConfig, NatControl, NetBackend};
+use crate::net::{eth_summary, mac_str, GatewayConfig, NatControl, NetBackend, PcapStatus};
 
 /// Summary of one host interface, returned by `list_interfaces()`.
 pub struct NetInterface {
@@ -328,8 +328,16 @@ impl PcapEngine {
 impl NetBackend for PcapEngine {
     fn run(&mut self) {
         let mut cap = match self.open_capture() {
-            Ok(c) => c,
+            Ok(c) => {
+                // Capture is live — let the GUI light "capturing" and dismiss any
+                // earlier permission prompt.
+                self.ctl.set_pcap_status(PcapStatus::Active);
+                c
+            }
             Err(e) => {
+                // Classify the failure so the GUI can offer to elevate (permission)
+                // vs. just report a bad/absent device. See `classify_open_error`.
+                self.ctl.set_pcap_status(classify_open_error(&e));
                 eprintln!("iris: PCAP backend disabled: {}", e);
                 eprintln!("iris: the guest will have NO networking. Use `[network] mode = \"nat\"` for the software gateway.");
                 // Drain TX so the guest's ring doesn't back up, but produce no RX.
@@ -414,6 +422,26 @@ pub fn is_pcap_mode(mode: NetMode) -> bool {
     mode == NetMode::Pcap
 }
 
+/// Classify a libpcap open/activate error into a [`PcapStatus`] the GUI can act
+/// on. pcap 2.x has no dedicated permission variant — EPERM/EACCES surface as
+/// `PcapError(String)` or `ErrnoError`, both of which Display to text containing
+/// "permission denied" / "operation not permitted" on macOS (BPF) and Linux. So
+/// we match the rendered message rather than a crate error variant, which is
+/// robust across platforms.
+fn classify_open_error(msg: &str) -> PcapStatus {
+    let m = msg.to_ascii_lowercase();
+    if m.contains("permission denied")
+        || m.contains("operation not permitted")
+        || m.contains("not permitted")
+        || m.contains("eacces")
+        || m.contains("eperm")
+    {
+        PcapStatus::PermissionDenied
+    } else {
+        PcapStatus::DeviceError
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -480,5 +508,25 @@ mod tests {
     fn auto_pick_errors_when_only_loopback() {
         let ifaces = vec![iface("lo", true, true, true, true)];
         assert!(resolve_interface(None, &ifaces).is_err());
+    }
+
+    #[test]
+    fn classify_open_error_detects_permission() {
+        // macOS BPF and Linux raw-socket permission messages map to the prompt.
+        for m in [
+            "activate device 'en0': (cannot open BPF device) /dev/bpf0: Permission denied",
+            "libpcap error: socket: Operation not permitted",
+            "You don't have permission to capture on that device (socket: Operation not permitted)",
+            "open device 'eth0': EACCES",
+        ] {
+            assert_eq!(classify_open_error(m), PcapStatus::PermissionDenied, "{m}");
+        }
+        // Non-permission failures stay a generic device error (no elevation UI).
+        for m in [
+            "open device 'wlan9': No such device exists",
+            "activate device 'en0': BIOCSETIF: Device not configured",
+        ] {
+            assert_eq!(classify_open_error(m), PcapStatus::DeviceError, "{m}");
+        }
     }
 }

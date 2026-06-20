@@ -1,6 +1,7 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod camera_test;
+mod capture_access;
 mod config_ui;
 mod dialogs;
 mod framebuffer;
@@ -173,6 +174,14 @@ struct App {
     /// Set when the Networking tab commits a subnet that fails the sanity checks
     /// (non-RFC1918 or a host conflict); drives the Override/Cancel modal.
     net_sanity_modal: Option<NetSanityModal>,
+    /// `true` while the "Enable packet capture" prompt is open — raised either by
+    /// the user's button in the Network tab or automatically when a pcap-mode
+    /// machine reports `PcapStatus::PermissionDenied` on Start.
+    pcap_perm_modal: bool,
+    /// One-shot guard so the automatic permission prompt fires at most once per
+    /// run (reset on `Evt::Started`); without it the modal would re-open every
+    /// frame the capture stays denied.
+    pcap_perm_prompted: bool,
     new_machine: NewMachineDialog,
     create_disk: CreateDiskDialog,
     /// If true, central panel shows the tabbed config editor; otherwise the
@@ -451,6 +460,8 @@ impl App {
             confirm_embedded_prom: false,
             net_ifaces: netplan::gather_host_ifaces(),
             net_sanity_modal: None,
+            pcap_perm_modal: false,
+            pcap_perm_prompted: false,
             new_machine,
             create_disk: CreateDiskDialog::default(),
             show_config_editor: false,
@@ -488,6 +499,22 @@ impl App {
     /// per-frame. A no-op placeholder when the build lacks `--features pcap`.
     fn refresh_pcap_ifaces(&mut self) {
         self.pcap_ifaces = Some(config_ui::enumerate_pcap_ifaces());
+    }
+
+    /// Run the platform's "grant packet-capture permission" flow and report the
+    /// result. Invoked by the Network tab's "Enable packet capture…" button and
+    /// by the automatic permission-denied prompt. The per-OS work lives in
+    /// `capture_access` (Linux pkexec/setcap, macOS ChmodBPF, Windows Npcap).
+    fn run_enable_packet_capture(&mut self) {
+        use capture_access::EnableOutcome;
+        // Dismiss the prompt regardless of outcome; the user made a choice.
+        self.pcap_perm_modal = false;
+        match capture_access::enable_packet_capture() {
+            EnableOutcome::Enabled => self.toast("packet capture enabled"),
+            EnableOutcome::NeedsRelaunch(msg) => self.toast(msg),
+            EnableOutcome::Cancelled => {}
+            EnableOutcome::Failed(why) => self.toast(why),
+        }
     }
 
     fn toast(&mut self, msg: impl Into<String>) {
@@ -822,7 +849,12 @@ impl App {
     fn handle_events(&mut self, ctx: &egui::Context) {
         for evt in self.emu.drain_events() {
             match evt {
-                Evt::Started   => self.toast("emulator started"),
+                Evt::Started   => {
+                    // Fresh run: re-arm the one-shot PCAP permission prompt so a
+                    // pcap-mode machine that can't open its capture re-prompts.
+                    self.pcap_perm_prompted = false;
+                    self.toast("emulator started");
+                }
                 Evt::Stopped   => self.toast("emulator stopped"),
                 Evt::PowerOff  => self.toast("guest powered off (safe to stop)"),
                 Evt::StateSaved(n)    => self.toast(format!("state saved: {n}")),
@@ -850,6 +882,17 @@ impl App {
                 }
             }
         }
+        // Automatic PCAP elevation prompt: a pcap-mode machine that couldn't open
+        // its raw capture for lack of privilege reports `PermissionDenied`. Raise
+        // the same "Enable packet capture" prompt the Network tab button uses,
+        // once per run (the one-shot guard avoids re-opening it every frame).
+        if !self.pcap_perm_prompted
+            && self.emu.pcap_status() == iris::net::PcapStatus::PermissionDenied
+        {
+            self.pcap_perm_prompted = true;
+            self.pcap_perm_modal = true;
+        }
+
         // Repaint cadence: ~60 fps while the emulator is running so we
         // can pull the latest framebuffer; lazy otherwise to save CPU.
         let next = if self.emu.is_running() { 16 } else { 250 };
@@ -1811,6 +1854,7 @@ impl App {
             ConfigAction::RequestEmbeddedProm => self.confirm_embedded_prom = true,
             ConfigAction::TestCamera => self.open_camera_test(),
             ConfigAction::RefreshPcapIfaces => self.refresh_pcap_ifaces(),
+            ConfigAction::EnablePacketCapture => self.run_enable_packet_capture(),
             ConfigAction::None => {}
         }
         if out.disks_changed { self.mark_dirty(); }
@@ -2776,6 +2820,38 @@ impl eframe::App for App {
             if do_revert  { self.cfg.nat_subnet = revert_to;          self.mark_dirty(); }
             if do_suggest { self.cfg.nat_subnet = Some(suggestion);   self.mark_dirty(); }
             if close { self.net_sanity_modal = None; }
+        }
+
+        // PCAP capture-permission prompt (button-raised or auto-raised on a
+        // permission-denied capture). "Enable" runs the platform privilege flow;
+        // "Not now" just dismisses — the guest keeps running on NAT-less PCAP
+        // (i.e. no networking) until the user enables capture or switches to NAT.
+        if self.pcap_perm_modal {
+            let mut do_enable = false;
+            let mut close = false;
+            egui::Window::new("Enable packet capture")
+                .collapsible(false)
+                .resizable(false)
+                .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+                .show(ctx, |ui| {
+                    ui.set_max_width(440.0);
+                    ui.label(RichText::new(
+                        "PCAP (bridged) networking needs permission to capture on a real \
+                         interface, which IRIS doesn't have yet.").strong());
+                    ui.add_space(4.0);
+                    ui.label(RichText::new(capture_access::permission_hint()).weak());
+                    ui.add_space(8.0);
+                    ui.horizontal(|ui| {
+                        if ui.add(egui::Button::new("Enable packet capture…")
+                            .fill(Color32::from_rgb(60, 90, 140))).clicked()
+                        {
+                            do_enable = true;
+                        }
+                        if ui.button("Not now").clicked() { close = true; }
+                    });
+                });
+            if do_enable { self.run_enable_packet_capture(); } // also clears the modal
+            if close { self.pcap_perm_modal = false; }
         }
 
         // Missing-disk modal.

@@ -7,7 +7,7 @@
 use std::collections::{HashMap, VecDeque};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr, TcpListener, TcpStream, UdpSocket};
 use socket2::{Domain, Protocol, Socket, Type};
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
 use crate::config::{ForwardBind, ForwardProto, NatSubnet, NetMode, NfsConfig, PortForwardConfig};
 use crate::devlog::LogModule;
@@ -476,6 +476,38 @@ fn portmap_reply(xid: u32, port: u32) -> Vec<u8> {
     r
 }
 
+/// Live status of the PCAP bridged-capture backend, surfaced to an embedder (the
+/// GUI) so it can prompt for privilege elevation when the raw capture can't be
+/// opened. Deliberately **not** feature-gated — `NatControl` always carries the
+/// field and non-`pcap` builds / the GUI reference the type unconditionally; it
+/// only ever leaves `Inactive` when the `pcap` feature is built and the active
+/// machine uses `[network] mode = "pcap"`.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+#[repr(u8)]
+pub enum PcapStatus {
+    /// Not bridging — NAT mode, or PCAP not yet attempted (default).
+    #[default]
+    Inactive = 0,
+    /// Capture handle is open; frames are bridging onto the host interface.
+    Active = 1,
+    /// Open failed for lack of privilege (EPERM/EACCES, libpcap "permission
+    /// denied"). The embedder should offer to elevate / enable capture.
+    PermissionDenied = 2,
+    /// Open failed for another reason (no such device, driver missing, …).
+    DeviceError = 3,
+}
+
+impl PcapStatus {
+    fn from_u8(v: u8) -> Self {
+        match v {
+            1 => PcapStatus::Active,
+            2 => PcapStatus::PermissionDenied,
+            3 => PcapStatus::DeviceError,
+            _ => PcapStatus::Inactive,
+        }
+    }
+}
+
 // ── NAT debug/status control (shared between NatEngine thread and command handler) ─
 pub struct NatControl {
     pub debug_tcp:  AtomicBool,
@@ -521,6 +553,11 @@ pub struct NatControl {
     /// an embedder add/remove forwards without a reboot.
     pub pending_forwards: Mutex<Option<Vec<PortForwardConfig>>>,
     pub apply_forwards:   AtomicBool,
+    /// Live PCAP backend status (a [`PcapStatus`] discriminant), set by the
+    /// `PcapEngine` as it opens (or fails to open) the capture and sampled by the
+    /// GUI to drive the "Enable packet capture" / elevation prompt. `Inactive`
+    /// (0) in NAT mode and on non-`pcap` builds.
+    pub pcap_status: AtomicU8,
 }
 
 impl NatControl {
@@ -542,7 +579,18 @@ impl NatControl {
             host_nets:     Mutex::new(Vec::new()),
             pending_forwards: Mutex::new(None),
             apply_forwards:   AtomicBool::new(false),
+            pcap_status:      AtomicU8::new(PcapStatus::Inactive as u8),
         })
+    }
+
+    /// Record the live PCAP backend status (called by the `PcapEngine`).
+    pub fn set_pcap_status(&self, s: PcapStatus) {
+        self.pcap_status.store(s as u8, Ordering::Relaxed);
+    }
+
+    /// The live PCAP backend status, for an embedder to drive elevation UI.
+    pub fn pcap_status(&self) -> PcapStatus {
+        PcapStatus::from_u8(self.pcap_status.load(Ordering::Relaxed))
     }
     pub fn dbg_tcp(&self)  -> bool { self.debug_tcp.load(Ordering::Relaxed) }
     pub fn dbg_udp(&self)  -> bool { self.debug_udp.load(Ordering::Relaxed) }

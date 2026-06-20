@@ -98,6 +98,10 @@ pub struct Status {
     pub net_guest_gateway: Option<Ipv4Addr>,
     /// IRIS's current NAT gateway (reflects any live adoption).
     pub net_nat_gateway: Option<Ipv4Addr>,
+    /// Live PCAP capture-backend status. `Inactive` in NAT mode / non-pcap
+    /// builds; `PermissionDenied` when a pcap-mode machine couldn't open the raw
+    /// capture, which drives the "Enable packet capture" elevation prompt.
+    pub pcap_status: iris::net::PcapStatus,
 }
 
 /// State of the internal-network ("NET") indicator shown next to MIPS.
@@ -199,6 +203,7 @@ impl EmulatorHandle {
                 self.status.net_guest_ip = s.net_guest_ip;
                 self.status.net_guest_gateway = s.net_guest_gateway;
                 self.status.net_nat_gateway = s.net_nat_gateway;
+                self.status.pcap_status = s.pcap_status;
             }
             match &evt {
                 Evt::Started => {
@@ -232,6 +237,12 @@ impl EmulatorHandle {
     pub fn net_state(&self) -> NetState {
         net_state_for(self.status.running, self.status.cpu_halted, self.net_seen_frames)
     }
+
+    /// Live PCAP capture-backend status, sampled from the running machine.
+    /// `Inactive` when no machine is up, in NAT mode, or on a non-pcap build.
+    /// The app watches this for `PermissionDenied` to raise the "Enable packet
+    /// capture" elevation prompt.
+    pub fn pcap_status(&self) -> iris::net::PcapStatus { self.status.pcap_status }
 
     /// Stop the machine (if running) and join the worker thread. Idempotent.
     /// Call this from the GUI's `on_exit` so a running machine is cleaned up
@@ -315,9 +326,12 @@ fn worker_loop(
                         let net_guest_ip = machine.as_ref().and_then(|m| m.net_observed_guest_ip());
                         let net_guest_gateway = machine.as_ref().and_then(|m| m.net_observed_gateway());
                         let net_nat_gateway = machine.as_ref().map(|m| m.nat_expected().1);
+                        let pcap_status = machine.as_ref()
+                            .map_or(iris::net::PcapStatus::Inactive, |m| m.net_pcap_status());
                         let _ = evt_tx.send(Evt::Status(Status {
                             mips, cpu_halted, cpu_stopped, chd_sync_pending,
                             net_frames, net_guest_ip, net_guest_gateway, net_nat_gateway,
+                            pcap_status,
                             ..Status::default()
                         }));
                     }

@@ -165,6 +165,10 @@ pub enum ConfigAction {
     /// User clicked "Refresh" on the Network tab's PCAP selector; the app should
     /// re-enumerate host interfaces and update its cache.
     RefreshPcapIfaces,
+    /// User clicked "Enable packet capture…" in the Network tab's PCAP section;
+    /// the app should run the platform's privilege flow (Linux setcap/pkexec,
+    /// macOS ChmodBPF install, Windows driver check) via `capture_access`.
+    EnablePacketCapture,
 }
 
 /// Everything a config tab hands back to the app for one frame.
@@ -496,6 +500,21 @@ fn show_network(
                  below are ignored; the guest uses your real LAN. Requires elevated \
                  privileges (root/CAP_NET_RAW on Unix, or a WinPcap-compatible driver \
                  + Administrator on Windows).");
+
+            // Explicit, OS-specific way to grant capture permission up front (the
+            // other trigger is automatic: the app pops the same prompt if a
+            // pcap-mode machine hits a permission error on Start). The hint text
+            // and the action are platform-specific — see `capture_access`.
+            ui.horizontal(|ui| {
+                if ui.button("Enable packet capture…")
+                    .on_hover_text("Grant IRIS permission to capture on a real interface. \
+                                    A one-time admin/root step per the note below.")
+                    .clicked()
+                {
+                    out.action = ConfigAction::EnablePacketCapture;
+                }
+                ui.label(RichText::new(crate::capture_access::permission_hint()).weak());
+            });
             ui.separator();
         }
     }

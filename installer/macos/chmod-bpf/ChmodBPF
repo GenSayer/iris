@@ -1,0 +1,40 @@
+#!/bin/sh
+#
+# ChmodBPF — grant the BPF capture devices (/dev/bpf*) group read/write so an
+# UNPRIVILEGED IRIS (and the libpcap it links) can open a raw capture for PCAP
+# (bridged) networking. Modeled on Wireshark's ChmodBPF.
+#
+# Installed by IRIS's in-app "Enable packet capture" step:
+#   - this script -> /Library/Application Support/IRIS/ChmodBPF/ChmodBPF
+#   - the LaunchDaemon io.github.danifunker.iris.ChmodBPF.plist -> /Library/LaunchDaemons/
+# The daemon runs this at every boot (RunAtLoad): macOS recreates the bpf nodes on
+# demand with default (root-only) permissions, so the grant is re-applied each boot.
+#
+# The emulator itself NEVER runs as root — that is the whole point of ChmodBPF
+# over a sudo re-exec of the GUI.
+
+BPF_GROUP="access_bpf"
+
+syslog -s -l notice "IRIS ChmodBPF: setting permissions on /dev/bpf*"
+
+# Ensure the access_bpf group exists (idempotent). The in-app installer also
+# creates it and adds the user; group membership only takes effect in new login
+# sessions, which is why IRIS asks the user to quit & reopen after enabling.
+if ! dseditgroup -o read "$BPF_GROUP" >/dev/null 2>&1; then
+    dseditgroup -o create "$BPF_GROUP"
+fi
+
+# Wait briefly for at least one bpf node to appear (created on demand at boot).
+attempts=0
+while [ ! -e /dev/bpf0 ] && [ "$attempts" -lt 10 ]; do
+    attempts=$((attempts + 1))
+    sleep 1
+done
+
+if [ -e /dev/bpf0 ]; then
+    chgrp "$BPF_GROUP" /dev/bpf*
+    chmod g+rw /dev/bpf*
+    syslog -s -l notice "IRIS ChmodBPF: /dev/bpf* now group-readable by $BPF_GROUP"
+else
+    syslog -s -l error "IRIS ChmodBPF: no /dev/bpf* devices found"
+fi

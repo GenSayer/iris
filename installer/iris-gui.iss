@@ -56,6 +56,12 @@ Name: "english"; MessagesFile: "compiler:Default.isl"
 
 [Tasks]
 Name: "desktopicon"; Description: "Create a &desktop shortcut"; GroupDescription: "Additional shortcuts:"; Flags: unchecked
+#ifdef Pcap
+; PCAP (bridged) networking needs a WinPcap-compatible driver. Offer to fetch
+; Npcap from npcap.com when it isn't already present. Checked by default (it's
+; required for PCAP mode), but the whole task is hidden when Npcap is detected.
+Name: "npcap"; Description: "Download && install Npcap (required for PCAP bridged networking)"; GroupDescription: "Packet capture:"; Check: not NpcapInstalled
+#endif
 
 [Files]
 Source: "{#SourceDir}\{#MyAppExeName}"; DestDir: "{app}"; Flags: ignoreversion
@@ -70,3 +76,86 @@ Name: "{userdesktop}\{#MyAppName}"; Filename: "{app}\{#MyAppExeName}"; Tasks: de
 
 [Run]
 Filename: "{app}\{#MyAppExeName}"; Description: "Launch {#MyAppName}"; Flags: nowait postinstall skipifsilent
+
+; ───────────────────────────────────────────────────────────────────────────
+; Npcap handling — PCAP installer variant only (compiled with `iscc /DPcap=1`).
+; The standard/lightning installer has no [Code] section and is unchanged.
+;
+; We do NOT bundle Npcap (proprietary, redistribution forbidden). If the user
+; opts in (and Npcap isn't already present) we download the official installer
+; from npcap.com and run it; its own UAC prompt handles elevation. The IRIS
+; installer itself stays per-user/no-admin. Bump the version with /DNpcapVersion=.
+#ifdef Pcap
+#ifndef NpcapVersion
+  #define NpcapVersion "1.79"
+#endif
+
+[Code]
+var
+  NpcapDownloadPage: TDownloadWizardPage;
+
+{ True when a WinPcap-compatible driver (Npcap, or a legacy WinPcap) is present.
+  Checks the wpcap.dll the `pcap` crate links against and the npcap service. }
+function NpcapInstalled(): Boolean;
+begin
+  Result := FileExists(ExpandConstant('{sys}\Npcap\wpcap.dll')) or
+            FileExists(ExpandConstant('{sys}\wpcap.dll')) or
+            RegKeyExists(HKLM, 'SYSTEM\CurrentControlSet\Services\npcap');
+end;
+
+function OnDownloadProgress(const Url, FileName: String; const Progress, ProgressMax: Int64): Boolean;
+begin
+  Result := True;
+end;
+
+procedure InitializeWizard();
+begin
+  NpcapDownloadPage := CreateDownloadPage(
+    'Download Npcap', 'Fetching the packet-capture driver from npcap.com', @OnDownloadProgress);
+end;
+
+{ Download Npcap on the Ready page when the task is selected and it's missing. }
+function NextButtonClick(CurPageID: Integer): Boolean;
+begin
+  Result := True;
+  if (CurPageID = wpReady) and WizardIsTaskSelected('npcap') and (not NpcapInstalled()) then
+  begin
+    NpcapDownloadPage.Clear;
+    NpcapDownloadPage.Add('https://npcap.com/dist/npcap-{#NpcapVersion}.exe', 'npcap-setup.exe', '');
+    NpcapDownloadPage.Show;
+    try
+      try
+        NpcapDownloadPage.Download;
+      except
+        if NpcapDownloadPage.AbortedByUser then
+          Result := False
+        else
+        begin
+          SuppressibleMsgBox(
+            'Could not download Npcap automatically. You can install it later from https://npcap.com.'
+            + #13#10#13#10 + GetExceptionMessage, mbInformation, MB_OK, IDOK);
+          Result := True; { keep installing IRIS even if the download failed }
+        end;
+      end;
+    finally
+      NpcapDownloadPage.Hide;
+    end;
+  end;
+end;
+
+{ Run the downloaded Npcap installer after IRIS's own files are in place. }
+procedure CurStepChanged(CurStep: TSetupStep);
+var
+  ResultCode: Integer;
+begin
+  if CurStep = ssPostInstall then
+  begin
+    if WizardIsTaskSelected('npcap') and (not NpcapInstalled()) and
+       FileExists(ExpandConstant('{tmp}\npcap-setup.exe')) then
+    begin
+      { Npcap's installer raises its own UAC prompt for the driver install. }
+      Exec(ExpandConstant('{tmp}\npcap-setup.exe'), '', '', SW_SHOW, ewWaitUntilTerminated, ResultCode);
+    end;
+  end;
+end;
+#endif
