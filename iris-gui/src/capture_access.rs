@@ -297,14 +297,36 @@ mod imp {
 #[cfg(target_os = "windows")]
 mod imp {
     use super::EnableOutcome;
+    use std::process::Command;
+
     pub const HINT: &str =
-        "Windows: install a WinPcap-compatible driver (Npcap) and run IRIS as Administrator.";
+        "Windows: needs the Npcap driver + Administrator. The button opens the download page.";
+
+    /// Whether a WinPcap-compatible driver (Npcap, or legacy WinPcap) is present.
+    fn npcap_present() -> bool {
+        let root = std::env::var("SystemRoot").unwrap_or_else(|_| "C:\\Windows".into());
+        let p = std::path::Path::new(&root);
+        p.join("System32\\Npcap\\wpcap.dll").exists() || p.join("System32\\wpcap.dll").exists()
+    }
+
     pub fn enable() -> EnableOutcome {
-        // The driver is provided by the installer (task A7). At runtime, point the
-        // user at Npcap if the capture failed.
-        EnableOutcome::Failed(
-            "PCAP on Windows needs the Npcap driver (https://npcap.com) and \
-             Administrator. Install Npcap, then relaunch IRIS as Administrator."
+        // Check first: if the driver is already present, the only remaining
+        // requirement is Administrator.
+        if npcap_present() {
+            return EnableOutcome::NeedsRelaunch(
+                "Npcap is installed. PCAP capture also needs Administrator — relaunch IRIS as \
+                 Administrator, then start the machine again."
+                    .into(),
+            );
+        }
+        // We never bundle or silently download the driver. Open the official page
+        // so the user installs Npcap themselves, then relaunches and tries again.
+        let _ = Command::new("explorer")
+            .arg("https://npcap.com/#download")
+            .spawn();
+        EnableOutcome::NeedsRelaunch(
+            "Opened the Npcap download page in your browser. Install Npcap (a free \
+             WinPcap-compatible driver), then relaunch IRIS as Administrator and try again."
                 .into(),
         )
     }

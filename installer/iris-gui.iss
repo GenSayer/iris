@@ -56,12 +56,6 @@ Name: "english"; MessagesFile: "compiler:Default.isl"
 
 [Tasks]
 Name: "desktopicon"; Description: "Create a &desktop shortcut"; GroupDescription: "Additional shortcuts:"; Flags: unchecked
-#ifdef Pcap
-; PCAP (bridged) networking needs a WinPcap-compatible driver. Offer to fetch
-; Npcap from npcap.com when it isn't already present. Checked by default (it's
-; required for PCAP mode), but the whole task is hidden when Npcap is detected.
-Name: "npcap"; Description: "Download && install Npcap (required for PCAP bridged networking)"; GroupDescription: "Packet capture:"; Check: not NpcapInstalled
-#endif
 
 [Files]
 Source: "{#SourceDir}\{#MyAppExeName}"; DestDir: "{app}"; Flags: ignoreversion
@@ -81,18 +75,17 @@ Filename: "{app}\{#MyAppExeName}"; Description: "Launch {#MyAppName}"; Flags: no
 ; Npcap handling — PCAP installer variant only (compiled with `iscc /DPcap=1`).
 ; The standard/lightning installer has no [Code] section and is unchanged.
 ;
-; We do NOT bundle Npcap (proprietary, redistribution forbidden). If the user
-; opts in (and Npcap isn't already present) we download the official installer
-; from npcap.com and run it; its own UAC prompt handles elevation. The IRIS
-; installer itself stays per-user/no-admin. Bump the version with /DNpcapVersion=.
+; PCAP bridged networking needs a WinPcap-compatible driver (Npcap). We do NOT
+; bundle it (proprietary, redistribution forbidden) and we never silently
+; download it. Instead, when Npcap is missing we show a page that OPENS the
+; official npcap.com download page in the user's browser; the user installs
+; Npcap themselves (its installer has its own UAC), then clicks Next to re-check.
+; The page is skipped entirely when Npcap is already present. The IRIS installer
+; stays per-user/no-admin throughout.
 #ifdef Pcap
-#ifndef NpcapVersion
-  #define NpcapVersion "1.79"
-#endif
-
 [Code]
 var
-  NpcapDownloadPage: TDownloadWizardPage;
+  NpcapPage: TWizardPage;
 
 { True when a WinPcap-compatible driver (Npcap, or a legacy WinPcap) is present.
   Checks the wpcap.dll the `pcap` crate links against and the npcap service. }
@@ -103,59 +96,70 @@ begin
             RegKeyExists(HKLM, 'SYSTEM\CurrentControlSet\Services\npcap');
 end;
 
-function OnDownloadProgress(const Url, FileName: String; const Progress, ProgressMax: Int64): Boolean;
+{ Open the official Npcap download page in the user's default browser. }
+procedure OpenNpcapSite(Sender: TObject);
+var
+  ErrorCode: Integer;
 begin
-  Result := True;
+  ShellExec('open', 'https://npcap.com/#download', '', '', SW_SHOWNORMAL, ewNoWait, ErrorCode);
 end;
 
 procedure InitializeWizard();
+var
+  Info: TNewStaticText;
+  OpenButton: TNewButton;
 begin
-  NpcapDownloadPage := CreateDownloadPage(
-    'Download Npcap', 'Fetching the packet-capture driver from npcap.com', @OnDownloadProgress);
+  NpcapPage := CreateCustomPage(wpSelectTasks,
+    'Npcap (packet-capture driver)',
+    'PCAP bridged networking needs the free Npcap driver.');
+
+  Info := TNewStaticText.Create(NpcapPage);
+  Info.Parent := NpcapPage.Surface;
+  Info.Left := 0;
+  Info.Top := 0;
+  Info.Width := NpcapPage.SurfaceWidth;
+  Info.AutoSize := False;
+  Info.WordWrap := True;
+  Info.Height := ScaleY(96);
+  Info.Caption :=
+    'IRIS bridged (PCAP) networking requires Npcap, a free WinPcap-compatible driver. ' +
+    'It is not bundled with IRIS and is not downloaded automatically.' + #13#10#13#10 +
+    'Click the button below to open the Npcap download page in your browser. Install ' +
+    'Npcap (its installer asks for Administrator), then return here and click Next — ' +
+    'IRIS will re-check for the driver. You can also continue and install it later.';
+
+  OpenButton := TNewButton.Create(NpcapPage);
+  OpenButton.Parent := NpcapPage.Surface;
+  OpenButton.Left := 0;
+  OpenButton.Top := Info.Top + Info.Height + ScaleY(8);
+  OpenButton.Width := ScaleX(240);
+  OpenButton.Height := ScaleY(28);
+  OpenButton.Caption := 'Open the Npcap download page';
+  OpenButton.OnClick := @OpenNpcapSite;
 end;
 
-{ Download Npcap on the Ready page when the task is selected and it's missing. }
+{ Skip the Npcap page when the driver is already present. }
+function ShouldSkipPage(PageID: Integer): Boolean;
+begin
+  Result := False;
+  if (NpcapPage <> nil) and (PageID = NpcapPage.ID) then
+    Result := NpcapInstalled();
+end;
+
+{ "Try again": re-check on Next. If still missing, let the user retry (stay on
+  the page to install first) or continue without it. }
 function NextButtonClick(CurPageID: Integer): Boolean;
 begin
   Result := True;
-  if (CurPageID = wpReady) and WizardIsTaskSelected('npcap') and (not NpcapInstalled()) then
+  if (NpcapPage <> nil) and (CurPageID = NpcapPage.ID) and (not NpcapInstalled()) then
   begin
-    NpcapDownloadPage.Clear;
-    NpcapDownloadPage.Add('https://npcap.com/dist/npcap-{#NpcapVersion}.exe', 'npcap-setup.exe', '');
-    NpcapDownloadPage.Show;
-    try
-      try
-        NpcapDownloadPage.Download;
-      except
-        if NpcapDownloadPage.AbortedByUser then
-          Result := False
-        else
-        begin
-          SuppressibleMsgBox(
-            'Could not download Npcap automatically. You can install it later from https://npcap.com.'
-            + #13#10#13#10 + GetExceptionMessage, mbInformation, MB_OK, IDOK);
-          Result := True; { keep installing IRIS even if the download failed }
-        end;
-      end;
-    finally
-      NpcapDownloadPage.Hide;
-    end;
-  end;
-end;
-
-{ Run the downloaded Npcap installer after IRIS's own files are in place. }
-procedure CurStepChanged(CurStep: TSetupStep);
-var
-  ResultCode: Integer;
-begin
-  if CurStep = ssPostInstall then
-  begin
-    if WizardIsTaskSelected('npcap') and (not NpcapInstalled()) and
-       FileExists(ExpandConstant('{tmp}\npcap-setup.exe')) then
-    begin
-      { Npcap's installer raises its own UAC prompt for the driver install. }
-      Exec(ExpandConstant('{tmp}\npcap-setup.exe'), '', '', SW_SHOW, ewWaitUntilTerminated, ResultCode);
-    end;
+    if MsgBox(
+        'Npcap was not detected yet. PCAP bridged networking will not work until it is installed.'
+        + #13#10#13#10 +
+        'Click Yes to re-check after installing Npcap (stay on this page), or No to continue '
+        + 'and install it later.',
+        mbConfirmation, MB_YESNO) = IDYES then
+      Result := False;
   end;
 end;
 #endif

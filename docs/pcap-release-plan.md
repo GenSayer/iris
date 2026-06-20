@@ -134,23 +134,37 @@ resources it consumes are authored here. The two halves meet only at release tim
   install never fails. ⚠️ *Packaging only verifiable on a Linux build (cargo-deb /
   cargo-generate-rpm) — flagged for Dani.* Manifest parses (`cargo metadata` OK).
 
-### A7 — Windows Npcap installer logic  *(DONE 2026-06-20)*
-- [x] **[branch]** Added a `[Code]` block + opt-in `[Tasks]` entry to
-  `installer/iris-gui.iss`, **all gated behind ISPP `#ifdef Pcap`** so the standard
-  installer is byte-for-byte unchanged; only the pcap installer (compiled
-  `iscc /DPcap=1`, a **[main]** step) gets it.
+### A7 — Windows Npcap installer logic  *(DONE 2026-06-20, revised: no auto-download)*
+Decision (2026-06-20): **never silently download or bundle Npcap.** The flow is
+detect → **open the npcap.com page in the browser** → user installs it → re-check.
+- [x] **[branch]** `installer/iris-gui.iss` `[Code]` block, **gated behind ISPP
+  `#ifdef Pcap`** so the standard installer is byte-for-byte unchanged; only the
+  pcap installer (compiled `iscc /DPcap=1`, a **[main]** step) gets it.
   1. `NpcapInstalled()` — `{sys}\Npcap\wpcap.dll`, legacy `{sys}\wpcap.dll`, and
      the `npcap` service registry key.
-  2. Missing + task selected → `CreateDownloadPage`/`TDownloadWizardPage` fetches
-     `https://npcap.com/dist/npcap-{#NpcapVersion}.exe` (default 1.79, override
-     `/DNpcapVersion=`) at `wpReady`, then `Exec`s it at `ssPostInstall` (Npcap's
-     own UAC handles the driver install). Download failure still installs IRIS.
-  3. **Not bundled**; installer stays per-user/no-admin. Task hidden when Npcap is
-     detected (`Check: not NpcapInstalled`).
+  2. When missing, a `CreateCustomPage` (after Select Tasks, skipped when present
+     via `ShouldSkipPage`) explains Npcap is needed and has an **"Open the Npcap
+     download page"** button → `ShellExec` to `https://npcap.com/#download`. No
+     `DownloadTemporaryFile`, no `Exec` of any downloaded file.
+  3. **Try again:** `NextButtonClick` re-checks; if still missing, a Yes/No prompt
+     lets the user stay on the page to install + re-check, or continue without it.
+  4. Removed the old `[Tasks]` npcap entry and the `NpcapVersion` define. Installer
+     stays per-user/no-admin (Npcap's own installer raises its own UAC).
+- [x] **[branch]** Runtime Windows path (`capture_access.rs`) aligned to the same
+  philosophy: `enable()` checks for Npcap; if present, advises Administrator +
+  relaunch; if missing, opens `npcap.com` in the browser (never downloads) and
+  asks the user to install + relaunch.
 - [ ] **[branch]** ⚠️ *Not compile-tested* — `ISCC` is Windows-only; Pascal
-  reviewed against the Inno 6.1+ API. Flagged for Dani's Windows test.
+  reviewed against the Inno API. Flagged for Dani's Windows test.
 
 ## B. On-main work (`main`) — CI pipeline, do NOT commit on this branch
+
+> **Status (2026-06-20):** B1–B3 are **implemented on branch `pcap-release-pipeline`**
+> (cut off `main`; `release.yml` only, +218 lines). They live there, not on
+> `add-pcap-builds`, per the file-ownership rule. The boxes below stay unchecked in
+> this doc because the doc travels with `add-pcap-builds`; both branches merge to
+> `main` for a full pcap release. Note: the WinPcap link uses `LIBPCAP_LIBDIR`
+> (the crate's `build.rs` honors it), not `LIB`/`rustc-link-search`.
 
 ### B1 — release.yml pcap build variant (Phase 1)
 - [ ] **[main]** Mirror the `lightning` step across every job, adding a 3rd `pcap`
