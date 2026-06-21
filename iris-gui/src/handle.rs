@@ -22,6 +22,9 @@ pub enum Cmd {
     /// Rebind the running NAT's inbound port-forward listeners from this rule
     /// set, live — no reboot. Ignored if not running.
     SetPortForwards(Vec<PortForwardConfig>),
+    /// Reopen the PCAP capture on a different host interface (`None` = auto-pick)
+    /// without rebooting the guest. Ignored if not running / not in PCAP mode.
+    SetPcapInterface(Option<String>),
     SaveState(String),
     RestoreState(String),
     Screenshot(PathBuf),
@@ -413,6 +416,9 @@ fn worker_loop(
             }
             Ok(Cmd::SetPortForwards(rules)) => {
                 if let Some(m) = machine.as_ref() { m.set_port_forwards(rules); }
+            }
+            Ok(Cmd::SetPcapInterface(iface)) => {
+                if let Some(m) = machine.as_ref() { m.set_pcap_interface(iface); }
             }
             Ok(Cmd::Stop) => {
                 if let Some(m) = machine.take() {

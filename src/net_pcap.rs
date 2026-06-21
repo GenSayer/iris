@@ -379,6 +379,25 @@ impl NetBackend for PcapEngine {
             // the flag so it doesn't stay set.
             self.ctl.reset_nat.swap(false, Ordering::AcqRel);
 
+            // Live host-NIC reswap (GUI changed the PCAP interface on a running
+            // machine). Reopen the capture in place; the guest is untouched. If
+            // the new interface fails to open, keep the current one so a typo
+            // doesn't drop networking.
+            if self.ctl.apply_pcap_iface.swap(false, Ordering::AcqRel) {
+                let new_iface = self.ctl.pending_pcap_iface.lock().clone();
+                self.config.pcap_interface = new_iface;
+                match self.open_capture() {
+                    Ok(c) => {
+                        cap = c;
+                        self.ctl.set_pcap_status(PcapStatus::Active);
+                        eprintln!("iris: PCAP capture re-opened on new interface");
+                    }
+                    Err(e) => {
+                        eprintln!("iris: PCAP reopen failed: {}; keeping the previous interface", e);
+                    }
+                }
+            }
+
             // ── TX: guest → host wire ────────────────────────────────────────
             while let Ok(frame) = self.tx_cons.pop() {
                 if frame.len() >= 12 && self.guest_mac.is_none() {

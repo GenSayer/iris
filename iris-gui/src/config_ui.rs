@@ -451,6 +451,10 @@ pub struct NetworkOutcome {
     /// A port-forward rule was added/removed/edited → the app should rebind the
     /// running NAT's forward listeners live.
     pub forwards_changed: bool,
+    /// The PCAP host interface was changed and committed (dropdown pick, or the
+    /// manual field lost focus) → reopen the running PcapEngine's capture on the
+    /// new NIC without a guest reboot.
+    pub iface_changed: bool,
     /// A soft-invalid subnet was just committed → pop the override modal.
     pub prompt: Option<NetSanityPrompt>,
     /// An app-level action requested from the tab (e.g. the PCAP "Refresh"
@@ -491,8 +495,13 @@ fn show_network(
         });
 
         if cfg.network.mode == NetMode::Pcap {
-            if let a @ ConfigAction::RefreshPcapIfaces = pcap_interface_picker(ui, cfg, pcap_ifaces) {
+            let (a, iface_committed) = pcap_interface_picker(ui, cfg, pcap_ifaces);
+            if let ConfigAction::RefreshPcapIfaces = a {
                 out.action = a;
+            }
+            if iface_committed {
+                out.iface_changed = true;
+                out.changed = true;
             }
 
             ui.colored_label(Color32::from_rgb(0xd0, 0xa0, 0x40),
@@ -825,12 +834,17 @@ fn show_network(
 /// Stores the choice by interface *name* in `cfg.network.pcap_interface`
 /// (`None` = auto-pick). Returns `RefreshPcapIfaces` when the user asks to
 /// re-enumerate.
+/// Returns `(action, committed)` — `committed` is true when the interface was
+/// deliberately changed (a dropdown pick, or the manual field losing focus), the
+/// cue to reopen a running PcapEngine's capture. Per-keystroke text edits don't
+/// commit, so typing "bridge100" doesn't thrash through `b`, `br`, …
 fn pcap_interface_picker(
     ui: &mut Ui,
     cfg: &mut MachineConfig,
     pcap_ifaces: &Option<Result<Vec<PcapIface>, String>>,
-) -> ConfigAction {
+) -> (ConfigAction, bool) {
     let mut action = ConfigAction::None;
+    let mut committed = false;
 
     // Selected text for the combo: the current name, "Auto-pick", or the raw
     // value if it's something not in the list (e.g. an index or manual name).
@@ -853,6 +867,7 @@ fn pcap_interface_picker(
                 if ui.selectable_label(is_auto, "Auto-pick (first up, non-loopback)").clicked() {
                     cfg.network.pcap_interface = None;
                     is_auto = true;
+                    committed = true;
                 }
                 let _ = is_auto;
 
@@ -863,6 +878,7 @@ fn pcap_interface_picker(
                             let selected = current.as_deref() == Some(iface.name.as_str());
                             if ui.selectable_label(selected, iface.summary()).clicked() {
                                 cfg.network.pcap_interface = Some(iface.name.clone());
+                                committed = true;
                             }
                         }
                     }
@@ -891,11 +907,16 @@ fn pcap_interface_picker(
     ui.horizontal(|ui| {
         ui.label("   or type index/name");
         let mut manual = current.clone().unwrap_or_default();
-        if ui.add(TextEdit::singleline(&mut manual)
+        let resp = ui.add(TextEdit::singleline(&mut manual)
             .hint_text("e.g. 1, eth0, or blank = auto")
-            .desired_width(260.0)).changed()
-        {
+            .desired_width(260.0));
+        if resp.changed() {
             cfg.network.pcap_interface = if manual.trim().is_empty() { None } else { Some(manual) };
+        }
+        // Commit (reopen the live capture) only when the field loses focus, so a
+        // running reswap doesn't fire on every keystroke.
+        if resp.lost_focus() {
+            committed = true;
         }
     });
 
@@ -904,7 +925,7 @@ fn pcap_interface_picker(
         ui.colored_label(Color32::from_rgb(0xe0, 0x60, 0x60), format!("Interface list unavailable: {e}"));
     }
 
-    action
+    (action, committed)
 }
 
 fn show_vino(ui: &mut Ui, cfg: &mut MachineConfig) -> ConfigAction {

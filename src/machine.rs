@@ -796,6 +796,13 @@ impl Machine {
         self.hpc3.seeq().nat_control().set_port_forwards(rules);
     }
 
+    /// Change the PCAP bridged host interface (`None` = auto-pick) on a running
+    /// machine without rebooting the guest: the PcapEngine reopens its capture on
+    /// the new NIC. No-op in NAT mode.
+    pub fn set_pcap_interface(&self, iface: Option<String>) {
+        self.hpc3.seeq().nat_control().request_pcap_interface(iface);
+    }
+
     /// Step the CPU `n` instructions in-line on the calling thread, with all
     /// peripheral threads stopped so the CPU sees no external interrupts.
     /// Used by Phase 3.3 snapshot determinism validator.

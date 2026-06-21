@@ -1867,6 +1867,18 @@ impl App {
             // takes effect without a restart (latest-wins coalesces in the NAT).
             self.emu.send(Cmd::SetPortForwards(self.cfg.port_forward.clone()));
         }
+        // Live PCAP host-NIC reswap: if the running machine is bridged and the
+        // interface was just committed, reopen the capture on the new NIC — no
+        // guest reboot. Latch the new iface into launched_net so the status badge
+        // reflects it.
+        if out.net.iface_changed
+            && matches!(self.launched_net.as_ref(), Some((iris::config::NetMode::Pcap, _)))
+        {
+            self.emu.send(Cmd::SetPcapInterface(self.cfg.network.pcap_interface.clone()));
+            if let Some((_, iface)) = self.launched_net.as_mut() {
+                *iface = self.cfg.network.pcap_interface.clone();
+            }
+        }
         if let Some(p) = out.net.prompt {
             self.net_sanity_modal = Some(NetSanityModal {
                 reason: p.reason, suggestion: p.suggestion, revert_to: p.revert_to,

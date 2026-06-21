@@ -686,6 +686,12 @@ pub struct NatControl {
     /// GUI to drive the "Enable packet capture" / elevation prompt. `Inactive`
     /// (0) in NAT mode and on non-`pcap` builds.
     pub pcap_status: AtomicU8,
+    /// Pending PCAP host-interface reswap (`None` = auto-pick), latched by
+    /// `request_pcap_interface`. Lets the GUI change the bridged NIC on a running
+    /// machine: the `PcapEngine` reopens its capture on the next loop — no guest
+    /// reboot. Unused in NAT mode.
+    pub pending_pcap_iface: Mutex<Option<String>>,
+    pub apply_pcap_iface:   AtomicBool,
 }
 
 impl NatControl {
@@ -708,7 +714,17 @@ impl NatControl {
             pending_forwards: Mutex::new(None),
             apply_forwards:   AtomicBool::new(false),
             pcap_status:      AtomicU8::new(PcapStatus::Inactive as u8),
+            pending_pcap_iface: Mutex::new(None),
+            apply_pcap_iface:   AtomicBool::new(false),
         })
+    }
+
+    /// Ask the running `PcapEngine` to reopen its capture on host interface
+    /// `iface` (`None` = auto-pick), applied on the engine's next loop. The guest
+    /// keeps running — only the host-side capture handle is swapped. No-op in NAT.
+    pub fn request_pcap_interface(&self, iface: Option<String>) {
+        *self.pending_pcap_iface.lock() = iface;
+        self.apply_pcap_iface.store(true, Ordering::Release);
     }
 
     /// Record the live PCAP backend status (called by the `PcapEngine`).
