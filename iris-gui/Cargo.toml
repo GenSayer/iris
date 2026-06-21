@@ -69,6 +69,10 @@ appstore = ["bundled"]
 # interfaces in a dropdown and the in-process VM can actually bridge onto them.
 # Build with: cargo build -p iris-gui --features pcap
 pcap = ["iris/pcap"]
+# Emulate an R5000 CPU instead of the default R4400 (compile-time: the cache
+# model differs deeply). Surfaced read-only on the Memory tab via
+# iris::build_features::CPU. Build with: cargo build -p iris-gui --features r5k
+r5k = ["iris/r5k"]
 
 [dependencies]
 # Group A (additive) features are always on for iris-gui so the user can
