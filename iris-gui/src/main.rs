@@ -1496,56 +1496,55 @@ impl App {
         if running && !halted {
             ui.label(format!("{:.0} MIPS", self.emu.status.mips));
         }
-        // Internal-network indicator — always shown (grey while unpowered or
-        // halted). Green once the guest is carrying NAT IP traffic; red when a
-        // running guest has produced none (a hint its IP is missing or wrong for
-        // the configured NAT subnet).
-        let (net_color, net_tip) = match self.emu.net_state() {
-            NetState::Active => (
-                Color32::from_rgb(0x35, 0xb8, 0x4a),
-                "Internal network: carrying guest NAT traffic.",
-            ),
-            NetState::Idle => (
-                Color32::from_rgb(0xd9, 0x4a, 0x3d),
-                "Internal network: no NAT traffic yet.\nThe guest may have no IP — or the wrong IP for this NAT subnet.",
-            ),
-            NetState::Off => (
-                Color32::from_gray(0x80),
-                "Internal network: machine not running.",
-            ),
+        // Networking indicator — ONE badge that shows both liveness (the dot's
+        // colour) and the active backend (the label: NAT / PCAP). Grey while
+        // unpowered/halted; green once the guest is carrying IP traffic, red when
+        // a running guest has produced none. Works for both backends — the PCAP
+        // engine counts guest IP frames too. The backend is latched on Start
+        // (launched_net), not the live editor.
+        use iris::config::NetMode;
+        let backend = self.launched_net.clone();
+        let state = self.emu.net_state();
+        let net_color = match state {
+            NetState::Active => Color32::from_rgb(0x35, 0xb8, 0x4a),
+            NetState::Idle => Color32::from_rgb(0xd9, 0x4a, 0x3d),
+            NetState::Off => Color32::from_gray(0x80),
         };
+        let (net_label, net_tip): (&str, String) = match (running, backend.as_ref()) {
+            (true, Some((NetMode::Pcap, iface))) => {
+                let iface = iface.as_deref().filter(|s| !s.is_empty()).unwrap_or("auto");
+                let tip = match state {
+                    NetState::Active => format!("Bridged (PCAP) on {iface}: guest is carrying IP traffic."),
+                    NetState::Idle => format!("Bridged (PCAP) on {iface}: no guest IP traffic yet.\nCheck the guest's IP / DHCP — wired connections only."),
+                    NetState::Off => "Bridged (PCAP) networking: machine not running.".into(),
+                };
+                ("PCAP", tip)
+            }
+            (true, Some((NetMode::Nat, _))) => {
+                let tip = match state {
+                    NetState::Active => "Internal NAT network: carrying guest traffic.".into(),
+                    NetState::Idle => "Internal NAT network: no traffic yet.\nThe guest may have no IP — or the wrong IP for this NAT subnet.".into(),
+                    NetState::Off => "Internal NAT network: machine not running.".into(),
+                };
+                ("NAT", tip)
+            }
+            _ => ("NET", "Internal network: machine not running.".into()),
+        };
+        // "check" diagnoses the guest IP against the NAT subnet — only meaningful
+        // in NAT mode, so it's hidden in PCAP.
+        let nat_running = running && matches!(backend.as_ref(), Some((NetMode::Nat, _)));
         let mut want_check = false;
         ui.horizontal(|ui| {
-            // U+2022 (bullet), sized up as a status light. NOT U+25CF (●),
-            // which renders as tofu — egui's label font chain (Ubuntu-Light →
-            // NotoEmoji → emoji-icon-font) has no filled circle; U+25CF is only
-            // in Hack, which is monospace-only. See rules/gui/egui-…-tofu.md.
-            ui.label(RichText::new("\u{2022}").size(18.0).color(net_color)).on_hover_text(net_tip);
-            ui.label("NET").on_hover_text(net_tip);
-            if running && ui.small_button("check").on_hover_text("Diagnose guest networking").clicked() {
+            // U+2022 (bullet) as a status light. NOT U+25CF (●), which renders as
+            // tofu in egui's font chain. See rules/gui/egui-…-tofu.md.
+            ui.label(RichText::new("\u{2022}").size(18.0).color(net_color)).on_hover_text(net_tip.as_str());
+            ui.label(net_label).on_hover_text(net_tip.as_str());
+            if nat_running && ui.small_button("check").on_hover_text("Diagnose guest networking").clicked() {
                 want_check = true;
             }
         });
         if want_check {
             self.show_net_check = true;
-        }
-        if running {
-            // Surface the active networking backend so PCAP vs NAT is verifiable
-            // at a glance. Reflects the config the running machine was started
-            // with (latched on Start), not the live editor.
-            match self.launched_net.as_ref() {
-                Some((iris::config::NetMode::Pcap, iface)) => {
-                    let iface = iface.as_deref().filter(|s| !s.is_empty()).unwrap_or("auto");
-                    ui.label(RichText::new(format!("net: PCAP → {iface}"))
-                        .color(Color32::from_rgb(120, 180, 220)))
-                        .on_hover_text("Bridged onto a host interface. See the console for \
-                                        'bridging onto interface …' / 'backend disabled …'.");
-                }
-                Some((iris::config::NetMode::Nat, _)) => {
-                    ui.label(RichText::new("net: NAT").color(Color32::LIGHT_GRAY));
-                }
-                None => {}
-            }
         }
         if running && self.fb_scale > 0.0 {
             // How magnified the emulated display currently is (1× = native).

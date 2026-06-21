@@ -39,7 +39,7 @@ use parking_lot::{Condvar, Mutex};
 
 use crate::config::NetMode;
 use crate::devlog::LogModule;
-use crate::net::{eth_summary, mac_str, GatewayConfig, NatControl, NetBackend, PcapStatus};
+use crate::net::{eth_summary, mac_str, GatewayConfig, NatControl, NetBackend, NfsVirtualHost, PcapStatus};
 
 /// Summary of one host interface, returned by `list_interfaces()`.
 pub struct NetInterface {
@@ -295,6 +295,11 @@ pub struct PcapEngine {
     /// Guest MAC, learned from the first outbound frame. Used to filter our own
     /// injected frames back out of the capture stream.
     guest_mac: Option<[u8; 6]>,
+    /// In-process NFS server presented as its own virtual L2 host on the bridged
+    /// LAN. `Some` when an NFS share is configured and `[network] nfs_pcap_ip` is
+    /// set; the guest's ARP/portmap/NFS frames to that IP are answered locally
+    /// instead of going to the wire.
+    nfs_host: Option<NfsVirtualHost>,
 }
 
 impl PcapEngine {
@@ -305,7 +310,16 @@ impl PcapEngine {
                tx_wake: Arc<(Mutex<()>, Condvar)>,
                running: Arc<AtomicBool>,
                ctl:     Arc<NatControl>) -> Self {
-        Self { config, tx_cons, rx_prod, rx_wake, tx_wake, running, ctl, guest_mac: None }
+        // Stand up the virtual NFS host when an export and a virtual IP are both
+        // configured — otherwise bridged frames just go to the wire.
+        let nfs_host = match (config.nfs.clone(), config.nfs_pcap_ip) {
+            (Some(nfs_cfg), Some(ip)) => {
+                eprintln!("iris: PCAP NFS server on virtual host {} exporting {}", ip, nfs_cfg.shared_dir);
+                Some(NfsVirtualHost::new(ip, nfs_cfg))
+            }
+            _ => None,
+        };
+        Self { config, tx_cons, rx_prod, rx_wake, tx_wake, running, ctl, guest_mac: None, nfs_host }
     }
 
     /// Open the configured (or auto-selected) capture handle in promiscuous,
@@ -378,6 +392,19 @@ impl NetBackend for PcapEngine {
                 // semantics — it's "the guest is actually carrying IP traffic".
                 if frame.len() >= 14 && frame[12] == 0x08 && frame[13] == 0x00 {
                     self.ctl.guest_frames.fetch_add(1, Ordering::Relaxed);
+                }
+                // Intercept frames bound for the virtual NFS host (ARP / portmap /
+                // NFS / mountd): answer them locally and inject the reply on the RX
+                // ring, rather than leaking them onto the real LAN.
+                if let Some(host) = self.nfs_host.as_mut() {
+                    if let Some(replies) = host.maybe_handle(&frame) {
+                        for reply in replies {
+                            if self.rx_prod.slots() > 0 && self.rx_prod.push(reply).is_ok() {
+                                self.rx_wake.1.notify_one();
+                            }
+                        }
+                        continue;
+                    }
                 }
                 if self.ctl.dbg_tcp() {
                     dlog_dev!(LogModule::Net, "PCAP TX {}", eth_summary(&frame));

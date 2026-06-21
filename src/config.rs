@@ -131,6 +131,9 @@ pub struct NetworkConfig {
     /// Host interface name to bridge onto when `mode == Pcap`. None = auto-pick
     /// the first non-loopback interface that libpcap reports as up/running.
     pub pcap_interface: Option<String>,
+    /// PCAP-only virtual IP for the in-process NFS server (so a bridged guest can
+    /// mount it). None = NFS-in-PCAP not configured.
+    pub nfs_pcap_ip: Option<std::net::Ipv4Addr>,
 }
 
 /// `[network]` section: backend selection and PCAP options.
@@ -498,6 +501,7 @@ impl MachineConfig {
             nat_subnet,
             mode:         self.network.mode,
             pcap_interface: self.network.pcap_interface.clone(),
+            nfs_pcap_ip:  self.network.nfs_pcap_ip,
         }
     }
 
