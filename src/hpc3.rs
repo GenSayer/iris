@@ -1013,14 +1013,14 @@ pub struct Hpc3 {
 
 impl Hpc3 {
     pub fn new(eeprom: Arc<Mutex<Eeprom93c56>>, ioc: Ioc, guinness: bool, heartbeat: Arc<AtomicU64>, cpu_cycles: Arc<AtomicU64>) -> Self {
-        Self::with_net(eeprom, ioc, guinness, heartbeat, NetworkConfig::default(), false, "nvram.bin".to_string(), cpu_cycles)
+        Self::with_net(eeprom, ioc, guinness, heartbeat, NetworkConfig::default(), false, "nvram.bin".to_string(), cpu_cycles, true)
     }
 
     /// `no_audio` skips HAL2 audio init (used by `--noaudio` and also by full
     /// `--headless`, which can't run audio in CI).
     /// `nvram_path` is the on-disk NVRAM file (loaded at startup, default save
     /// target for `iris-ci rtc-save`).
-    pub fn with_net(eeprom: Arc<Mutex<Eeprom93c56>>, ioc: Ioc, guinness: bool, heartbeat: Arc<AtomicU64>, net: NetworkConfig, no_audio: bool, nvram_path: String, cpu_cycles: Arc<AtomicU64>) -> Self {
+    pub fn with_net(eeprom: Arc<Mutex<Eeprom93c56>>, ioc: Ioc, guinness: bool, heartbeat: Arc<AtomicU64>, net: NetworkConfig, no_audio: bool, nvram_path: String, cpu_cycles: Arc<AtomicU64>, scsi_deferred_int: bool) -> Self {
         let nfs = net.nfs;
         let port_forwards = net.port_forward;
         let subnet = net.nat_subnet.unwrap_or_default();
@@ -1109,7 +1109,7 @@ impl Hpc3 {
             pdma_paired: Some((pdma_channels[8].clone(), HPC3_INTSTAT_SCSI0_DMA)),
         });
 
-        let scsi_dev = Arc::new(Wd33c93a::new(Some(scsi0_dma), Some(scsi0_irq), heartbeat.clone(), cpu_cycles));
+        let scsi_dev = Arc::new(Wd33c93a::new_with_config(Some(scsi0_dma), Some(scsi0_irq), heartbeat.clone(), cpu_cycles, scsi_deferred_int));
         let _ = scsi_wd_lock.set(scsi_dev.clone());
 
         let hal2 = if no_audio { None } else { Some(Arc::new(Hal2::new(dma_clients[0..8].to_vec()))) };

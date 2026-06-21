@@ -255,15 +255,15 @@ struct Wd33c93aState {
     // interrupt line low. This allows SELECT_ATN to push 0x11 then 0x8E as two
     // separate interrupts, matching real hardware behaviour.
     irq_fifo: VecDeque<(u8, Option<u8>, bool)>, // (status, phase, deferred) — deferred=true: worker drops lock before delivery
-    // ASR state-transition FIFO. Each entry is (value, is_bubble).
-    // Bubble entries are immutable (deferred INT=0 reads for BSD's poll loop).
-    // Normal entries are mutated in place by update_asr. Collapsed on COMMAND write.
-    asr_fifo: VecDeque<(u8, bool)>,
     callback: Option<Arc<dyn ScsiCallback>>,
     // Debug tracking: last values returned for register reads
     last_read_asr: Option<u8>,
     last_read_reg: Option<(u8, u8)>, // (register, value)
     last_cmd: u8,                    // last command written to COMMAND register
+    /// When true, STATUS_IN interrupts are deferred: CIP cleared early, then
+    /// INT asserted after a 1000-cycle spin so wd33c93_loop can exit first.
+    /// Required for OpenBSD/NetBSD. Toggleable via `scsi defer on/off`.
+    deferred_int: Arc<AtomicBool>,
 }
 
 pub trait ScsiCallback: Send + Sync {
@@ -282,10 +282,18 @@ pub struct Wd33c93a {
     heartbeat: Arc<AtomicU64>,
     /// CPU cycle counter — used to pace interrupt delivery without wall-clock sleeping.
     cpu_cycles: Arc<AtomicU64>,
+    /// Defer SCSI status interrupts: clear CIP, spin 1000 cycles, then assert INT.
+    /// Required for OpenBSD/NetBSD so wd33c93_loop exits before INT fires.
+    deferred_int: Arc<AtomicBool>,
 }
 
 impl Wd33c93a {
     pub fn new(dma: Option<Arc<dyn DmaClient>>, callback: Option<Arc<dyn ScsiCallback>>, heartbeat: Arc<AtomicU64>, cpu_cycles: Arc<AtomicU64>) -> Self {
+        Self::new_with_config(dma, callback, heartbeat, cpu_cycles, true)
+    }
+
+    pub fn new_with_config(dma: Option<Arc<dyn DmaClient>>, callback: Option<Arc<dyn ScsiCallback>>, heartbeat: Arc<AtomicU64>, cpu_cycles: Arc<AtomicU64>, deferred_int: bool) -> Self {
+        let deferred_int_arc = Arc::new(AtomicBool::new(deferred_int));
         Self {
             state: Arc::new(Mutex::new(Wd33c93aState {
                 regs: [0; 32],
@@ -304,11 +312,11 @@ impl Wd33c93a {
                 xfer_offset: 0,
                 xfer_direction_in: false,
                 irq_fifo: VecDeque::new(),
-                asr_fifo: VecDeque::new(),
                 callback,
                 last_read_asr: None,
                 last_read_reg: None,
                 last_cmd: 0,
+                deferred_int: deferred_int_arc.clone(),
             })),
             cond: Arc::new(Condvar::new()),
             thread: Mutex::new(None),
@@ -316,6 +324,7 @@ impl Wd33c93a {
             dma,
             heartbeat,
             cpu_cycles,
+            deferred_int: deferred_int_arc,
         }
     }
 
@@ -793,11 +802,11 @@ impl Wd33c93a {
 */                    
             }
 
-            wdt!("R REG[{:02x}] -> {:02x} (phase={:02x} stat={:02x} asr_after={:02x})",
+            wdt!("R REG[{:02x}] -> {:02x} (phase={:02x} stat={:02x} asr={:02x})",
                 ar, val,
                 state.regs[regs::COMMAND_PHASE as usize],
                 state.regs[regs::SCSI_STATUS as usize],
-                state.asr_front());
+                state.asr);
 
             // Auto-increment for registers except COMMAND (0x18), DATA (0x19), AUX_STATUS (0x1F)
             if ar != regs::COMMAND && ar != regs::AUX_STATUS_DIRECT {
@@ -903,7 +912,7 @@ impl Wd33c93a {
 
             if ar == regs::COMMAND {
                 // New command cycle: clear stale state from previous cycle.
-                state.collapse_asr_fifo();
+                state.clear_interrupt();
                 state.irq_fifo.clear();
                 state.last_cmd = val;
                 state.update_asr(0, asr::CIP);
@@ -998,16 +1007,19 @@ impl Device for Wd33c93a {
                 // and fires the interrupt line via set_asr when the front changes.
                 if !state_guard.irq_fifo.is_empty() {
                     let deferred = state_guard.irq_fifo.front().map(|e| e.2).unwrap_or(false);
-                    if deferred {
+                    if deferred && state_guard.deferred_int.load(Ordering::Relaxed) {
                         // Clear CIP now so WAIT_CIP exits with INT=0, then spin 10000 cycles
                         // before asserting INT — giving wd33c93_loop time to exit via
                         // GET_SBIC_asr seeing INT=0 before we deliver the interrupt.
                         state_guard.update_asr(asr::CIP | asr::DBR, 0);
+                        let deferred_int = state_guard.deferred_int.clone();
                         let start = cpu_cycles.load(Ordering::Relaxed);
                         drop(state_guard);
                         loop {
                             let now = cpu_cycles.load(Ordering::Relaxed);
                             if now.wrapping_sub(start) >= 10000 { break; }
+                            // Re-check: if disabled at runtime, exit spin early
+                            if !deferred_int.load(Ordering::Relaxed) { break; }
                         }
                         state_guard = state.lock();
                     }
@@ -1021,7 +1033,7 @@ impl Device for Wd33c93a {
 
     fn register_commands(&self) -> Vec<(String, String)> {
         vec![
-            ("scsi".to_string(), "SCSI: scsi regs | scsi status | scsi wdt [N] | scsi wdt file <path> | scsi eject <id> | scsi add <id> <path> | scsi list <id> | scsi del <id> <ord> | scsi next <id> <ord> | scsi debug <on|off> [DEV]".to_string()),
+            ("scsi".to_string(), "SCSI: scsi regs | scsi status | scsi wdt [N] | scsi wdt file <path> | scsi eject <id> | scsi add <id> <path> | scsi list <id> | scsi del <id> <ord> | scsi next <id> <ord> | scsi debug <on|off> [DEV] | scsi defer <on|off>".to_string()),
             ("cow".to_string(), "COW overlay: cow status | cow commit [id] | cow reset [id]".to_string()),
         ]
     }
@@ -1123,6 +1135,16 @@ impl Device for Wd33c93a {
                     };
                     if val { devlog().enable(LogModule::Scsi); } else { devlog().disable(LogModule::Scsi); }
                     writeln!(writer, "SCSI debug {}", if val { "enabled" } else { "disabled" }).unwrap();
+                    return Ok(());
+                }
+                Some("defer") => {
+                    let val = match args.get(1).copied() {
+                        Some("on")  => true,
+                        Some("off") => false,
+                        _ => return Err("Usage: scsi defer <on|off>".to_string()),
+                    };
+                    self.deferred_int.store(val, Ordering::Relaxed);
+                    writeln!(writer, "SCSI deferred interrupts {}", if val { "enabled" } else { "disabled" }).unwrap();
                     return Ok(());
                 }
                 Some("status") => {
@@ -1285,7 +1307,6 @@ impl Resettable for Wd33c93a {
         // Mirrors process_wd_command(cmd::RESET, ...) logic.
         state.fifo.clear();
         state.irq_fifo.clear();
-        state.asr_fifo.clear();
         state.xfer_data.clear();
         state.xfer_offset = 0;
         state.regs[regs::COMMAND_PHASE as usize] = command_phase::DISCONNECTED;
@@ -1335,7 +1356,6 @@ impl Saveable for Wd33c93a {
         if let Some(x) = get_field(v, "advanced_mode")    { if let Some(b) = toml_bool(x) { state.advanced_mode = b; } }
         // Transient state cleared on load.
         state.fifo.clear();
-        state.asr_fifo.clear();
         state.xfer_data.clear();
         state.xfer_offset = 0;
         state.pending_command = None;
@@ -1351,10 +1371,6 @@ impl Wd33c93aState {
         mode != 0
     }
 
-    fn asr_front(&self) -> u8 {
-        self.asr_fifo.front().map(|e| e.0).unwrap_or(self.asr)
-    }
-
     fn read_asr(&mut self) -> u8 {
         let val = self.asr;
         if self.last_read_asr.is_none() || self.last_read_asr.unwrap() != val {
@@ -1362,44 +1378,20 @@ impl Wd33c93aState {
             self.last_read_asr = Some(val);
         }
         self.last_read_reg = None;
-        wdt!("R ASR -> {:02x} (phase={:02x} stat={:02x}) next_asr={:02x}",
+        wdt!("R ASR -> {:02x} (phase={:02x} stat={:02x})",
             val,
             self.regs[regs::COMMAND_PHASE as usize],
-            self.regs[regs::SCSI_STATUS as usize],
-            self.asr);
-        if let Some((v, _)) = self.asr_fifo.pop_front() {
-            self.set_asr(v);
-        }
+            self.regs[regs::SCSI_STATUS as usize]);
         val
     }
 
-    // Apply a bit-clear/bit-set transition to ASR.
-    // If fifo is empty: apply immediately via set_asr (fires interrupt line if INT changes).
-    // If the tail is a bubble (immutable): clone its value, push a new mutable entry.
-    // Otherwise: mutate the tail entry in place.
+    // Apply a bit-clear/bit-set transition to ASR, firing the interrupt line if INT changes.
     fn update_asr(&mut self, clear: u8, set: u8) {
-        if self.asr_fifo.is_empty() {
-            let val = (self.asr & !clear) | set;
-            self.set_asr(val);
-            return;
-        }
-        if self.asr_fifo.back().unwrap().1 {
-            let cloned = *self.asr_fifo.back().unwrap();
-            self.asr_fifo.push_back((cloned.0, false));
-        }
-        let tail = self.asr_fifo.back_mut().unwrap();
-        tail.0 = (tail.0 & !clear) | set;
+        let val = (self.asr & !clear) | set;
+        self.set_asr(val);
     }
 
-    // Insert two bubble entries: immutable ASR reads with CIP=0/INT=0 so BSD's
-    // synchronous poll loop exits before the interrupt handler sees INT=1.
-    fn push_bubble(&mut self) {
-        let base = self.asr_fifo.back().map(|e| e.0).unwrap_or(self.asr);
-        let bubble = base & !(asr::CIP | asr::DBR | asr::INT);
-        self.asr_fifo.push_back((bubble, true));
-    }
-
-    // Write self.asr directly and fire the interrupt line if INT changed.
+    // Write self.asr and fire the interrupt line if INT changed.
     fn set_asr(&mut self, val: u8) {
         let old_int = self.asr & asr::INT;
         self.asr = val;
@@ -1411,14 +1403,10 @@ impl Wd33c93aState {
         }
     }
 
-    // Drain all pending ASR transitions into self.asr and clear the fifo.
-    // Called on COMMAND write: the new command cycle always starts with INT/DBR/LCI
-    // cleared regardless of prior state — driver writing a command implicitly
-    // acknowledges any pending interrupt.
-    fn collapse_asr_fifo(&mut self) {
-        let val = self.asr_fifo.back().map(|e| e.0).unwrap_or(self.asr);
-        self.asr_fifo.clear();
-        self.set_asr(val & !(asr::INT | asr::DBR | asr::LCI));
+    // Called on COMMAND write and ABORT: clear INT/DBR/LCI to start a new command cycle.
+    // Driver writing a command implicitly acknowledges any pending interrupt.
+    fn clear_interrupt(&mut self) {
+        self.update_asr(asr::INT | asr::DBR | asr::LCI, 0);
     }
 
     /// Compute DBR (Data Buffer Ready) bit based on COMMAND_PHASE register
@@ -1432,20 +1420,11 @@ impl Wd33c93aState {
                 self.regs[regs::COMMAND_PHASE as usize] = phase;
             }
             self.regs[regs::SCSI_STATUS as usize] = status;
-            // if deferred {
-            //     // Clear CIP/DBR first (fifo empty here), then push bubble so
-            //     // BSD's WAIT_CIP exit read sees INT=0, then set INT in tail.
-            //     self.update_asr(asr::CIP | asr::DBR, 0);
-            //     self.push_bubble();
-            //     self.update_asr(0, asr::INT);
-            // } else {
-            //     self.update_asr(asr::CIP | asr::DBR, asr::INT);
-            // }
-            // Deferred: worker drops lock and spins 1000 CPU cycles before calling update_irq,
-            // giving CPU thread time to exit wd33c93_loop before INT is asserted.
+            // Deferred: worker clears CIP and spins 10000 CPU cycles before calling
+            // update_irq, giving wd33c93_loop time to exit before INT fires.
             self.update_asr(asr::CIP | asr::DBR, asr::INT);
-            wdt!("QUEUE_IRQ phase={:02x} stat={:02x} asr_front={:02x} deferred={} (fifo_remaining={})",
-                self.regs[regs::COMMAND_PHASE as usize], status, self.asr_front(), deferred, self.irq_fifo.len());
+            wdt!("QUEUE_IRQ phase={:02x} stat={:02x} deferred={} (fifo_remaining={})",
+                self.regs[regs::COMMAND_PHASE as usize], status, deferred, self.irq_fifo.len());
             true
         } else {
             self.update_asr(asr::INT, 0);
@@ -1509,7 +1488,6 @@ impl Wd33c93aState {
         if cmd == cmd::RESET {
             self.fifo.clear();
             self.irq_fifo.clear();
-            self.asr_fifo.clear();
             self.regs[regs::COMMAND_PHASE as usize] = command_phase::DISCONNECTED;
             self.set_asr(asr::INT);
             self.target_id = 0;
@@ -1611,7 +1589,7 @@ impl Wd33c93aState {
             cmd::ABORT => {
                 self.fifo.clear();
                 self.irq_fifo.clear();
-                self.collapse_asr_fifo();
+                self.clear_interrupt();
                 self.xfer_data.clear();
                 self.xfer_offset = 0;
                 self.update_asr(asr::CIP | asr::BSY, 0);
@@ -1977,11 +1955,8 @@ impl Wd33c93aState {
             // calls xferdone() which then issues SELECT_ATN_XFER(cmd_phase=0x46) → our conclude.
             wdt!("STATUS_IN tgt={} status={:02x} phase={:02x}", self.target_id, self.pending_status, self.regs[regs::COMMAND_PHASE as usize]);
             self.regs[regs::TARGET_LUN as usize] = self.pending_status;
-            // Deferred (bubble) only when wd33c93_loop is still running inside wd33c93_go.
-            // COMMAND_START (0x30): no data, STATUS_IN fires immediately while loop is mid-flight
-            // → bubble suppresses GET_SBIC_asr so loop exits before nextstate(0x1b) is called.
-            // IDENTIFY_SENT (0x20): CDB sent via PIO, loop already exited before STATUS_IN fires
-            // → non-deferred; bubble would be eaten by wd33c93_poll's SBIC_WAIT → sd0 timeout.
+            // deferred=true: worker clears CIP and spins 10000 cycles before asserting INT,
+            // giving wd33c93_loop time to exit before STATUS_IN fires.
             self.queue_interrupt_ex(Some(command_phase::RECEIVE_STATUS), scsi_status::TRANSFER_STATUS_IN, true);
         }
     }

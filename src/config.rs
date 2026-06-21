@@ -339,7 +339,14 @@ pub struct MachineConfig {
     /// Networking backend selection (`[network]` section). Defaults to NAT.
     #[serde(default)]
     pub network: NetworkSection,
+
+    /// Defer SCSI status interrupts so wd33c93_loop exits before INT fires.
+    /// Required for OpenBSD/NetBSD; disable if observing spurious SCSI timeouts.
+    #[serde(default = "default_scsi_deferred_int")]
+    pub scsi_deferred_int: bool,
 }
+
+fn default_scsi_deferred_int() -> bool { true }
 
 fn default_ci_socket() -> String { "/tmp/iris.sock".to_string() }
 fn default_scroll_pixels_per_line() -> f64 { 40.0 }
@@ -402,6 +409,7 @@ impl Default for MachineConfig {
             network: NetworkSection::default(),
             mouse_scroll_pixels_per_line: default_scroll_pixels_per_line(),
             lock_aspect_ratio: default_lock_aspect_ratio(),
+            scsi_deferred_int: default_scsi_deferred_int(),
         }
     }
 }
@@ -605,6 +613,10 @@ pub struct Cli {
     #[arg(long = "list-net-interfaces", default_value_t = false)]
     pub list_net_interfaces: bool,
 
+    /// Disable deferred SCSI status interrupts (default: enabled for OpenBSD/NetBSD compatibility).
+    #[arg(long = "no-scsi-deferred-int", default_value_t = false)]
+    pub no_scsi_deferred_int: bool,
+
     /// Enable GDB stub on the given TCP port (e.g. --gdb-port 1234).
     /// Connect with: target remote localhost:<port>
     #[arg(long = "gdb-port", value_name = "PORT")]
@@ -670,6 +682,7 @@ impl Cli {
         if self.headless  { cfg.headless  = true; }
         if self.no_audio  { cfg.no_audio  = true; }
 
+        if self.no_scsi_deferred_int { cfg.scsi_deferred_int = false; }
         if self.ci         { cfg.ci         = true; }
         if let Some(p) = &self.ci_socket { cfg.ci_socket = p.clone(); }
         if self.ci_display { cfg.ci_display = true; }
