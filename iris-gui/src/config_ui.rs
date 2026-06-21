@@ -247,6 +247,19 @@ fn show_general(ui: &mut Ui, cfg: &mut MachineConfig) -> ConfigAction {
 }
 
 fn show_memory(ui: &mut Ui, cfg: &mut MachineConfig) {
+    ui.heading("Processor");
+    Grid::new("cpu_grid").num_columns(2).striped(true).show(ui, |ui| {
+        ui.label("CPU");
+        ui.label(RichText::new(build_features::CPU).strong());
+        ui.end_row();
+    });
+    ui.label(RichText::new(
+        "The CPU is fixed at build time — the R4400 and R5000 differ in their cache \
+         architecture, so it can't be switched at runtime. To use a different CPU, \
+         download that build.")
+        .weak());
+    ui.separator();
+
     ui.heading("Memory");
     ui.label("RAM bank sizes in MB (valid: 0, 8, 16, 32, 64, 128)");
     Grid::new("mem_grid").num_columns(2).striped(true).show(ui, |ui| {
