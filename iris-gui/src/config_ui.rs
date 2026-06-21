@@ -496,10 +496,10 @@ fn show_network(
             }
 
             ui.colored_label(Color32::from_rgb(0xd0, 0xa0, 0x40),
-                "PCAP mode bridges onto a real interface. NAT, port forwards, and NFS \
-                 below are ignored; the guest uses your real LAN. Requires elevated \
-                 privileges (root/CAP_NET_RAW on Unix, or a WinPcap-compatible driver \
-                 + Administrator on Windows).");
+                "PCAP mode bridges onto a real interface — the guest joins your real LAN \
+                 directly. The NAT gateway and port forwards don't apply here and are \
+                 hidden below. Requires elevated privileges (root/CAP_NET_RAW on Unix, or \
+                 a WinPcap-compatible driver + Administrator on Windows).");
 
             // Explicit, OS-specific way to grant capture permission up front (the
             // other trigger is automatic: the app pops the same prompt if a
@@ -519,6 +519,11 @@ fn show_network(
         }
     }
 
+    // The NAT subnet settings and port forwards only apply to the software
+    // gateway. In PCAP bridged mode the guest is directly on your real LAN, so
+    // they're meaningless — hide the whole block. (The NFS share further below
+    // works in both modes.)
+    if cfg.network.mode != NetMode::Pcap {
     ui.label(RichText::new(
         "IRIS gives the Indy its own private NAT network, the same trick your home router uses. \
          The Indy reaches the internet through IRIS, but nothing on your real network can see it. \
@@ -730,6 +735,7 @@ fn show_network(
          guest services (log in, copy files, and so on). Inbound only, and it works once the guest is \
          up on the NAT subnet. None exist by default.")
         .weak());
+    } // end: NAT-only section (hidden in PCAP mode)
 
     ui.separator();
     ui.strong("NFS share");
@@ -791,9 +797,21 @@ fn show_network(
             }
         }
 
-        // Live mount command — gateway fills in to match the subnet. The export
-        // is the single root, so the path is just "/".
-        let gw = assess.derived.as_ref().map(|d| d.gateway.to_string()).unwrap_or_else(|| "192.168.0.1".into());
+        // Live mount command — the server IP fills in to match the backend. The
+        // export is the single root, so the path is just "/". NAT: the gateway IP
+        // of the configured subnet. PCAP: the in-process NFS server's own virtual
+        // LAN IP (the guest is bridged, so there's no NAT gateway to mount from).
+        let gw = if cfg.network.mode == NetMode::Pcap {
+            cfg.network.nfs_pcap_ip
+                .map(|ip| ip.to_string())
+                .unwrap_or_else(|| "<NFS IP>".into())
+        } else {
+            let (b, p) = netplan::parse_cidr(cfg.nat_subnet.as_deref());
+            netplan::classify(b, p, host)
+                .derived
+                .map(|d| d.gateway.to_string())
+                .unwrap_or_else(|| "192.168.0.1".into())
+        };
         ui.label(RichText::new("Pick a folder, boot the Indy, then mount it:").weak());
         ui.code(format!("mkdir /shared\nmount {gw}:/ /shared"));
         ui.label(RichText::new("Your files then appear at /shared on the Indy.").weak());

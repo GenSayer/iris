@@ -144,6 +144,12 @@ pub struct NetworkSection {
     /// Run `iris --list-net-interfaces` to enumerate candidates.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pcap_interface: Option<String>,
+    /// PCAP-only: the virtual LAN IP the in-process NFS server answers on, so a
+    /// bridged guest (which is directly on your real LAN, with no NAT gateway to
+    /// reach) can mount it. None = NFS-in-PCAP not configured. NAT mode ignores
+    /// this and serves NFS at the gateway IP instead.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub nfs_pcap_ip: Option<std::net::Ipv4Addr>,
 }
 
 /// Where VINO's video-in capture should come from.

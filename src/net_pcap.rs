@@ -372,6 +372,13 @@ impl NetBackend for PcapEngine {
                     self.guest_mac = Some(mac);
                     dlog_dev!(LogModule::Net, "PCAP learned guest MAC {}", mac_str(&mac));
                 }
+                // Count guest-originated IPv4 frames so the GUI's NET indicator
+                // lights in PCAP mode too (the NAT engine isn't running to bump
+                // this). ARP / link-layer chatter is excluded, matching NAT's
+                // semantics — it's "the guest is actually carrying IP traffic".
+                if frame.len() >= 14 && frame[12] == 0x08 && frame[13] == 0x00 {
+                    self.ctl.guest_frames.fetch_add(1, Ordering::Relaxed);
+                }
                 if self.ctl.dbg_tcp() {
                     dlog_dev!(LogModule::Net, "PCAP TX {}", eth_summary(&frame));
                 }
@@ -442,6 +449,52 @@ fn classify_open_error(msg: &str) -> PcapStatus {
     }
 }
 
+/// Ordered candidate IPv4 addresses for the in-PCAP NFS server's virtual host on
+/// a bridged subnet `network`/`prefix`. The GUI pings these in order and pre-fills
+/// the first that doesn't answer; the [`PcapEngine`] ARP-probes similarly.
+///
+/// `.213` sits at offset 212 of a /24's 254 usable hosts (~83.5% up the range —
+/// the "85% range"); that ratio is scaled to this subnet for the start, the scan
+/// runs upward, and it never exceeds the 95% mark of the usable host range. The
+/// network/broadcast addresses and any `reserved` ones (host IP, gateway, guest
+/// IP, …) are excluded. At most 16 candidates are returned ("a few to ping").
+pub fn nfs_ip_candidates(
+    network: std::net::Ipv4Addr,
+    prefix: u8,
+    reserved: &[std::net::Ipv4Addr],
+) -> Vec<std::net::Ipv4Addr> {
+    use std::collections::HashSet;
+    use std::net::Ipv4Addr;
+    const MAX_CANDIDATES: usize = 16;
+    // /31 and /32 (and the degenerate /0) have no usable host band to pick from.
+    if prefix == 0 || prefix >= 31 {
+        return Vec::new();
+    }
+    let host_bits = 32 - prefix as u32;
+    let net = u32::from(network) & (u32::MAX << host_bits); // normalize to network addr
+    let size = 1u32 << host_bits;
+    let usable = size - 2;
+    let first = net + 1;
+    let broadcast = net + size - 1;
+    let start_off = (usable as u64 * 212 / 254) as u32; // /24 → 212 → .213
+    let cap_off = (usable as u64 * 95 / 100) as u32; // 95% of the usable range
+    let reserved_set: HashSet<u32> = reserved
+        .iter()
+        .map(|a| u32::from(*a))
+        .chain([net, broadcast])
+        .collect();
+    let mut out = Vec::new();
+    let mut off = start_off;
+    while off <= cap_off && out.len() < MAX_CANDIDATES {
+        let Some(addr) = first.checked_add(off) else { break };
+        if addr < broadcast && !reserved_set.contains(&addr) {
+            out.push(Ipv4Addr::from(addr));
+        }
+        off += 1;
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -508,6 +561,43 @@ mod tests {
     fn auto_pick_errors_when_only_loopback() {
         let ifaces = vec![iface("lo", true, true, true, true)];
         assert!(resolve_interface(None, &ifaces).is_err());
+    }
+
+    #[test]
+    fn nfs_candidates_24_default_starts_at_213() {
+        let c = nfs_ip_candidates(Ipv4Addr::new(192, 168, 1, 0), 24, &[]);
+        assert_eq!(c[0], Ipv4Addr::new(192, 168, 1, 213), "default for /24 is .213");
+        assert_eq!(c[1], Ipv4Addr::new(192, 168, 1, 214), "scans upward, contiguous");
+        assert!(c.len() <= 16, "returns at most a few candidates");
+        assert!(c.iter().all(|a| *a <= Ipv4Addr::new(192, 168, 1, 242)),
+                "never above the 95% cap (.242 on a /24)");
+    }
+
+    #[test]
+    fn nfs_candidates_skip_reserved() {
+        let res = [Ipv4Addr::new(192, 168, 1, 213), Ipv4Addr::new(192, 168, 1, 214)];
+        let c = nfs_ip_candidates(Ipv4Addr::new(192, 168, 1, 0), 24, &res);
+        assert_eq!(c[0], Ipv4Addr::new(192, 168, 1, 215), "first free after reserved");
+    }
+
+    #[test]
+    fn nfs_candidates_respect_95pct_cap() {
+        // Reserve the whole band below .242 → only .242 remains, and .243+ are
+        // never offered (the 95% hard cap).
+        let res: Vec<_> = (213u8..=241).map(|h| Ipv4Addr::new(192, 168, 1, h)).collect();
+        let c = nfs_ip_candidates(Ipv4Addr::new(192, 168, 1, 0), 24, &res);
+        assert_eq!(c, vec![Ipv4Addr::new(192, 168, 1, 242)]);
+    }
+
+    #[test]
+    fn nfs_candidates_normalize_and_edge_prefixes() {
+        // Host bits in `network` are ignored (normalized to the network address).
+        let c = nfs_ip_candidates(Ipv4Addr::new(10, 0, 0, 77), 24, &[]);
+        assert_eq!(c[0], Ipv4Addr::new(10, 0, 0, 213));
+        // /31, /32, /0 have no usable host band.
+        assert!(nfs_ip_candidates(Ipv4Addr::new(10, 0, 0, 0), 31, &[]).is_empty());
+        assert!(nfs_ip_candidates(Ipv4Addr::new(10, 0, 0, 0), 32, &[]).is_empty());
+        assert!(nfs_ip_candidates(Ipv4Addr::new(10, 0, 0, 0), 0, &[]).is_empty());
     }
 
     #[test]
