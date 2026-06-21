@@ -734,11 +734,16 @@ impl App {
         }
     }
 
-    /// App Store preflight: attached CHD disks (non-scratch HDDs) whose folder
-    /// we can't write, so their on-exit `.diff.chd` fold would be denied. Empty
-    /// off the sandbox build, where folders are reachable directly.
+    /// macOS preflight: attached CHD disks (non-scratch HDDs) whose folder we
+    /// can't write, so their on-exit `.diff.chd` fold would be denied. Runs on
+    /// ALL macOS builds: the sandbox (MAS) build needs an explicit directory
+    /// security-scoped grant, while the notarized build is subject to macOS TCC
+    /// (Documents/Desktop/Downloads/iCloud/external/network volumes are blocked
+    /// until the user consents). Either way we probe real writability and prompt
+    /// up front, so the fold doesn't silently fail at quit. Empty off macOS,
+    /// where there's no such gate and folders are writable directly.
     fn chd_dirs_needing_grant(&self) -> Vec<ChdNeedsGrant> {
-        if !cfg!(feature = "appstore") {
+        if !cfg!(target_os = "macos") {
             return Vec::new();
         }
         let mut out = Vec::new();
@@ -2928,7 +2933,10 @@ impl eframe::App for App {
         // CHD folder-grant modal (App Store): attached CHDs sit in folders we
         // can't write, so their on-exit fold would be denied. Offer to grant
         // each folder, or start anyway and forgo compaction.
-        enum ChdGrantChoice { None, Cancel, StartAnyway, Grant(String) }
+        // `Grant` is built only in the sandbox branch, `OpenPrivacy`/`Recheck`
+        // only in the notarized branch — so one set is always cfg-dead.
+        #[allow(dead_code)]
+        enum ChdGrantChoice { None, Cancel, StartAnyway, Grant(String), OpenPrivacy, Recheck }
         let mut chd_choice = ChdGrantChoice::None;
         if let Some(modal) = &self.chd_grant_modal {
             egui::Window::new("Grant folder access to compact disks")
@@ -2953,16 +2961,40 @@ impl eframe::App for App {
                          put each disk image in its own dedicated folder and grant only that.")
                         .italics().weak());
                     ui.add_space(6.0);
-                    ui.label(RichText::new("Grant the containing folder so IRIS can compact it on exit:").weak());
-                    // One button per distinct folder — a recursive grant covers
-                    // every disk under it.
-                    let mut dirs: Vec<&str> = modal.disks.iter().map(|d| d.dir.as_str()).collect();
-                    dirs.sort_unstable();
-                    dirs.dedup();
-                    for dir in dirs {
-                        if ui.button(format!("Grant \"{dir}\"…")).clicked() {
-                            chd_choice = ChdGrantChoice::Grant(dir.to_string());
+                    // Sandbox (MAS): a directory security-scoped grant via the
+                    // open panel conveys write access. One button per distinct
+                    // folder — a recursive grant covers every disk under it.
+                    #[cfg(feature = "appstore")]
+                    {
+                        ui.label(RichText::new("Grant the containing folder so IRIS can compact it on exit:").weak());
+                        let mut dirs: Vec<&str> = modal.disks.iter().map(|d| d.dir.as_str()).collect();
+                        dirs.sort_unstable();
+                        dirs.dedup();
+                        for dir in dirs {
+                            if ui.button(format!("Grant \"{dir}\"…")).clicked() {
+                                chd_choice = ChdGrantChoice::Grant(dir.to_string());
+                            }
                         }
+                    }
+                    // Notarized macOS: the block is macOS Privacy (TCC), which a
+                    // folder pick doesn't override — the user allows IRIS in
+                    // System Settings, then re-checks (a relaunch may be needed
+                    // for Full Disk Access to take effect).
+                    #[cfg(not(feature = "appstore"))]
+                    {
+                        ui.label(RichText::new(
+                            "macOS Privacy & Security is blocking write access to these folders. \
+                             Allow IRIS under System Settings → Privacy & Security (Files and Folders, \
+                             or add it to Full Disk Access), then Re-check. You may need to quit and \
+                             reopen IRIS for Full Disk Access to take effect.").weak());
+                        ui.horizontal(|ui| {
+                            if ui.button("Open Privacy & Security…").clicked() {
+                                chd_choice = ChdGrantChoice::OpenPrivacy;
+                            }
+                            if ui.button("Re-check").clicked() {
+                                chd_choice = ChdGrantChoice::Recheck;
+                            }
+                        });
                     }
                     ui.add_space(4.0);
                     ui.horizontal(|ui| {
@@ -2987,6 +3019,27 @@ impl eframe::App for App {
                 self.grant_disk_folder_at(Some(&dir));
                 // Re-probe: drop disks whose folder is now writable. When all are
                 // satisfied, dismiss and start; otherwise leave the rest listed.
+                if let Some(modal) = &mut self.chd_grant_modal {
+                    modal.disks.retain(|d| !dir_writable(std::path::Path::new(&d.dir)));
+                    if modal.disks.is_empty() {
+                        self.chd_grant_modal = None;
+                        self.start_emulator();
+                    }
+                }
+            }
+            ChdGrantChoice::OpenPrivacy => {
+                // Open System Settings → Privacy & Security → Full Disk Access so
+                // the user can add IRIS (the "+"). No-op off macOS.
+                #[cfg(target_os = "macos")]
+                {
+                    let _ = std::process::Command::new("open")
+                        .arg("x-apple.systempreferences:com.apple.preference.security?Privacy_AllFiles")
+                        .spawn();
+                }
+            }
+            ChdGrantChoice::Recheck => {
+                // Re-probe each listed folder; drop the ones now writable (the
+                // user allowed IRIS in System Settings). Mirrors the Grant path.
                 if let Some(modal) = &mut self.chd_grant_modal {
                     modal.disks.retain(|d| !dir_writable(std::path::Path::new(&d.dir)));
                     if modal.disks.is_empty() {
