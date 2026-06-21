@@ -699,6 +699,13 @@ fn show_network(
             add = Some(PortForwardConfig { proto: ForwardProto::Tcp, host_port: 2121, guest_port: 21, bind: ForwardBind::Localhost });
             ui.close_menu();
         }
+        if ui.add_enabled(!has_port(177), egui::Button::new("XDMCP (host 11177 to guest 177, UDP)"))
+            .on_hover_text("Remote X login: an X server XDMCP-queries the guest's xdm. Binds all interfaces (LAN X servers OK). Stock X servers use UDP 177 — redirect 177→11177 on the X-server host, or use a chooser that accepts host:port.")
+            .clicked()
+        {
+            add = Some(PortForwardConfig { proto: ForwardProto::Udp, host_port: 11177, guest_port: 177, bind: ForwardBind::Any });
+            ui.close_menu();
+        }
         if ui.button("Custom (empty row)").clicked() {
             add = Some(PortForwardConfig { proto: ForwardProto::Tcp, host_port: 0, guest_port: 0, bind: ForwardBind::Localhost });
             ui.close_menu();

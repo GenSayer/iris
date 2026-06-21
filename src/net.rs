@@ -32,6 +32,8 @@ const UDP_PORT_DNS:          u16 = 53;
 const UDP_PORT_PORTMAP:      u16 = 111;
 const UDP_PORT_TIME:         u16 = 37;
 const UDP_PORT_NTP:          u16 = 123;
+const XDMCP_GUEST_PORT:      u16 = 177;  // XDMCP control channel inside the guest
+const X11_BASE_PORT:         u16 = 6000; // X11 display N's TCP port = 6000 + N
 const TCP_PORT_TIME:         u16 = 37;
 const BOOTP_OP_REQUEST: u8      = 1;
 
@@ -762,6 +764,11 @@ pub struct NatEngine {
     // Inbound IP-fragment reassembly buffers, keyed by (src_ip, ip_id, proto).
     // NFS writes arrive fragmented when wsize > MTU.
     frag_reasm: HashMap<(u32, u16, u8), FragReasm>,
+    // XDMCP reverse-proxy ALG: active X11 session targets, keyed by the X11 TCP
+    // port (6000 + display). nfs_remap_dst relays guest→gateway:(that port) to the
+    // real X server recorded here instead of the generic loopback. Populated by
+    // the XDMCP UDP-forward hook in poll_udp_fwd_listeners.
+    xdmcp_sessions: HashMap<u16, Ipv4Addr>,
 }
 
 /// Reassembly state for one fragmented inbound IP datagram.
@@ -853,7 +860,8 @@ impl NatEngine {
                icmp_nat: HashMap::new(), icmp_unavailable: false, deferred_rx: Vec::new(),
                tcp_fwd_listeners, udp_fwd_listeners, fwd_static_count,
                tcp_fwd_pending: HashMap::new(), fwd_ephemeral_next: 49152,
-               guest_mac: None, ip_id: 1, nfs, frag_reasm: HashMap::new() }
+               guest_mac: None, ip_id: 1, nfs, frag_reasm: HashMap::new(),
+               xdmcp_sessions: HashMap::new() }
     }
 
     /// Rebind the static port-forward listeners from a new rule set, live (no
@@ -887,6 +895,7 @@ impl NatEngine {
                 self.udp_nat.clear();  // drops all UdpSockets
                 self.icmp_nat.clear(); // drops all ICMP raw sockets
                 self.tcp_fwd_pending.clear();
+                self.xdmcp_sessions.clear();
                 self.tcp_fwd_listeners.truncate(self.fwd_static_count); // drop transient FTP data forwards
                 self.ctl.routed.store(false, Ordering::Relaxed); // re-arm plug-and-play adoption
             }
@@ -1537,6 +1546,11 @@ impl NatEngine {
     // through here — it's served in-process by the NAT before this point.)
     fn nfs_remap_dst(&self, dst_ip: Ipv4Addr, dport: u16) -> (Ipv4Addr, u16) {
         if dst_ip != self.config.gateway_ip { return (dst_ip, dport); }
+        // XDMCP X11 session: the guest's xdm dials gateway:(6000+display); relay
+        // it to the real X server the XDMCP ALG recorded for that display.
+        if let Some(&xserver) = self.xdmcp_sessions.get(&dport) {
+            return (xserver, dport);
+        }
         // Generic outbound: guest→gateway becomes guest→host loopback on
         // the same port. Lets the guest reach any service the host is
         // running on 127.0.0.1:<dport> (pyftpdlib on 2121, python -m
@@ -1547,6 +1561,11 @@ impl NatEngine {
     // Reverse: translate (127.0.0.1, host_port) back to the address the guest
     // dialed, so replies look like they came from the gateway.
     fn nfs_unmap_src(&self, src_ip: Ipv4Addr, sport: u16) -> (Ipv4Addr, u16) {
+        // XDMCP X11 session reply: traffic from the real X server is presented to
+        // the guest as coming from the gateway it dialed.
+        if let Some(&xserver) = self.xdmcp_sessions.get(&sport) {
+            if src_ip == xserver { return (self.config.gateway_ip, sport); }
+        }
         if src_ip != Ipv4Addr::LOCALHOST { return (src_ip, sport); }
         // Generic outbound: reply from host-side dport becomes gateway:dport
         // to the guest.
@@ -2152,6 +2171,23 @@ impl NatEngine {
             let guest_ip = self.ctl.observed_guest_ip().unwrap_or(self.config.client_ip);
             let gw_ip    = self.config.gateway_ip;
             let gw_mac   = self.config.gateway_mac;
+            // XDMCP ALG: on the control forward (→ guest:177), rewrite a Request's
+            // connection-addresses to the gateway so the guest's xdm opens the X11
+            // session at gateway:(6000+display) — which nfs_remap_dst then relays
+            // to the real X server. Record display→X-server (the datagram source).
+            let data = if guest_port == XDMCP_GUEST_PORT {
+                match (crate::xdmcp::rewrite_request_ipv4(&data, gw_ip), from.ip()) {
+                    (Some(rw), IpAddr::V4(xserver)) => {
+                        let x11_port = X11_BASE_PORT.wrapping_add(rw.display_number);
+                        self.xdmcp_sessions.insert(x11_port, xserver);
+                        dlog_dev!(LogModule::Net, "XDMCP Request: display {} → relay gateway:{} to X server {}", rw.display_number, x11_port, xserver);
+                        rw.packet
+                    }
+                    _ => data,
+                }
+            } else {
+                data
+            };
             // Inject as UDP: src=gateway_ip:host_port dst=guest_ip:guest_port
             let udp = udp_packet(gw_ip, guest_ip, host_port, guest_port, &data);
             let id = self.ip_id; self.ip_id = self.ip_id.wrapping_add(1);
