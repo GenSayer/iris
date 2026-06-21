@@ -1,5 +1,7 @@
-; Inno Setup script for IRIS (Windows, per-user install).
-; Produces a per-user Setup.exe that installs into %LocalAppData% — no admin required.
+; Inno Setup script for IRIS (Windows).
+; Defaults to a per-user install into %LocalAppData% (no admin required), but the
+; user can choose "install for all users" (elevates to admin), which installs
+; into C:\Program Files\IRIS — the {auto*} constants follow whichever they pick.
 ;
 ; Build:
 ;   iscc /DMyAppVersion=2025-06-09-02-00 /DSourceDir=path\to\build /DAssetsDir=path\to\icons installer\iris-gui.iss
@@ -40,7 +42,12 @@ AppUpdatesURL={#MyAppURL}/releases
 LicenseFile={#LicenseFile}
 PrivilegesRequired=lowest
 PrivilegesRequiredOverridesAllowed=dialog
-DefaultDirName={localappdata}\Programs\IRIS
+; Use the "auto" Program Files constant so the destination follows the install
+; mode the user picks via PrivilegesRequiredOverridesAllowed: an all-users
+; (elevated) install lands in C:\Program Files\IRIS, a per-user install in
+; %LocalAppData%\Programs\IRIS. A literal {localappdata} would force the per-user
+; folder even when the user chose "install for all users".
+DefaultDirName={autopf}\{#MyAppName}
 DisableProgramGroupPage=yes
 DefaultGroupName={#MyAppName}
 DisableDirPage=no
@@ -66,7 +73,7 @@ Source: "{#LicenseFile}"; DestDir: "{app}"; DestName: "LICENSE.txt"; Flags: igno
 [Icons]
 Name: "{group}\{#MyAppName}"; Filename: "{app}\{#MyAppExeName}"
 Name: "{group}\Uninstall {#MyAppName}"; Filename: "{uninstallexe}"
-Name: "{userdesktop}\{#MyAppName}"; Filename: "{app}\{#MyAppExeName}"; Tasks: desktopicon
+Name: "{autodesktop}\{#MyAppName}"; Filename: "{app}\{#MyAppExeName}"; Tasks: desktopicon
 
 [Run]
 Filename: "{app}\{#MyAppExeName}"; Description: "Launch {#MyAppName}"; Flags: nowait postinstall skipifsilent
