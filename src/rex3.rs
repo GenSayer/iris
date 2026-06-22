@@ -3625,6 +3625,10 @@ impl Rex3 {
                 thread::sleep(frame_duration - elapsed);
             }
         }
+
+        if let Some(renderer) = self.renderer.lock().as_mut() {
+            renderer.stop();
+        }
     }
 
     /// Returns `true` if the register offset was recognized and updated state.
@@ -3897,10 +3901,6 @@ impl Device for Rex3 {
         #[cfg(feature = "developer")]
         eprintln!("REX3: GFIFO high-watermark = {} / {} entries",
             self.gfifo_hwm.load(Ordering::Relaxed), GFIFO_DEPTH);
-
-        if let Some(renderer) = self.renderer.lock().as_mut() {
-            renderer.stop();
-        }
     }
 
     fn start(&self) {
