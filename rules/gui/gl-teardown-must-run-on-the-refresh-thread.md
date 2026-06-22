@@ -3,7 +3,7 @@
 **Keywords:** opengl,gl,glow,glutin,glDeleteTextures,thread,context,make_current,refresh,poweroff,shutdown,crash,segfault,compositor,destroy,rex3,renderer
 **Category:** gui
 
-# All OpenGL calls — including teardown — belong to the thread that owns the context
+## All OpenGL calls — including teardown — belong to the thread that owns the context
 
 The GL context is created and made current lazily by `GlRenderer::init_gl`, which
 runs from `present()` — and `present()` is only ever called from `Rex3::refresh_loop`
