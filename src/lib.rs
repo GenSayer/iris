@@ -45,6 +45,7 @@ pub mod locks;
 pub mod pit8254;
 pub mod net;
 pub mod nfsudp;
+pub mod xdmcp;
 #[cfg(feature = "pcap")]
 pub mod net_pcap;
 pub mod seeq8003;
