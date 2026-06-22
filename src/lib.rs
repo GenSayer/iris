@@ -13,6 +13,19 @@ pub mod build_features {
     /// from the MIPS executor hot path. Interactive debugging (GDB stub,
     /// monitor breakpoints) is non-functional in this build.
     pub const LIGHTNING: bool = cfg!(feature = "lightning");
+    /// The emulated CPU, fixed at build time (the cache model differs deeply
+    /// between the R4400 and R5000, so it's a compile-time choice, not a runtime
+    /// setting). `r5k` selects the R5000; `r5ksc`/`r5ksc_triton` add a secondary
+    /// cache. The GUI surfaces this read-only on the Memory tab.
+    pub const CPU: &str = if cfg!(feature = "r5ksc_triton") {
+        "MIPS R5000 (Triton on-die L2)"
+    } else if cfg!(all(feature = "r5k", feature = "r5ksc")) {
+        "MIPS R5000 (external L2)"
+    } else if cfg!(feature = "r5k") {
+        "MIPS R5000"
+    } else {
+        "MIPS R4400"
+    };
 }
 
 pub mod config;

@@ -165,6 +165,10 @@ pub enum ConfigAction {
     /// User clicked "Refresh" on the Network tab's PCAP selector; the app should
     /// re-enumerate host interfaces and update its cache.
     RefreshPcapIfaces,
+    /// User clicked "Enable packet capture…" in the Network tab's PCAP section;
+    /// the app should run the platform's privilege flow (Linux setcap/pkexec,
+    /// macOS ChmodBPF install, Windows driver check) via `capture_access`.
+    EnablePacketCapture,
 }
 
 /// Everything a config tab hands back to the app for one frame.
@@ -243,6 +247,19 @@ fn show_general(ui: &mut Ui, cfg: &mut MachineConfig) -> ConfigAction {
 }
 
 fn show_memory(ui: &mut Ui, cfg: &mut MachineConfig) {
+    ui.heading("Processor");
+    Grid::new("cpu_grid").num_columns(2).striped(true).show(ui, |ui| {
+        ui.label("CPU");
+        ui.label(RichText::new(build_features::CPU).strong());
+        ui.end_row();
+    });
+    ui.label(RichText::new(
+        "The CPU is fixed at build time — the R4400 and R5000 differ in their cache \
+         architecture, so it can't be switched at runtime. To use a different CPU, \
+         download that build.")
+        .weak());
+    ui.separator();
+
     ui.heading("Memory");
     ui.label("RAM bank sizes in MB (valid: 0, 8, 16, 32, 64, 128)");
     Grid::new("mem_grid").num_columns(2).striped(true).show(ui, |ui| {
@@ -447,6 +464,10 @@ pub struct NetworkOutcome {
     /// A port-forward rule was added/removed/edited → the app should rebind the
     /// running NAT's forward listeners live.
     pub forwards_changed: bool,
+    /// The PCAP host interface was changed and committed (dropdown pick, or the
+    /// manual field lost focus) → reopen the running PcapEngine's capture on the
+    /// new NIC without a guest reboot.
+    pub iface_changed: bool,
     /// A soft-invalid subnet was just committed → pop the override modal.
     pub prompt: Option<NetSanityPrompt>,
     /// An app-level action requested from the tab (e.g. the PCAP "Refresh"
@@ -487,19 +508,44 @@ fn show_network(
         });
 
         if cfg.network.mode == NetMode::Pcap {
-            if let a @ ConfigAction::RefreshPcapIfaces = pcap_interface_picker(ui, cfg, pcap_ifaces) {
+            let (a, iface_committed) = pcap_interface_picker(ui, cfg, pcap_ifaces);
+            if let ConfigAction::RefreshPcapIfaces = a {
                 out.action = a;
+            }
+            if iface_committed {
+                out.iface_changed = true;
+                out.changed = true;
             }
 
             ui.colored_label(Color32::from_rgb(0xd0, 0xa0, 0x40),
-                "PCAP mode bridges onto a real interface. NAT, port forwards, and NFS \
-                 below are ignored; the guest uses your real LAN. Requires elevated \
-                 privileges (root/CAP_NET_RAW on Unix, or a WinPcap-compatible driver \
-                 + Administrator on Windows).");
+                "PCAP mode bridges onto a real interface — the guest joins your real LAN \
+                 directly. The NAT gateway and port forwards don't apply here and are \
+                 hidden below. Requires elevated privileges (root/CAP_NET_RAW on Unix, or \
+                 a WinPcap-compatible driver + Administrator on Windows).");
+
+            // Explicit, OS-specific way to grant capture permission up front (the
+            // other trigger is automatic: the app pops the same prompt if a
+            // pcap-mode machine hits a permission error on Start). The hint text
+            // and the action are platform-specific — see `capture_access`.
+            ui.horizontal(|ui| {
+                if ui.button("Enable packet capture…")
+                    .on_hover_text("Grant IRIS permission to capture on a real interface. \
+                                    A one-time admin/root step per the note below.")
+                    .clicked()
+                {
+                    out.action = ConfigAction::EnablePacketCapture;
+                }
+                ui.label(RichText::new(crate::capture_access::permission_hint()).weak());
+            });
             ui.separator();
         }
     }
 
+    // The NAT subnet settings and port forwards only apply to the software
+    // gateway. In PCAP bridged mode the guest is directly on your real LAN, so
+    // they're meaningless — hide the whole block. (The NFS share further below
+    // works in both modes.)
+    if cfg.network.mode != NetMode::Pcap {
     ui.label(RichText::new(
         "IRIS gives the Indy its own private NAT network, the same trick your home router uses. \
          The Indy reaches the internet through IRIS, but nothing on your real network can see it. \
@@ -718,6 +764,7 @@ fn show_network(
          guest services (log in, copy files, and so on). Inbound only, and it works once the guest is \
          up on the NAT subnet. None exist by default.")
         .weak());
+    } // end: NAT-only section (hidden in PCAP mode)
 
     ui.separator();
     ui.strong("NFS share");
@@ -732,6 +779,13 @@ fn show_network(
             Some(NfsConfig { shared_dir: String::new(), version: NfsVersion::Auto })
         } else { None };
         out.changed = true;
+    }
+    // PCAP mode: the in-core NFS server is presented as its own virtual L2 host
+    // on the bridged LAN (see `NfsVirtualHost`), so it needs its own IP on the
+    // guest's subnet. NAT mode mounts from the gateway and doesn't use this. The
+    // change takes effect on the next Start (the virtual host is built then).
+    if cfg.nfs.is_some() && cfg.network.mode == NetMode::Pcap {
+        out.changed |= pcap_nfs_ip_row(ui, cfg, host);
     }
     if let Some(nfs) = cfg.nfs.as_mut() {
         Grid::new("nfs_grid").num_columns(2).striped(true).show(ui, |ui| {
@@ -779,9 +833,21 @@ fn show_network(
             }
         }
 
-        // Live mount command — gateway fills in to match the subnet. The export
-        // is the single root, so the path is just "/".
-        let gw = assess.derived.as_ref().map(|d| d.gateway.to_string()).unwrap_or_else(|| "192.168.0.1".into());
+        // Live mount command — the server IP fills in to match the backend. The
+        // export is the single root, so the path is just "/". NAT: the gateway IP
+        // of the configured subnet. PCAP: the in-process NFS server's own virtual
+        // LAN IP (the guest is bridged, so there's no NAT gateway to mount from).
+        let gw = if cfg.network.mode == NetMode::Pcap {
+            cfg.network.nfs_pcap_ip
+                .map(|ip| ip.to_string())
+                .unwrap_or_else(|| "<NFS IP>".into())
+        } else {
+            let (b, p) = netplan::parse_cidr(cfg.nat_subnet.as_deref());
+            netplan::classify(b, p, host)
+                .derived
+                .map(|d| d.gateway.to_string())
+                .unwrap_or_else(|| "192.168.0.1".into())
+        };
         ui.label(RichText::new("Pick a folder, boot the Indy, then mount it:").weak());
         ui.code(format!("mkdir /shared\nmount {gw}:/ /shared"));
         ui.label(RichText::new("Your files then appear at /shared on the Indy.").weak());
@@ -790,17 +856,92 @@ fn show_network(
     out
 }
 
+/// PCAP mode: edit the virtual NFS host's IPv4 address (`cfg.network.nfs_pcap_ip`).
+/// The server answers ARP + portmap/NFS/mountd UDP for this single address on the
+/// bridged LAN, so it only needs an IP on the guest's subnet — no netmask or
+/// gateway (it never routes). Returns true if the value changed this frame.
+fn pcap_nfs_ip_row(ui: &mut Ui, cfg: &mut MachineConfig, host: &[crate::netplan::HostIface]) -> bool {
+    #[cfg(not(feature = "pcap"))]
+    let _ = host;
+
+    let buf_id  = ui.make_persistent_id("nfs_pcap_ip_buf");
+    let last_id = ui.make_persistent_id("nfs_pcap_ip_last");
+
+    let cur = cfg.network.nfs_pcap_ip.map(|i| i.to_string()).unwrap_or_default();
+    let mut text: String = ui.data_mut(|d| d.get_temp::<String>(buf_id)).unwrap_or_else(|| cur.clone());
+    // Re-sync the buffer if the stored IP changed outside this code (machine switch).
+    let last: String = ui.data_mut(|d| d.get_temp::<String>(last_id)).unwrap_or_default();
+    if cur != last {
+        text = cur.clone();
+    }
+
+    let mut changed = false;
+    ui.horizontal(|ui| {
+        ui.label("NFS server IP");
+        let resp = ui.add(TextEdit::singleline(&mut text)
+            .hint_text("e.g. 192.168.1.213").desired_width(130.0));
+        if resp.changed() {
+            cfg.network.nfs_pcap_ip = text.trim().parse::<std::net::Ipv4Addr>().ok();
+            changed = true;
+        }
+        // One-click suggestion: a free address high in the host LAN's host range.
+        #[cfg(feature = "pcap")]
+        if let Some(ip) = suggest_nfs_ip(cfg, host) {
+            if ui.button(format!("Use {ip}"))
+                .on_hover_text("A free address on your LAN's subnet")
+                .clicked()
+            {
+                text = ip.to_string();
+                cfg.network.nfs_pcap_ip = Some(ip);
+                changed = true;
+            }
+        }
+    });
+    ui.label(RichText::new(
+        "Give the NFS server a free address on the same subnet your Indy uses (your real LAN). \
+         Then on the Indy: mount it from this IP. No gateway needed — it's reachable directly.")
+        .weak());
+
+    ui.data_mut(|d| {
+        d.insert_temp(buf_id, text);
+        d.insert_temp(last_id, cfg.network.nfs_pcap_ip.map(|i| i.to_string()).unwrap_or_default());
+    });
+    changed
+}
+
+/// Suggest a free IPv4 for the PCAP NFS host: take the subnet of the selected
+/// capture interface (else the first host interface), reserve the host's own
+/// addresses, and pick the first [`nfs_ip_candidates`] entry.
+///
+/// [`nfs_ip_candidates`]: iris::net_pcap::nfs_ip_candidates
+#[cfg(feature = "pcap")]
+fn suggest_nfs_ip(cfg: &MachineConfig, host: &[crate::netplan::HostIface]) -> Option<std::net::Ipv4Addr> {
+    let want = cfg.network.pcap_interface.as_deref().filter(|s| !s.is_empty());
+    let iface = want
+        .and_then(|n| host.iter().find(|h| h.name == n))
+        .or_else(|| host.first())?;
+    let reserved: Vec<_> = host.iter().map(|h| h.addr).collect();
+    iris::net_pcap::nfs_ip_candidates(iface.network, iface.prefix, &reserved)
+        .into_iter()
+        .next()
+}
+
 /// PCAP interface picker: a dropdown of enumerated host interfaces (with an
 /// "Auto-pick" entry and a "Manual…" escape hatch), plus a Refresh button.
 /// Stores the choice by interface *name* in `cfg.network.pcap_interface`
 /// (`None` = auto-pick). Returns `RefreshPcapIfaces` when the user asks to
 /// re-enumerate.
+/// Returns `(action, committed)` — `committed` is true when the interface was
+/// deliberately changed (a dropdown pick, or the manual field losing focus), the
+/// cue to reopen a running PcapEngine's capture. Per-keystroke text edits don't
+/// commit, so typing "bridge100" doesn't thrash through `b`, `br`, …
 fn pcap_interface_picker(
     ui: &mut Ui,
     cfg: &mut MachineConfig,
     pcap_ifaces: &Option<Result<Vec<PcapIface>, String>>,
-) -> ConfigAction {
+) -> (ConfigAction, bool) {
     let mut action = ConfigAction::None;
+    let mut committed = false;
 
     // Selected text for the combo: the current name, "Auto-pick", or the raw
     // value if it's something not in the list (e.g. an index or manual name).
@@ -823,6 +964,7 @@ fn pcap_interface_picker(
                 if ui.selectable_label(is_auto, "Auto-pick (first up, non-loopback)").clicked() {
                     cfg.network.pcap_interface = None;
                     is_auto = true;
+                    committed = true;
                 }
                 let _ = is_auto;
 
@@ -833,6 +975,7 @@ fn pcap_interface_picker(
                             let selected = current.as_deref() == Some(iface.name.as_str());
                             if ui.selectable_label(selected, iface.summary()).clicked() {
                                 cfg.network.pcap_interface = Some(iface.name.clone());
+                                committed = true;
                             }
                         }
                     }
@@ -861,11 +1004,16 @@ fn pcap_interface_picker(
     ui.horizontal(|ui| {
         ui.label("   or type index/name");
         let mut manual = current.clone().unwrap_or_default();
-        if ui.add(TextEdit::singleline(&mut manual)
+        let resp = ui.add(TextEdit::singleline(&mut manual)
             .hint_text("e.g. 1, eth0, or blank = auto")
-            .desired_width(260.0)).changed()
-        {
+            .desired_width(260.0));
+        if resp.changed() {
             cfg.network.pcap_interface = if manual.trim().is_empty() { None } else { Some(manual) };
+        }
+        // Commit (reopen the live capture) only when the field loses focus, so a
+        // running reswap doesn't fire on every keystroke.
+        if resp.lost_focus() {
+            committed = true;
         }
     });
 
@@ -874,7 +1022,7 @@ fn pcap_interface_picker(
         ui.colored_label(Color32::from_rgb(0xe0, 0x60, 0x60), format!("Interface list unavailable: {e}"));
     }
 
-    action
+    (action, committed)
 }
 
 fn show_vino(ui: &mut Ui, cfg: &mut MachineConfig) -> ConfigAction {

@@ -768,6 +768,14 @@ impl Machine {
         self.hpc3.seeq().nat_control().observed_gateway()
     }
 
+    /// Live status of the PCAP bridged-capture backend. `Inactive` unless this is
+    /// a `--features pcap` build whose active machine uses `mode = "pcap"`; goes
+    /// `PermissionDenied` when the raw capture can't be opened for lack of
+    /// privilege, which the GUI turns into an "Enable packet capture" prompt.
+    pub fn net_pcap_status(&self) -> crate::net::PcapStatus {
+        self.hpc3.seeq().nat_control().pcap_status()
+    }
+
     /// Move the running NAT onto a new subnet without a reboot: the NAT thread
     /// swaps its `(gateway, client, netmask)` and flushes connection state on
     /// its next loop. Typically gateway = network+1, client = network+2.
@@ -786,6 +794,13 @@ impl Machine {
     /// the NAT thread rebinds its host listeners on its next loop.
     pub fn set_port_forwards(&self, rules: Vec<crate::config::PortForwardConfig>) {
         self.hpc3.seeq().nat_control().set_port_forwards(rules);
+    }
+
+    /// Change the PCAP bridged host interface (`None` = auto-pick) on a running
+    /// machine without rebooting the guest: the PcapEngine reopens its capture on
+    /// the new NIC. No-op in NAT mode.
+    pub fn set_pcap_interface(&self, iface: Option<String>) {
+        self.hpc3.seeq().nat_control().request_pcap_interface(iface);
     }
 
     /// Step the CPU `n` instructions in-line on the calling thread, with all

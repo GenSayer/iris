@@ -39,7 +39,7 @@ use parking_lot::{Condvar, Mutex};
 
 use crate::config::NetMode;
 use crate::devlog::LogModule;
-use crate::net::{eth_summary, mac_str, GatewayConfig, NatControl, NetBackend};
+use crate::net::{eth_summary, mac_str, GatewayConfig, NatControl, NetBackend, NfsVirtualHost, PcapStatus};
 
 /// Summary of one host interface, returned by `list_interfaces()`.
 pub struct NetInterface {
@@ -295,6 +295,11 @@ pub struct PcapEngine {
     /// Guest MAC, learned from the first outbound frame. Used to filter our own
     /// injected frames back out of the capture stream.
     guest_mac: Option<[u8; 6]>,
+    /// In-process NFS server presented as its own virtual L2 host on the bridged
+    /// LAN. `Some` when an NFS share is configured and `[network] nfs_pcap_ip` is
+    /// set; the guest's ARP/portmap/NFS frames to that IP are answered locally
+    /// instead of going to the wire.
+    nfs_host: Option<NfsVirtualHost>,
 }
 
 impl PcapEngine {
@@ -305,7 +310,16 @@ impl PcapEngine {
                tx_wake: Arc<(Mutex<()>, Condvar)>,
                running: Arc<AtomicBool>,
                ctl:     Arc<NatControl>) -> Self {
-        Self { config, tx_cons, rx_prod, rx_wake, tx_wake, running, ctl, guest_mac: None }
+        // Stand up the virtual NFS host when an export and a virtual IP are both
+        // configured — otherwise bridged frames just go to the wire.
+        let nfs_host = match (config.nfs.clone(), config.nfs_pcap_ip) {
+            (Some(nfs_cfg), Some(ip)) => {
+                eprintln!("iris: PCAP NFS server on virtual host {} exporting {}", ip, nfs_cfg.shared_dir);
+                Some(NfsVirtualHost::new(ip, nfs_cfg))
+            }
+            _ => None,
+        };
+        Self { config, tx_cons, rx_prod, rx_wake, tx_wake, running, ctl, guest_mac: None, nfs_host }
     }
 
     /// Open the configured (or auto-selected) capture handle in promiscuous,
@@ -328,8 +342,16 @@ impl PcapEngine {
 impl NetBackend for PcapEngine {
     fn run(&mut self) {
         let mut cap = match self.open_capture() {
-            Ok(c) => c,
+            Ok(c) => {
+                // Capture is live — let the GUI light "capturing" and dismiss any
+                // earlier permission prompt.
+                self.ctl.set_pcap_status(PcapStatus::Active);
+                c
+            }
             Err(e) => {
+                // Classify the failure so the GUI can offer to elevate (permission)
+                // vs. just report a bad/absent device. See `classify_open_error`.
+                self.ctl.set_pcap_status(classify_open_error(&e));
                 eprintln!("iris: PCAP backend disabled: {}", e);
                 eprintln!("iris: the guest will have NO networking. Use `[network] mode = \"nat\"` for the software gateway.");
                 // Drain TX so the guest's ring doesn't back up, but produce no RX.
@@ -357,12 +379,63 @@ impl NetBackend for PcapEngine {
             // the flag so it doesn't stay set.
             self.ctl.reset_nat.swap(false, Ordering::AcqRel);
 
+            // Live host-NIC reswap (GUI changed the PCAP interface on a running
+            // machine). Reopen the capture in place; the guest is untouched. If
+            // the new interface fails to open, keep the current one so a typo
+            // doesn't drop networking.
+            if self.ctl.apply_pcap_iface.swap(false, Ordering::AcqRel) {
+                let new_iface = self.ctl.pending_pcap_iface.lock().clone();
+                self.config.pcap_interface = new_iface;
+                match self.open_capture() {
+                    Ok(c) => {
+                        cap = c;
+                        self.ctl.set_pcap_status(PcapStatus::Active);
+                        eprintln!("iris: PCAP capture re-opened on new interface");
+                    }
+                    Err(e) => {
+                        eprintln!("iris: PCAP reopen failed: {}; keeping the previous interface", e);
+                    }
+                }
+            }
+
             // ── TX: guest → host wire ────────────────────────────────────────
             while let Ok(frame) = self.tx_cons.pop() {
                 if frame.len() >= 12 && self.guest_mac.is_none() {
                     let mac: [u8; 6] = frame[6..12].try_into().unwrap();
                     self.guest_mac = Some(mac);
                     dlog_dev!(LogModule::Net, "PCAP learned guest MAC {}", mac_str(&mac));
+                    // Now that the guest's MAC is known, push a kernel BPF filter so
+                    // promiscuous capture only delivers frames the guest can accept
+                    // (its own unicast + broadcast + multicast) rather than the whole
+                    // LAN's unicast chatter, which would otherwise flood the RX ring.
+                    // (Our own injected broadcasts still come back and are dropped by
+                    // the src==guest_mac check below.)
+                    let prog = format!("ether dst {m} or ether broadcast or ether multicast", m = mac_str(&mac));
+                    if let Err(e) = cap.filter(&prog, true) {
+                        dlog_dev!(LogModule::Net, "PCAP set capture filter failed: {}", e);
+                    } else {
+                        dlog_dev!(LogModule::Net, "PCAP capture filter set: {}", prog);
+                    }
+                }
+                // Count guest-originated IPv4 frames so the GUI's NET indicator
+                // lights in PCAP mode too (the NAT engine isn't running to bump
+                // this). ARP / link-layer chatter is excluded, matching NAT's
+                // semantics — it's "the guest is actually carrying IP traffic".
+                if frame.len() >= 14 && frame[12] == 0x08 && frame[13] == 0x00 {
+                    self.ctl.guest_frames.fetch_add(1, Ordering::Relaxed);
+                }
+                // Intercept frames bound for the virtual NFS host (ARP / portmap /
+                // NFS / mountd): answer them locally and inject the reply on the RX
+                // ring, rather than leaking them onto the real LAN.
+                if let Some(host) = self.nfs_host.as_mut() {
+                    if let Some(replies) = host.maybe_handle(&frame) {
+                        for reply in replies {
+                            if self.rx_prod.slots() > 0 && self.rx_prod.push(reply).is_ok() {
+                                self.rx_wake.1.notify_one();
+                            }
+                        }
+                        continue;
+                    }
                 }
                 if self.ctl.dbg_tcp() {
                     dlog_dev!(LogModule::Net, "PCAP TX {}", eth_summary(&frame));
@@ -412,6 +485,72 @@ impl NetBackend for PcapEngine {
 /// import NetMode just to branch.
 pub fn is_pcap_mode(mode: NetMode) -> bool {
     mode == NetMode::Pcap
+}
+
+/// Classify a libpcap open/activate error into a [`PcapStatus`] the GUI can act
+/// on. pcap 2.x has no dedicated permission variant — EPERM/EACCES surface as
+/// `PcapError(String)` or `ErrnoError`, both of which Display to text containing
+/// "permission denied" / "operation not permitted" on macOS (BPF) and Linux. So
+/// we match the rendered message rather than a crate error variant, which is
+/// robust across platforms.
+fn classify_open_error(msg: &str) -> PcapStatus {
+    let m = msg.to_ascii_lowercase();
+    if m.contains("permission denied")
+        || m.contains("operation not permitted")
+        || m.contains("not permitted")
+        || m.contains("eacces")
+        || m.contains("eperm")
+    {
+        PcapStatus::PermissionDenied
+    } else {
+        PcapStatus::DeviceError
+    }
+}
+
+/// Ordered candidate IPv4 addresses for the in-PCAP NFS server's virtual host on
+/// a bridged subnet `network`/`prefix`. The GUI pings these in order and pre-fills
+/// the first that doesn't answer; the [`PcapEngine`] ARP-probes similarly.
+///
+/// `.213` sits at offset 212 of a /24's 254 usable hosts (~83.5% up the range —
+/// the "85% range"); that ratio is scaled to this subnet for the start, the scan
+/// runs upward, and it never exceeds the 95% mark of the usable host range. The
+/// network/broadcast addresses and any `reserved` ones (host IP, gateway, guest
+/// IP, …) are excluded. At most 16 candidates are returned ("a few to ping").
+pub fn nfs_ip_candidates(
+    network: std::net::Ipv4Addr,
+    prefix: u8,
+    reserved: &[std::net::Ipv4Addr],
+) -> Vec<std::net::Ipv4Addr> {
+    use std::collections::HashSet;
+    use std::net::Ipv4Addr;
+    const MAX_CANDIDATES: usize = 16;
+    // /31 and /32 (and the degenerate /0) have no usable host band to pick from.
+    if prefix == 0 || prefix >= 31 {
+        return Vec::new();
+    }
+    let host_bits = 32 - prefix as u32;
+    let net = u32::from(network) & (u32::MAX << host_bits); // normalize to network addr
+    let size = 1u32 << host_bits;
+    let usable = size - 2;
+    let first = net + 1;
+    let broadcast = net + size - 1;
+    let start_off = (usable as u64 * 212 / 254) as u32; // /24 → 212 → .213
+    let cap_off = (usable as u64 * 95 / 100) as u32; // 95% of the usable range
+    let reserved_set: HashSet<u32> = reserved
+        .iter()
+        .map(|a| u32::from(*a))
+        .chain([net, broadcast])
+        .collect();
+    let mut out = Vec::new();
+    let mut off = start_off;
+    while off <= cap_off && out.len() < MAX_CANDIDATES {
+        let Some(addr) = first.checked_add(off) else { break };
+        if addr < broadcast && !reserved_set.contains(&addr) {
+            out.push(Ipv4Addr::from(addr));
+        }
+        off += 1;
+    }
+    out
 }
 
 #[cfg(test)]
@@ -480,5 +619,62 @@ mod tests {
     fn auto_pick_errors_when_only_loopback() {
         let ifaces = vec![iface("lo", true, true, true, true)];
         assert!(resolve_interface(None, &ifaces).is_err());
+    }
+
+    #[test]
+    fn nfs_candidates_24_default_starts_at_213() {
+        let c = nfs_ip_candidates(Ipv4Addr::new(192, 168, 1, 0), 24, &[]);
+        assert_eq!(c[0], Ipv4Addr::new(192, 168, 1, 213), "default for /24 is .213");
+        assert_eq!(c[1], Ipv4Addr::new(192, 168, 1, 214), "scans upward, contiguous");
+        assert!(c.len() <= 16, "returns at most a few candidates");
+        assert!(c.iter().all(|a| *a <= Ipv4Addr::new(192, 168, 1, 242)),
+                "never above the 95% cap (.242 on a /24)");
+    }
+
+    #[test]
+    fn nfs_candidates_skip_reserved() {
+        let res = [Ipv4Addr::new(192, 168, 1, 213), Ipv4Addr::new(192, 168, 1, 214)];
+        let c = nfs_ip_candidates(Ipv4Addr::new(192, 168, 1, 0), 24, &res);
+        assert_eq!(c[0], Ipv4Addr::new(192, 168, 1, 215), "first free after reserved");
+    }
+
+    #[test]
+    fn nfs_candidates_respect_95pct_cap() {
+        // Reserve the whole band below .242 → only .242 remains, and .243+ are
+        // never offered (the 95% hard cap).
+        let res: Vec<_> = (213u8..=241).map(|h| Ipv4Addr::new(192, 168, 1, h)).collect();
+        let c = nfs_ip_candidates(Ipv4Addr::new(192, 168, 1, 0), 24, &res);
+        assert_eq!(c, vec![Ipv4Addr::new(192, 168, 1, 242)]);
+    }
+
+    #[test]
+    fn nfs_candidates_normalize_and_edge_prefixes() {
+        // Host bits in `network` are ignored (normalized to the network address).
+        let c = nfs_ip_candidates(Ipv4Addr::new(10, 0, 0, 77), 24, &[]);
+        assert_eq!(c[0], Ipv4Addr::new(10, 0, 0, 213));
+        // /31, /32, /0 have no usable host band.
+        assert!(nfs_ip_candidates(Ipv4Addr::new(10, 0, 0, 0), 31, &[]).is_empty());
+        assert!(nfs_ip_candidates(Ipv4Addr::new(10, 0, 0, 0), 32, &[]).is_empty());
+        assert!(nfs_ip_candidates(Ipv4Addr::new(10, 0, 0, 0), 0, &[]).is_empty());
+    }
+
+    #[test]
+    fn classify_open_error_detects_permission() {
+        // macOS BPF and Linux raw-socket permission messages map to the prompt.
+        for m in [
+            "activate device 'en0': (cannot open BPF device) /dev/bpf0: Permission denied",
+            "libpcap error: socket: Operation not permitted",
+            "You don't have permission to capture on that device (socket: Operation not permitted)",
+            "open device 'eth0': EACCES",
+        ] {
+            assert_eq!(classify_open_error(m), PcapStatus::PermissionDenied, "{m}");
+        }
+        // Non-permission failures stay a generic device error (no elevation UI).
+        for m in [
+            "open device 'wlan9': No such device exists",
+            "activate device 'en0': BIOCSETIF: Device not configured",
+        ] {
+            assert_eq!(classify_open_error(m), PcapStatus::DeviceError, "{m}");
+        }
     }
 }

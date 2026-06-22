@@ -1,0 +1,17 @@
+#!/bin/sh
+#
+# IRIS deb postinst — grant the GUI binary packet-capture capability so PCAP
+# (bridged) networking works WITHOUT running IRIS as root. This is the preferred
+# Linux path for installed packages (no per-launch prompt). Best-effort: if setcap
+# is missing or the filesystem lacks xattr support, capture just falls back to the
+# in-app pkexec elevation, so we NEVER fail the install over this.
+#
+# Applied to every variant's binary (the metadata is shared); harmless on
+# standard/lightning builds, which simply never exercise the capability.
+set -e
+if [ "$1" = "configure" ]; then
+    if command -v setcap >/dev/null 2>&1; then
+        setcap cap_net_raw,cap_net_admin+eip /usr/bin/iris-gui 2>/dev/null || true
+    fi
+fi
+exit 0

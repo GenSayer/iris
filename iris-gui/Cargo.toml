@@ -10,7 +10,15 @@ maintainer = "Dani Sarfati <dani@funkervogt.com>"
 copyright = "2025 Dani Sarfati"
 license-file = "../LICENSE"
 extended-description = "IRIS emulates an SGI Indy workstation (MIPS R4400) and boots IRIX 6.5 and 5.3 to a usable system with shell, networking, and X11."
+# `$auto` runs dpkg-shlibdeps, which resolves the pcap variant's libpcap link to
+# the correctly-versioned package name for the build's distro — including the
+# Ubuntu 24.04 `t64` rename (libpcap0.8 -> libpcap0.8t64). That's why we DON'T
+# hardcode libpcap here: a literal name would break on noble, and would also be
+# over-broad on the standard/lightning debs that don't link libpcap at all.
 depends = "$auto"
+# PCAP (bridged) networking: setcap the binary at install so it captures without
+# root. See installer/linux/postinst (best-effort; falls back to in-app pkexec).
+maintainer-scripts = "../installer/linux"
 section = "games"
 priority = "optional"
 # Asset source paths are resolved relative to this package dir (iris-gui/),
@@ -26,6 +34,17 @@ assets = [
 ]
 
 [package.metadata.generate-rpm]
+# cargo-generate-rpm does NOT auto-detect shared-lib deps, so list libpcap
+# explicitly for the pcap variant. Harmless on standard/lightning rpms (libpcap
+# is a tiny, near-universal package). The rpm names it `libpcap` on Fedora/RHEL.
+requires = { libpcap = "*" }
+# PCAP: setcap the binary at install so it captures without root (mirrors the deb
+# postinst). Best-effort; capture falls back to the in-app pkexec elevation.
+post_install_script = '''
+if command -v setcap >/dev/null 2>&1; then
+    setcap cap_net_raw,cap_net_admin+eip /usr/bin/iris-gui 2>/dev/null || true
+fi
+'''
 assets = [
   { source = "target/release/iris-gui", dest = "/usr/bin/iris-gui", mode = "755" },
   { source = "assets/icons/icon-256.png", dest = "/usr/share/icons/hicolor/256x256/apps/iris-gui.png", mode = "644" },
@@ -50,6 +69,10 @@ appstore = ["bundled"]
 # interfaces in a dropdown and the in-process VM can actually bridge onto them.
 # Build with: cargo build -p iris-gui --features pcap
 pcap = ["iris/pcap"]
+# Emulate an R5000 CPU instead of the default R4400 (compile-time: the cache
+# model differs deeply). Surfaced read-only on the Memory tab via
+# iris::build_features::CPU. Build with: cargo build -p iris-gui --features r5k
+r5k = ["iris/r5k"]
 
 [dependencies]
 # Group A (additive) features are always on for iris-gui so the user can

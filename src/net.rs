@@ -7,7 +7,7 @@
 use std::collections::{HashMap, VecDeque};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr, TcpListener, TcpStream, UdpSocket};
 use socket2::{Domain, Protocol, Socket, Type};
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
 use crate::config::{ForwardBind, ForwardProto, NatSubnet, NetMode, NfsConfig, PortForwardConfig};
 use crate::devlog::LogModule;
@@ -66,6 +66,9 @@ pub struct GatewayConfig {
     pub mode: NetMode,
     /// Host interface to bridge onto in PCAP mode. None = auto-pick.
     pub pcap_interface: Option<String>,
+    /// PCAP-only: virtual LAN IP the in-process NFS server answers on. `Some`
+    /// together with `nfs` enables the bridged NFS responder ([`NfsVirtualHost`]).
+    pub nfs_pcap_ip: Option<Ipv4Addr>,
 }
 
 impl Default for GatewayConfig {
@@ -81,6 +84,7 @@ impl Default for GatewayConfig {
             port_forwards: vec![],
             mode:         NetMode::Nat,
             pcap_interface: None,
+            nfs_pcap_ip:  None,
         }
     }
 }
@@ -478,6 +482,189 @@ fn portmap_reply(xid: u32, port: u32) -> Vec<u8> {
     r
 }
 
+/// A virtual NFS host on the bridged LAN, used only in PCAP mode. The in-process
+/// NFS server normally lives inside the NAT engine and answers at the gateway IP;
+/// in PCAP mode the NAT engine isn't running and the guest sits directly on the
+/// real LAN, so we present the server as its own L2 host at a configured virtual
+/// IP. [`PcapEngine`] feeds each guest TX frame to [`maybe_handle`]: an ARP-for or
+/// UDP-to our IP (portmap / NFS / mountd) is answered and the reply frame(s) are
+/// injected straight back to the guest — still zero host sockets. Anything else is
+/// forwarded to the wire unchanged.
+///
+/// Inbound IP fragments (a large NFS WRITE whose wsize exceeds the link MTU) are
+/// reassembled in [`handle_udp`] before dispatch, keyed by (src, id, proto) and
+/// aged out after 5s — mirroring the NAT engine's `handle_ip`. Outbound replies are
+/// auto-fragmented (via [`ip_frames_udp`]); MOUNT/READ and small ops still fit one
+/// datagram.
+///
+/// [`maybe_handle`]: NfsVirtualHost::maybe_handle
+/// [`handle_udp`]: NfsVirtualHost::handle_udp
+#[cfg(feature = "pcap")]
+pub(crate) struct NfsVirtualHost {
+    ip: Ipv4Addr,
+    mac: [u8; 6],
+    server: crate::nfsudp::NfsServer,
+    nfs_cfg: NfsConfig,
+    ip_id: u16,
+    /// Inbound IP-fragment reassembly buffer, keyed by (src IP, IP id, proto).
+    frag_reasm: HashMap<(u32, u16, u8), FragReasm>,
+}
+
+#[cfg(feature = "pcap")]
+impl NfsVirtualHost {
+    pub(crate) fn new(ip: Ipv4Addr, nfs_cfg: NfsConfig) -> Self {
+        // Locally-administered MAC, distinct from the NAT gateway's, so the guest
+        // keeps the virtual NFS host as its own ARP entry. (0xBF53 ≈ "BF-NFS".)
+        let mac = [0x02, 0x00, 0xDE, 0xAD, 0xBF, 0x53];
+        let server = crate::nfsudp::NfsServer::new(nfs_cfg.shared_dir.clone(), nfs_cfg.version);
+        Self { ip, mac, server, nfs_cfg, ip_id: 1, frag_reasm: HashMap::new() }
+    }
+
+    /// Handle a guest-originated Ethernet `frame` if it's addressed to the virtual
+    /// NFS host; returns reply frame(s) to inject back to the guest, or `None` if
+    /// the frame isn't for us (the caller bridges it to the wire).
+    pub(crate) fn maybe_handle(&mut self, frame: &[u8]) -> Option<Vec<Vec<u8>>> {
+        if frame.len() < 14 {
+            return None;
+        }
+        match r16(frame, 12) {
+            ETHERTYPE_ARP => self.handle_arp(frame),
+            ETHERTYPE_IP => self.handle_udp(frame),
+            _ => None,
+        }
+    }
+
+    fn handle_arp(&self, frame: &[u8]) -> Option<Vec<Vec<u8>>> {
+        if frame.len() < 14 + 28 {
+            return None;
+        }
+        let a = &frame[14..];
+        if r16(a, 0) != ARP_HW_ETHER
+            || r16(a, 2) != ARP_PROTO_IP
+            || a[4] != 6
+            || a[5] != 4
+            || r16(a, 6) != ARP_OP_REQUEST
+        {
+            return None;
+        }
+        let sender_mac: [u8; 6] = a[8..14].try_into().unwrap();
+        let sender_ip = Ipv4Addr::new(a[14], a[15], a[16], a[17]);
+        let target_ip = Ipv4Addr::new(a[24], a[25], a[26], a[27]);
+        if target_ip != self.ip {
+            return None;
+        }
+        let mut arp = [0u8; 28];
+        w16(&mut arp, 0, ARP_HW_ETHER);
+        w16(&mut arp, 2, ARP_PROTO_IP);
+        arp[4] = 6;
+        arp[5] = 4;
+        w16(&mut arp, 6, ARP_OP_REPLY);
+        arp[8..14].copy_from_slice(&self.mac);
+        arp[14..18].copy_from_slice(&self.ip.octets());
+        arp[18..24].copy_from_slice(&sender_mac);
+        arp[24..28].copy_from_slice(&sender_ip.octets());
+        Some(vec![eth_frame(&sender_mac, &self.mac, ETHERTYPE_ARP, &arp)])
+    }
+
+    fn handle_udp(&mut self, frame: &[u8]) -> Option<Vec<Vec<u8>>> {
+        if frame.len() < 34 {
+            return None;
+        }
+        let src_mac: [u8; 6] = frame[6..12].try_into().unwrap();
+        let ip = &frame[14..];
+        if ip[9] != IP_PROTO_UDP {
+            return None;
+        }
+        let dst_ip = Ipv4Addr::new(ip[16], ip[17], ip[18], ip[19]);
+        if dst_ip != self.ip {
+            return None;
+        }
+        let src_ip = Ipv4Addr::new(ip[12], ip[13], ip[14], ip[15]);
+        let ihl = ((ip[0] & 0x0f) as usize) * 4;
+        let ip_total = r16(ip, 2) as usize;
+        if ip_total < ihl || frame.len() < 14 + ihl {
+            return None;
+        }
+        let ip_end = ip_total.min(frame.len() - 14);
+        let ip_payload = &ip[ihl..ip_end];
+
+        // Inbound IP-fragment reassembly: a large NFS WRITE arrives fragmented when
+        // its wsize exceeds the link MTU. Buffer fragments by (src, id, proto) and
+        // only dispatch once the whole UDP datagram is contiguous; mirrors the NAT
+        // engine's `handle_ip`. Without this, large guest→host writes silently fail.
+        // A buffered-but-incomplete fragment returns `Some(vec![])` so the caller
+        // treats it as consumed (not bridged onto the wire), since it's addressed to
+        // our virtual host.
+        let flags_frag = r16(ip, 6);
+        let more = flags_frag & 0x2000 != 0;
+        let frag_off = ((flags_frag & 0x1fff) as usize) * 8;
+        let reassembled: Option<Vec<u8>> = if more || frag_off != 0 {
+            let id = r16(ip, 4);
+            let key = (u32::from(src_ip), id, IP_PROTO_UDP);
+            self.frag_reasm.retain(|_, v| v.last.elapsed() < Duration::from_secs(5));
+            match self.frag_reasm.entry(key).or_insert_with(FragReasm::new).add(frag_off, ip_payload, more) {
+                Some(full) => { self.frag_reasm.remove(&key); Some(full) }
+                None => return Some(Vec::new()), // consumed; still waiting on fragments
+            }
+        } else {
+            None
+        };
+        // The complete UDP datagram: the reassembled one, or this lone unfragmented one.
+        let udp: &[u8] = reassembled.as_deref().unwrap_or(ip_payload);
+        if udp.len() < 8 {
+            return None;
+        }
+        let sport = r16(udp, 0);
+        let dport = r16(udp, 2);
+        let payload = &udp[8..];
+        let reply = match dport {
+            UDP_PORT_PORTMAP => {
+                let xid = if payload.len() >= 4 { r32(payload, 0) } else { 0 };
+                portmap_reply(xid, portmap_lookup(payload, &self.nfs_cfg))
+            }
+            NFS_VM_PORT | MOUNTD_VM_PORT => self.server.handle(payload)?,
+            _ => return None,
+        };
+        // Reply source = our virtual host; reply port = the port the guest hit.
+        let dgram = udp_packet(self.ip, src_ip, dport, sport, &reply);
+        let id = self.ip_id;
+        self.ip_id = self.ip_id.wrapping_add(1);
+        Some(ip_frames_udp(&src_mac, &self.mac, self.ip, src_ip, id, &dgram))
+    }
+}
+
+/// Live status of the PCAP bridged-capture backend, surfaced to an embedder (the
+/// GUI) so it can prompt for privilege elevation when the raw capture can't be
+/// opened. Deliberately **not** feature-gated — `NatControl` always carries the
+/// field and non-`pcap` builds / the GUI reference the type unconditionally; it
+/// only ever leaves `Inactive` when the `pcap` feature is built and the active
+/// machine uses `[network] mode = "pcap"`.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+#[repr(u8)]
+pub enum PcapStatus {
+    /// Not bridging — NAT mode, or PCAP not yet attempted (default).
+    #[default]
+    Inactive = 0,
+    /// Capture handle is open; frames are bridging onto the host interface.
+    Active = 1,
+    /// Open failed for lack of privilege (EPERM/EACCES, libpcap "permission
+    /// denied"). The embedder should offer to elevate / enable capture.
+    PermissionDenied = 2,
+    /// Open failed for another reason (no such device, driver missing, …).
+    DeviceError = 3,
+}
+
+impl PcapStatus {
+    fn from_u8(v: u8) -> Self {
+        match v {
+            1 => PcapStatus::Active,
+            2 => PcapStatus::PermissionDenied,
+            3 => PcapStatus::DeviceError,
+            _ => PcapStatus::Inactive,
+        }
+    }
+}
+
 // ── NAT debug/status control (shared between NatEngine thread and command handler) ─
 pub struct NatControl {
     pub debug_tcp:  AtomicBool,
@@ -523,6 +710,17 @@ pub struct NatControl {
     /// an embedder add/remove forwards without a reboot.
     pub pending_forwards: Mutex<Option<Vec<PortForwardConfig>>>,
     pub apply_forwards:   AtomicBool,
+    /// Live PCAP backend status (a [`PcapStatus`] discriminant), set by the
+    /// `PcapEngine` as it opens (or fails to open) the capture and sampled by the
+    /// GUI to drive the "Enable packet capture" / elevation prompt. `Inactive`
+    /// (0) in NAT mode and on non-`pcap` builds.
+    pub pcap_status: AtomicU8,
+    /// Pending PCAP host-interface reswap (`None` = auto-pick), latched by
+    /// `request_pcap_interface`. Lets the GUI change the bridged NIC on a running
+    /// machine: the `PcapEngine` reopens its capture on the next loop — no guest
+    /// reboot. Unused in NAT mode.
+    pub pending_pcap_iface: Mutex<Option<String>>,
+    pub apply_pcap_iface:   AtomicBool,
 }
 
 impl NatControl {
@@ -544,7 +742,28 @@ impl NatControl {
             host_nets:     Mutex::new(Vec::new()),
             pending_forwards: Mutex::new(None),
             apply_forwards:   AtomicBool::new(false),
+            pcap_status:      AtomicU8::new(PcapStatus::Inactive as u8),
+            pending_pcap_iface: Mutex::new(None),
+            apply_pcap_iface:   AtomicBool::new(false),
         })
+    }
+
+    /// Ask the running `PcapEngine` to reopen its capture on host interface
+    /// `iface` (`None` = auto-pick), applied on the engine's next loop. The guest
+    /// keeps running — only the host-side capture handle is swapped. No-op in NAT.
+    pub fn request_pcap_interface(&self, iface: Option<String>) {
+        *self.pending_pcap_iface.lock() = iface;
+        self.apply_pcap_iface.store(true, Ordering::Release);
+    }
+
+    /// Record the live PCAP backend status (called by the `PcapEngine`).
+    pub fn set_pcap_status(&self, s: PcapStatus) {
+        self.pcap_status.store(s as u8, Ordering::Relaxed);
+    }
+
+    /// The live PCAP backend status, for an embedder to drive elevation UI.
+    pub fn pcap_status(&self) -> PcapStatus {
+        PcapStatus::from_u8(self.pcap_status.load(Ordering::Relaxed))
     }
     pub fn dbg_tcp(&self)  -> bool { self.debug_tcp.load(Ordering::Relaxed) }
     pub fn dbg_udp(&self)  -> bool { self.debug_udp.load(Ordering::Relaxed) }
@@ -723,6 +942,84 @@ mod ftp_alg_tests {
         // Malformed tuple (not six bytes) is rejected.
         assert!(ftp_pasv_rewrite(b"227 (1,2,3,4,5)\r\n", Ipv4Addr::LOCALHOST, 1).is_none());
         assert!(ftp_pasv_rewrite(b"227 (1,2,3,4,5,999)\r\n", Ipv4Addr::LOCALHOST, 1).is_none());
+    }
+}
+
+#[cfg(all(test, feature = "pcap"))]
+mod nfs_pcap_tests {
+    use super::*;
+
+    /// A 56-byte portmap GETPORT call asking for the port of `req_prog` over UDP.
+    fn getport_call(xid: u32, req_prog: u32) -> Vec<u8> {
+        let mut p = vec![0u8; 56];
+        w32(&mut p,  0, xid);
+        w32(&mut p,  4, 0);                    // msg_type = CALL
+        w32(&mut p,  8, 2);                    // rpcvers
+        w32(&mut p, 12, RPC_PROG_PORTMAP);
+        w32(&mut p, 16, 2);                    // portmap vers
+        w32(&mut p, 20, RPC_PORTMAP_GETPORT);
+        // cred (flavor+len) and verf (flavor+len) all zero (AUTH_NULL).
+        w32(&mut p, 40, req_prog);             // mapping.prog
+        w32(&mut p, 44, 3);                    // mapping.vers
+        w32(&mut p, 48, 17);                   // mapping.prot = UDP
+        w32(&mut p, 52, 0);                    // mapping.port
+        p
+    }
+
+    /// A fragmented inbound portmap request (large NFS WRITEs arrive the same way)
+    /// must be reassembled, not dropped: intermediate fragments are consumed
+    /// (`Some([])`, so the caller doesn't bridge them onto the wire) and the final
+    /// fragment yields the reply built from the whole datagram.
+    #[test]
+    fn reassembles_fragmented_request() {
+        let nfs_ip = Ipv4Addr::new(192, 168, 1, 213);
+        let guest_ip = Ipv4Addr::new(192, 168, 1, 50);
+        let guest_mac = [0x08, 0x00, 0x69, 0x01, 0x02, 0x03];
+        let host_mac  = [0x02, 0x00, 0xde, 0xad, 0xbf, 0x53];
+
+        let mut host = NfsVirtualHost::new(
+            nfs_ip,
+            NfsConfig { shared_dir: "/nonexistent".into(), version: crate::nfsudp::NfsVersion::Auto },
+        );
+
+        // Full UDP datagram (header + portmap GETPORT for NFS), then split its IP
+        // payload across two fragments at an 8-byte boundary.
+        let dgram = udp_packet(guest_ip, nfs_ip, 0x9abc, UDP_PORT_PORTMAP, &getport_call(0x1234, RPC_PROG_NFS));
+        let (a, b) = dgram.split_at(8);
+        let frag1 = ip_fragment_frame(&host_mac, &guest_mac, guest_ip, nfs_ip, IP_PROTO_UDP, 0x42, 0, true,  a);
+        let frag2 = ip_fragment_frame(&host_mac, &guest_mac, guest_ip, nfs_ip, IP_PROTO_UDP, 0x42, 8, false, b);
+
+        // First fragment: consumed, no reply yet (NOT None — None would bridge it).
+        assert_eq!(host.maybe_handle(&frag1), Some(Vec::new()));
+
+        // Second fragment completes the datagram → one reply frame.
+        let frames = host.maybe_handle(&frag2).expect("reply after reassembly");
+        assert_eq!(frames.len(), 1);
+        // eth(14) + ip(20) + udp(8) = 42-byte headers, then the 28-byte portmap reply
+        // whose final word is the resolved port.
+        let reply = &frames[0];
+        let port = u32::from_be_bytes(reply[reply.len() - 4..].try_into().unwrap());
+        assert_eq!(port, NFS_VM_PORT as u32, "portmap resolved NFS to its VM port");
+    }
+
+    /// An unfragmented request still works unchanged (no reassembly path taken).
+    #[test]
+    fn handles_unfragmented_request() {
+        let nfs_ip = Ipv4Addr::new(10, 0, 0, 9);
+        let guest_ip = Ipv4Addr::new(10, 0, 0, 2);
+        let guest_mac = [0x08, 0x00, 0x69, 0x0a, 0x0b, 0x0c];
+        let host_mac  = [0x02, 0x00, 0xde, 0xad, 0xbf, 0x53];
+
+        let mut host = NfsVirtualHost::new(
+            nfs_ip,
+            NfsConfig { shared_dir: "/nonexistent".into(), version: crate::nfsudp::NfsVersion::Auto },
+        );
+        let dgram = udp_packet(guest_ip, nfs_ip, 0x9abc, UDP_PORT_PORTMAP, &getport_call(7, RPC_PROG_MOUNTD));
+        let frame = ip_frame(&host_mac, &guest_mac, guest_ip, nfs_ip, IP_PROTO_UDP, &dgram);
+        let frames = host.maybe_handle(&frame).expect("reply");
+        let reply = &frames[0];
+        let port = u32::from_be_bytes(reply[reply.len() - 4..].try_into().unwrap());
+        assert_eq!(port, MOUNTD_VM_PORT as u32);
     }
 }
 

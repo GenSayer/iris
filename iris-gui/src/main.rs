@@ -1,6 +1,7 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod camera_test;
+mod capture_access;
 mod config_ui;
 mod dialogs;
 mod framebuffer;
@@ -173,6 +174,14 @@ struct App {
     /// Set when the Networking tab commits a subnet that fails the sanity checks
     /// (non-RFC1918 or a host conflict); drives the Override/Cancel modal.
     net_sanity_modal: Option<NetSanityModal>,
+    /// `true` while the "Enable packet capture" prompt is open — raised either by
+    /// the user's button in the Network tab or automatically when a pcap-mode
+    /// machine reports `PcapStatus::PermissionDenied` on Start.
+    pcap_perm_modal: bool,
+    /// One-shot guard so the automatic permission prompt fires at most once per
+    /// run (reset on `Evt::Started`); without it the modal would re-open every
+    /// frame the capture stays denied.
+    pcap_perm_prompted: bool,
     new_machine: NewMachineDialog,
     create_disk: CreateDiskDialog,
     /// If true, central panel shows the tabbed config editor; otherwise the
@@ -451,6 +460,8 @@ impl App {
             confirm_embedded_prom: false,
             net_ifaces: netplan::gather_host_ifaces(),
             net_sanity_modal: None,
+            pcap_perm_modal: false,
+            pcap_perm_prompted: false,
             new_machine,
             create_disk: CreateDiskDialog::default(),
             show_config_editor: false,
@@ -488,6 +499,22 @@ impl App {
     /// per-frame. A no-op placeholder when the build lacks `--features pcap`.
     fn refresh_pcap_ifaces(&mut self) {
         self.pcap_ifaces = Some(config_ui::enumerate_pcap_ifaces());
+    }
+
+    /// Run the platform's "grant packet-capture permission" flow and report the
+    /// result. Invoked by the Network tab's "Enable packet capture…" button and
+    /// by the automatic permission-denied prompt. The per-OS work lives in
+    /// `capture_access` (Linux pkexec/setcap, macOS ChmodBPF, Windows Npcap).
+    fn run_enable_packet_capture(&mut self) {
+        use capture_access::EnableOutcome;
+        // Dismiss the prompt regardless of outcome; the user made a choice.
+        self.pcap_perm_modal = false;
+        match capture_access::enable_packet_capture() {
+            EnableOutcome::Enabled => self.toast("packet capture enabled"),
+            EnableOutcome::NeedsRelaunch(msg) => self.toast(msg),
+            EnableOutcome::Cancelled => {}
+            EnableOutcome::Failed(why) => self.toast(why),
+        }
     }
 
     fn toast(&mut self, msg: impl Into<String>) {
@@ -707,11 +734,16 @@ impl App {
         }
     }
 
-    /// App Store preflight: attached CHD disks (non-scratch HDDs) whose folder
-    /// we can't write, so their on-exit `.diff.chd` fold would be denied. Empty
-    /// off the sandbox build, where folders are reachable directly.
+    /// macOS preflight: attached CHD disks (non-scratch HDDs) whose folder we
+    /// can't write, so their on-exit `.diff.chd` fold would be denied. Runs on
+    /// ALL macOS builds: the sandbox (MAS) build needs an explicit directory
+    /// security-scoped grant, while the notarized build is subject to macOS TCC
+    /// (Documents/Desktop/Downloads/iCloud/external/network volumes are blocked
+    /// until the user consents). Either way we probe real writability and prompt
+    /// up front, so the fold doesn't silently fail at quit. Empty off macOS,
+    /// where there's no such gate and folders are writable directly.
     fn chd_dirs_needing_grant(&self) -> Vec<ChdNeedsGrant> {
-        if !cfg!(feature = "appstore") {
+        if !cfg!(target_os = "macos") {
             return Vec::new();
         }
         let mut out = Vec::new();
@@ -822,7 +854,12 @@ impl App {
     fn handle_events(&mut self, ctx: &egui::Context) {
         for evt in self.emu.drain_events() {
             match evt {
-                Evt::Started   => self.toast("emulator started"),
+                Evt::Started   => {
+                    // Fresh run: re-arm the one-shot PCAP permission prompt so a
+                    // pcap-mode machine that can't open its capture re-prompts.
+                    self.pcap_perm_prompted = false;
+                    self.toast("emulator started");
+                }
                 Evt::Stopped   => self.toast("emulator stopped"),
                 Evt::PowerOff  => self.toast("guest powered off (safe to stop)"),
                 Evt::StateSaved(n)    => self.toast(format!("state saved: {n}")),
@@ -850,6 +887,17 @@ impl App {
                 }
             }
         }
+        // Automatic PCAP elevation prompt: a pcap-mode machine that couldn't open
+        // its raw capture for lack of privilege reports `PermissionDenied`. Raise
+        // the same "Enable packet capture" prompt the Network tab button uses,
+        // once per run (the one-shot guard avoids re-opening it every frame).
+        if !self.pcap_perm_prompted
+            && self.emu.pcap_status() == iris::net::PcapStatus::PermissionDenied
+        {
+            self.pcap_perm_prompted = true;
+            self.pcap_perm_modal = true;
+        }
+
         // Repaint cadence: ~60 fps while the emulator is running so we
         // can pull the latest framebuffer; lazy otherwise to save CPU.
         let next = if self.emu.is_running() { 16 } else { 250 };
@@ -1453,56 +1501,55 @@ impl App {
         if running && !halted {
             ui.label(format!("{:.0} MIPS", self.emu.status.mips));
         }
-        // Internal-network indicator — always shown (grey while unpowered or
-        // halted). Green once the guest is carrying NAT IP traffic; red when a
-        // running guest has produced none (a hint its IP is missing or wrong for
-        // the configured NAT subnet).
-        let (net_color, net_tip) = match self.emu.net_state() {
-            NetState::Active => (
-                Color32::from_rgb(0x35, 0xb8, 0x4a),
-                "Internal network: carrying guest NAT traffic.",
-            ),
-            NetState::Idle => (
-                Color32::from_rgb(0xd9, 0x4a, 0x3d),
-                "Internal network: no NAT traffic yet.\nThe guest may have no IP — or the wrong IP for this NAT subnet.",
-            ),
-            NetState::Off => (
-                Color32::from_gray(0x80),
-                "Internal network: machine not running.",
-            ),
+        // Networking indicator — ONE badge that shows both liveness (the dot's
+        // colour) and the active backend (the label: NAT / PCAP). Grey while
+        // unpowered/halted; green once the guest is carrying IP traffic, red when
+        // a running guest has produced none. Works for both backends — the PCAP
+        // engine counts guest IP frames too. The backend is latched on Start
+        // (launched_net), not the live editor.
+        use iris::config::NetMode;
+        let backend = self.launched_net.clone();
+        let state = self.emu.net_state();
+        let net_color = match state {
+            NetState::Active => Color32::from_rgb(0x35, 0xb8, 0x4a),
+            NetState::Idle => Color32::from_rgb(0xd9, 0x4a, 0x3d),
+            NetState::Off => Color32::from_gray(0x80),
         };
+        let (net_label, net_tip): (&str, String) = match (running, backend.as_ref()) {
+            (true, Some((NetMode::Pcap, iface))) => {
+                let iface = iface.as_deref().filter(|s| !s.is_empty()).unwrap_or("auto");
+                let tip = match state {
+                    NetState::Active => format!("Bridged (PCAP) on {iface}: guest is carrying IP traffic."),
+                    NetState::Idle => format!("Bridged (PCAP) on {iface}: no guest IP traffic yet.\nCheck the guest's IP / DHCP — wired connections only."),
+                    NetState::Off => "Bridged (PCAP) networking: machine not running.".into(),
+                };
+                ("PCAP", tip)
+            }
+            (true, Some((NetMode::Nat, _))) => {
+                let tip = match state {
+                    NetState::Active => "Internal NAT network: carrying guest traffic.".into(),
+                    NetState::Idle => "Internal NAT network: no traffic yet.\nThe guest may have no IP — or the wrong IP for this NAT subnet.".into(),
+                    NetState::Off => "Internal NAT network: machine not running.".into(),
+                };
+                ("NAT", tip)
+            }
+            _ => ("NET", "Internal network: machine not running.".into()),
+        };
+        // "check" diagnoses the guest IP against the NAT subnet — only meaningful
+        // in NAT mode, so it's hidden in PCAP.
+        let nat_running = running && matches!(backend.as_ref(), Some((NetMode::Nat, _)));
         let mut want_check = false;
         ui.horizontal(|ui| {
-            // U+2022 (bullet), sized up as a status light. NOT U+25CF (●),
-            // which renders as tofu — egui's label font chain (Ubuntu-Light →
-            // NotoEmoji → emoji-icon-font) has no filled circle; U+25CF is only
-            // in Hack, which is monospace-only. See rules/gui/egui-…-tofu.md.
-            ui.label(RichText::new("\u{2022}").size(18.0).color(net_color)).on_hover_text(net_tip);
-            ui.label("NET").on_hover_text(net_tip);
-            if running && ui.small_button("check").on_hover_text("Diagnose guest networking").clicked() {
+            // U+2022 (bullet) as a status light. NOT U+25CF (●), which renders as
+            // tofu in egui's font chain. See rules/gui/egui-…-tofu.md.
+            ui.label(RichText::new("\u{2022}").size(18.0).color(net_color)).on_hover_text(net_tip.as_str());
+            ui.label(net_label).on_hover_text(net_tip.as_str());
+            if nat_running && ui.small_button("check").on_hover_text("Diagnose guest networking").clicked() {
                 want_check = true;
             }
         });
         if want_check {
             self.show_net_check = true;
-        }
-        if running {
-            // Surface the active networking backend so PCAP vs NAT is verifiable
-            // at a glance. Reflects the config the running machine was started
-            // with (latched on Start), not the live editor.
-            match self.launched_net.as_ref() {
-                Some((iris::config::NetMode::Pcap, iface)) => {
-                    let iface = iface.as_deref().filter(|s| !s.is_empty()).unwrap_or("auto");
-                    ui.label(RichText::new(format!("net: PCAP → {iface}"))
-                        .color(Color32::from_rgb(120, 180, 220)))
-                        .on_hover_text("Bridged onto a host interface. See the console for \
-                                        'bridging onto interface …' / 'backend disabled …'.");
-                }
-                Some((iris::config::NetMode::Nat, _)) => {
-                    ui.label(RichText::new("net: NAT").color(Color32::LIGHT_GRAY));
-                }
-                None => {}
-            }
         }
         if running && self.fb_scale > 0.0 {
             // How magnified the emulated display currently is (1× = native).
@@ -1811,6 +1858,7 @@ impl App {
             ConfigAction::RequestEmbeddedProm => self.confirm_embedded_prom = true,
             ConfigAction::TestCamera => self.open_camera_test(),
             ConfigAction::RefreshPcapIfaces => self.refresh_pcap_ifaces(),
+            ConfigAction::EnablePacketCapture => self.run_enable_packet_capture(),
             ConfigAction::None => {}
         }
         if out.disks_changed { self.mark_dirty(); }
@@ -1823,6 +1871,18 @@ impl App {
             // Rebind the running NAT's listeners so a forward added/removed now
             // takes effect without a restart (latest-wins coalesces in the NAT).
             self.emu.send(Cmd::SetPortForwards(self.cfg.port_forward.clone()));
+        }
+        // Live PCAP host-NIC reswap: if the running machine is bridged and the
+        // interface was just committed, reopen the capture on the new NIC — no
+        // guest reboot. Latch the new iface into launched_net so the status badge
+        // reflects it.
+        if out.net.iface_changed
+            && matches!(self.launched_net.as_ref(), Some((iris::config::NetMode::Pcap, _)))
+        {
+            self.emu.send(Cmd::SetPcapInterface(self.cfg.network.pcap_interface.clone()));
+            if let Some((_, iface)) = self.launched_net.as_mut() {
+                *iface = self.cfg.network.pcap_interface.clone();
+            }
         }
         if let Some(p) = out.net.prompt {
             self.net_sanity_modal = Some(NetSanityModal {
@@ -2165,18 +2225,28 @@ impl App {
         }
         use iris::nfsudp::NfsVersion;
 
-        // Gateway the guest will mount from: the one IRIS has live-adopted while
-        // running, else the gateway derived from the configured NAT subnet, else
-        // the documented default. Matches network_check_window's derivation.
-        let (eb, ep) = netplan::parse_cidr(self.cfg.nat_subnet.as_deref());
-        let cfg_gw = netplan::classify(eb, ep, &[]).derived.map(|d| d.gateway.to_string());
-        let gw = self
-            .emu
-            .status
-            .net_guest_gateway
-            .map(|g| g.to_string())
-            .or(cfg_gw)
-            .unwrap_or_else(|| "192.168.0.1".into());
+        // Address the guest mounts from. PCAP (bridged) mode: the in-core NFS
+        // server is a virtual L2 host at the IP you assigned — show that, not a NAT
+        // gateway (there is none). NAT mode: the gateway IRIS live-adopted while
+        // running, else the gateway derived from the configured subnet, else the
+        // documented default. (Matches network_check_window's derivation.)
+        let pcap = self.cfg.network.mode == iris::config::NetMode::Pcap;
+        let gw = if pcap {
+            self.cfg
+                .network
+                .nfs_pcap_ip
+                .map(|ip| ip.to_string())
+                .unwrap_or_else(|| "<set the NFS server IP under Networking>".into())
+        } else {
+            let (eb, ep) = netplan::parse_cidr(self.cfg.nat_subnet.as_deref());
+            let cfg_gw = netplan::classify(eb, ep, &[]).derived.map(|d| d.gateway.to_string());
+            self.emu
+                .status
+                .net_guest_gateway
+                .map(|g| g.to_string())
+                .or(cfg_gw)
+                .unwrap_or_else(|| "192.168.0.1".into())
+        };
 
         let mut open = true;
         egui::Window::new("Mount the shared folder in IRIX")
@@ -2200,10 +2270,15 @@ impl App {
                         return;
                     };
 
-                    ui.label(
-                        "IRIS serves the folder below over NFS, in-process, from the NAT gateway. \
+                    let source = if pcap {
+                        "as a virtual host on your LAN at the address you assigned"
+                    } else {
+                        "from the NAT gateway"
+                    };
+                    ui.label(format!(
+                        "IRIS serves the folder below over NFS, in-process, {source}. \
                          Boot IRIX, make sure networking is up (the NET light / Check networking), \
-                         then log in as root and run these commands at an IRIX shell:");
+                         then log in as root and run these commands at an IRIX shell:"));
                     ui.add_space(6.0);
 
                     if nfs.shared_dir.trim().is_empty() {
@@ -2778,6 +2853,38 @@ impl eframe::App for App {
             if close { self.net_sanity_modal = None; }
         }
 
+        // PCAP capture-permission prompt (button-raised or auto-raised on a
+        // permission-denied capture). "Enable" runs the platform privilege flow;
+        // "Not now" just dismisses — the guest keeps running on NAT-less PCAP
+        // (i.e. no networking) until the user enables capture or switches to NAT.
+        if self.pcap_perm_modal {
+            let mut do_enable = false;
+            let mut close = false;
+            egui::Window::new("Enable packet capture")
+                .collapsible(false)
+                .resizable(false)
+                .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+                .show(ctx, |ui| {
+                    ui.set_max_width(440.0);
+                    ui.label(RichText::new(
+                        "PCAP (bridged) networking needs permission to capture on a real \
+                         interface, which IRIS doesn't have yet.").strong());
+                    ui.add_space(4.0);
+                    ui.label(RichText::new(capture_access::permission_hint()).weak());
+                    ui.add_space(8.0);
+                    ui.horizontal(|ui| {
+                        if ui.add(egui::Button::new("Enable packet capture…")
+                            .fill(Color32::from_rgb(60, 90, 140))).clicked()
+                        {
+                            do_enable = true;
+                        }
+                        if ui.button("Not now").clicked() { close = true; }
+                    });
+                });
+            if do_enable { self.run_enable_packet_capture(); } // also clears the modal
+            if close { self.pcap_perm_modal = false; }
+        }
+
         // Missing-disk modal.
         enum MissingChoice { None, Cancel, Detach, EditDisks }
         let mut choice = MissingChoice::None;
@@ -2841,7 +2948,10 @@ impl eframe::App for App {
         // CHD folder-grant modal (App Store): attached CHDs sit in folders we
         // can't write, so their on-exit fold would be denied. Offer to grant
         // each folder, or start anyway and forgo compaction.
-        enum ChdGrantChoice { None, Cancel, StartAnyway, Grant(String) }
+        // `Grant` is built only in the sandbox branch, `OpenPrivacy`/`Recheck`
+        // only in the notarized branch — so one set is always cfg-dead.
+        #[allow(dead_code)]
+        enum ChdGrantChoice { None, Cancel, StartAnyway, Grant(String), OpenPrivacy, Recheck }
         let mut chd_choice = ChdGrantChoice::None;
         if let Some(modal) = &self.chd_grant_modal {
             egui::Window::new("Grant folder access to compact disks")
@@ -2866,16 +2976,40 @@ impl eframe::App for App {
                          put each disk image in its own dedicated folder and grant only that.")
                         .italics().weak());
                     ui.add_space(6.0);
-                    ui.label(RichText::new("Grant the containing folder so IRIS can compact it on exit:").weak());
-                    // One button per distinct folder — a recursive grant covers
-                    // every disk under it.
-                    let mut dirs: Vec<&str> = modal.disks.iter().map(|d| d.dir.as_str()).collect();
-                    dirs.sort_unstable();
-                    dirs.dedup();
-                    for dir in dirs {
-                        if ui.button(format!("Grant \"{dir}\"…")).clicked() {
-                            chd_choice = ChdGrantChoice::Grant(dir.to_string());
+                    // Sandbox (MAS): a directory security-scoped grant via the
+                    // open panel conveys write access. One button per distinct
+                    // folder — a recursive grant covers every disk under it.
+                    #[cfg(feature = "appstore")]
+                    {
+                        ui.label(RichText::new("Grant the containing folder so IRIS can compact it on exit:").weak());
+                        let mut dirs: Vec<&str> = modal.disks.iter().map(|d| d.dir.as_str()).collect();
+                        dirs.sort_unstable();
+                        dirs.dedup();
+                        for dir in dirs {
+                            if ui.button(format!("Grant \"{dir}\"…")).clicked() {
+                                chd_choice = ChdGrantChoice::Grant(dir.to_string());
+                            }
                         }
+                    }
+                    // Notarized macOS: the block is macOS Privacy (TCC), which a
+                    // folder pick doesn't override — the user allows IRIS in
+                    // System Settings, then re-checks (a relaunch may be needed
+                    // for Full Disk Access to take effect).
+                    #[cfg(not(feature = "appstore"))]
+                    {
+                        ui.label(RichText::new(
+                            "macOS Privacy & Security is blocking write access to these folders. \
+                             Allow IRIS under System Settings → Privacy & Security (Files and Folders, \
+                             or add it to Full Disk Access), then Re-check. You may need to quit and \
+                             reopen IRIS for Full Disk Access to take effect.").weak());
+                        ui.horizontal(|ui| {
+                            if ui.button("Open Privacy & Security…").clicked() {
+                                chd_choice = ChdGrantChoice::OpenPrivacy;
+                            }
+                            if ui.button("Re-check").clicked() {
+                                chd_choice = ChdGrantChoice::Recheck;
+                            }
+                        });
                     }
                     ui.add_space(4.0);
                     ui.horizontal(|ui| {
@@ -2900,6 +3034,27 @@ impl eframe::App for App {
                 self.grant_disk_folder_at(Some(&dir));
                 // Re-probe: drop disks whose folder is now writable. When all are
                 // satisfied, dismiss and start; otherwise leave the rest listed.
+                if let Some(modal) = &mut self.chd_grant_modal {
+                    modal.disks.retain(|d| !dir_writable(std::path::Path::new(&d.dir)));
+                    if modal.disks.is_empty() {
+                        self.chd_grant_modal = None;
+                        self.start_emulator();
+                    }
+                }
+            }
+            ChdGrantChoice::OpenPrivacy => {
+                // Open System Settings → Privacy & Security → Full Disk Access so
+                // the user can add IRIS (the "+"). No-op off macOS.
+                #[cfg(target_os = "macos")]
+                {
+                    let _ = std::process::Command::new("open")
+                        .arg("x-apple.systempreferences:com.apple.preference.security?Privacy_AllFiles")
+                        .spawn();
+                }
+            }
+            ChdGrantChoice::Recheck => {
+                // Re-probe each listed folder; drop the ones now writable (the
+                // user allowed IRIS in System Settings). Mirrors the Grant path.
                 if let Some(modal) = &mut self.chd_grant_modal {
                     modal.disks.retain(|d| !dir_writable(std::path::Path::new(&d.dir)));
                     if modal.disks.is_empty() {

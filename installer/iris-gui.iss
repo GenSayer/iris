@@ -1,5 +1,7 @@
-; Inno Setup script for IRIS (Windows, per-user install).
-; Produces a per-user Setup.exe that installs into %LocalAppData% — no admin required.
+; Inno Setup script for IRIS (Windows).
+; Defaults to a per-user install into %LocalAppData% (no admin required), but the
+; user can choose "install for all users" (elevates to admin), which installs
+; into C:\Program Files\IRIS — the {auto*} constants follow whichever they pick.
 ;
 ; Build:
 ;   iscc /DMyAppVersion=2025-06-09-02-00 /DSourceDir=path\to\build /DAssetsDir=path\to\icons installer\iris-gui.iss
@@ -40,7 +42,12 @@ AppUpdatesURL={#MyAppURL}/releases
 LicenseFile={#LicenseFile}
 PrivilegesRequired=lowest
 PrivilegesRequiredOverridesAllowed=dialog
-DefaultDirName={localappdata}\Programs\IRIS
+; Use the "auto" Program Files constant so the destination follows the install
+; mode the user picks via PrivilegesRequiredOverridesAllowed: an all-users
+; (elevated) install lands in C:\Program Files\IRIS, a per-user install in
+; %LocalAppData%\Programs\IRIS. A literal {localappdata} would force the per-user
+; folder even when the user chose "install for all users".
+DefaultDirName={autopf}\{#MyAppName}
 DisableProgramGroupPage=yes
 DefaultGroupName={#MyAppName}
 DisableDirPage=no
@@ -66,7 +73,100 @@ Source: "{#LicenseFile}"; DestDir: "{app}"; DestName: "LICENSE.txt"; Flags: igno
 [Icons]
 Name: "{group}\{#MyAppName}"; Filename: "{app}\{#MyAppExeName}"
 Name: "{group}\Uninstall {#MyAppName}"; Filename: "{uninstallexe}"
-Name: "{userdesktop}\{#MyAppName}"; Filename: "{app}\{#MyAppExeName}"; Tasks: desktopicon
+Name: "{autodesktop}\{#MyAppName}"; Filename: "{app}\{#MyAppExeName}"; Tasks: desktopicon
 
 [Run]
 Filename: "{app}\{#MyAppExeName}"; Description: "Launch {#MyAppName}"; Flags: nowait postinstall skipifsilent
+
+; ───────────────────────────────────────────────────────────────────────────
+; Npcap handling — PCAP installer variant only (compiled with `iscc /DPcap=1`).
+; The standard/lightning installer has no [Code] section and is unchanged.
+;
+; PCAP bridged networking needs a WinPcap-compatible driver (Npcap). We do NOT
+; bundle it (proprietary, redistribution forbidden) and we never silently
+; download it. Instead, when Npcap is missing we show a page that OPENS the
+; official npcap.com download page in the user's browser; the user installs
+; Npcap themselves (its installer has its own UAC), then clicks Next to re-check.
+; The page is skipped entirely when Npcap is already present. The IRIS installer
+; stays per-user/no-admin throughout.
+#ifdef Pcap
+[Code]
+var
+  NpcapPage: TWizardPage;
+
+{ True when a WinPcap-compatible driver (Npcap, or a legacy WinPcap) is present.
+  Checks the wpcap.dll the `pcap` crate links against and the npcap service. }
+function NpcapInstalled(): Boolean;
+begin
+  Result := FileExists(ExpandConstant('{sys}\Npcap\wpcap.dll')) or
+            FileExists(ExpandConstant('{sys}\wpcap.dll')) or
+            RegKeyExists(HKLM, 'SYSTEM\CurrentControlSet\Services\npcap');
+end;
+
+{ Open the official Npcap download page in the user's default browser. }
+procedure OpenNpcapSite(Sender: TObject);
+var
+  ErrorCode: Integer;
+begin
+  ShellExec('open', 'https://npcap.com/#download', '', '', SW_SHOWNORMAL, ewNoWait, ErrorCode);
+end;
+
+procedure InitializeWizard();
+var
+  Info: TNewStaticText;
+  OpenButton: TNewButton;
+begin
+  NpcapPage := CreateCustomPage(wpSelectTasks,
+    'Npcap (packet-capture driver)',
+    'PCAP bridged networking needs the free Npcap driver.');
+
+  Info := TNewStaticText.Create(NpcapPage);
+  Info.Parent := NpcapPage.Surface;
+  Info.Left := 0;
+  Info.Top := 0;
+  Info.Width := NpcapPage.SurfaceWidth;
+  Info.AutoSize := False;
+  Info.WordWrap := True;
+  Info.Height := ScaleY(96);
+  Info.Caption :=
+    'IRIS bridged (PCAP) networking requires Npcap, a free WinPcap-compatible driver. ' +
+    'It is not bundled with IRIS and is not downloaded automatically.' + #13#10#13#10 +
+    'Click the button below to open the Npcap download page in your browser. Install ' +
+    'Npcap (its installer asks for Administrator), then return here and click Next — ' +
+    'IRIS will re-check for the driver. You can also continue and install it later.';
+
+  OpenButton := TNewButton.Create(NpcapPage);
+  OpenButton.Parent := NpcapPage.Surface;
+  OpenButton.Left := 0;
+  OpenButton.Top := Info.Top + Info.Height + ScaleY(8);
+  OpenButton.Width := ScaleX(240);
+  OpenButton.Height := ScaleY(28);
+  OpenButton.Caption := 'Open the Npcap download page';
+  OpenButton.OnClick := @OpenNpcapSite;
+end;
+
+{ Skip the Npcap page when the driver is already present. }
+function ShouldSkipPage(PageID: Integer): Boolean;
+begin
+  Result := False;
+  if (NpcapPage <> nil) and (PageID = NpcapPage.ID) then
+    Result := NpcapInstalled();
+end;
+
+{ "Try again": re-check on Next. If still missing, let the user retry (stay on
+  the page to install first) or continue without it. }
+function NextButtonClick(CurPageID: Integer): Boolean;
+begin
+  Result := True;
+  if (NpcapPage <> nil) and (CurPageID = NpcapPage.ID) and (not NpcapInstalled()) then
+  begin
+    if MsgBox(
+        'Npcap was not detected yet. PCAP bridged networking will not work until it is installed.'
+        + #13#10#13#10 +
+        'Click Yes to re-check after installing Npcap (stay on this page), or No to continue '
+        + 'and install it later.',
+        mbConfirmation, MB_YESNO) = IDYES then
+      Result := False;
+  end;
+end;
+#endif

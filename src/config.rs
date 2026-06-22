@@ -131,6 +131,9 @@ pub struct NetworkConfig {
     /// Host interface name to bridge onto when `mode == Pcap`. None = auto-pick
     /// the first non-loopback interface that libpcap reports as up/running.
     pub pcap_interface: Option<String>,
+    /// PCAP-only virtual IP for the in-process NFS server (so a bridged guest can
+    /// mount it). None = NFS-in-PCAP not configured.
+    pub nfs_pcap_ip: Option<std::net::Ipv4Addr>,
 }
 
 /// `[network]` section: backend selection and PCAP options.
@@ -144,6 +147,12 @@ pub struct NetworkSection {
     /// Run `iris --list-net-interfaces` to enumerate candidates.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pcap_interface: Option<String>,
+    /// PCAP-only: the virtual LAN IP the in-process NFS server answers on, so a
+    /// bridged guest (which is directly on your real LAN, with no NAT gateway to
+    /// reach) can mount it. None = NFS-in-PCAP not configured. NAT mode ignores
+    /// this and serves NFS at the gateway IP instead.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub nfs_pcap_ip: Option<std::net::Ipv4Addr>,
 }
 
 /// Where VINO's video-in capture should come from.
@@ -492,6 +501,7 @@ impl MachineConfig {
             nat_subnet,
             mode:         self.network.mode,
             pcap_interface: self.network.pcap_interface.clone(),
+            nfs_pcap_ip:  self.network.nfs_pcap_ip,
         }
     }
 

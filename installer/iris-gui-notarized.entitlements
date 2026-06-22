@@ -22,5 +22,15 @@
     <true/>
     <key>com.apple.security.cs.allow-unsigned-executable-memory</key>
     <true/>
+
+    <!-- PCAP (bridged networking) only. The in-app "Enable packet capture" step
+         drives a one-time admin install of Wireshark-style ChmodBPF via
+         `osascript … "do shell script … with administrator privileges"`, which
+         sends Apple Events; the hardened runtime requires this entitlement (plus
+         NSAppleEventsUsageDescription in Info.plist, added by release.yml's
+         make_dmg) or the osascript call is blocked. Harmless for non-PCAP builds.
+         REJECTED for the Mac App Store, which is fine — PCAP never ships there. -->
+    <key>com.apple.security.automation.apple-events</key>
+    <true/>
 </dict>
 </plist>

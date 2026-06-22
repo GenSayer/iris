@@ -1026,6 +1026,7 @@ impl Hpc3 {
         let subnet = net.nat_subnet.unwrap_or_default();
         let net_mode = net.mode;
         let pcap_interface = net.pcap_interface;
+        let nfs_pcap_ip = net.nfs_pcap_ip;
         let rtc = Arc::new(Ds1x86::new(8192, nvram_path));
         let pdma_dump = Arc::new(AtomicU32::new(0));
         
@@ -1095,6 +1096,7 @@ impl Hpc3 {
             netmask:    subnet.netmask,
             mode:       net_mode,
             pcap_interface,
+            nfs_pcap_ip,
             ..GatewayConfig::default()
         };
         let seeq = Arc::new(Seeq8003::with_config(Some(seeq_irq), Some(enet_rx_dma), Some(enet_tx_dma), gateway_cfg, heartbeat.clone()));
