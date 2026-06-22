@@ -404,6 +404,18 @@ impl NetBackend for PcapEngine {
                     let mac: [u8; 6] = frame[6..12].try_into().unwrap();
                     self.guest_mac = Some(mac);
                     dlog_dev!(LogModule::Net, "PCAP learned guest MAC {}", mac_str(&mac));
+                    // Now that the guest's MAC is known, push a kernel BPF filter so
+                    // promiscuous capture only delivers frames the guest can accept
+                    // (its own unicast + broadcast + multicast) rather than the whole
+                    // LAN's unicast chatter, which would otherwise flood the RX ring.
+                    // (Our own injected broadcasts still come back and are dropped by
+                    // the src==guest_mac check below.)
+                    let prog = format!("ether dst {m} or ether broadcast or ether multicast", m = mac_str(&mac));
+                    if let Err(e) = cap.filter(&prog, true) {
+                        dlog_dev!(LogModule::Net, "PCAP set capture filter failed: {}", e);
+                    } else {
+                        dlog_dev!(LogModule::Net, "PCAP capture filter set: {}", prog);
+                    }
                 }
                 // Count guest-originated IPv4 frames so the GUI's NET indicator
                 // lights in PCAP mode too (the NAT engine isn't running to bump

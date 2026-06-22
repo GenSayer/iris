@@ -145,7 +145,14 @@ pub trait SeeqCallback: Send + Sync {
 }
 
 // ── Ring-buffer capacity (number of frames) ───────────────────────────────────
-const CHAN_CAPACITY: usize = 32;
+const CHAN_CAPACITY: usize = 256;
+
+// Max RX frames the enet thread drains from the ring per loop iteration before
+// yielding to TX/interrupt work. Lets it clear a burst of address-filtered
+// chatter (a busy LAN in promiscuous PCAP mode floods the ring with frames the
+// guest rejects) in one pass, so chatter can't pin the ring full and starve the
+// guest's own frames. Bounded so TX and interrupt servicing still run.
+const RX_DRAIN_CAP: usize = 256;
 
 // ── Main device struct ────────────────────────────────────────────────────────
 pub struct Seeq8003 {
@@ -190,6 +197,7 @@ enum TxPumpResult {
 /// Result of an RX pump: applied under SeeqState lock.
 enum RxPumpResult {
     Nothing,
+    Filtered, // frame rejected by address_filter (not for the guest) and discarded
     Refused,
     Delivered { dma_irq: bool, writeback: Option<(u32, u16)>, frame_len: usize },
 }
@@ -359,7 +367,7 @@ impl Seeq8003 {
         if !Self::address_filter(rx_cmd_snap, &station_addr_snap, frame) {
             dlog_dev!(LogModule::Seeq, "SEEQ pump_rx: address filter dropped {}", eth_summary(frame));
             let _ = rx_cons.pop(); // discard filtered frame
-            return RxPumpResult::Nothing;
+            return RxPumpResult::Filtered;
         }
 
         dlog_dev!(LogModule::Seeq, "SEEQ RX {} → guest DMA", eth_summary(frame));
@@ -636,8 +644,20 @@ impl Device for Seeq8003 {
                     Self::pump_tx(dma, &mut tx_prod, &tx_wake_enet, &in_reset_enet)
                 } else { TxPumpResult::Nothing };
 
+                // Drain the RX ring: discard leading chatter (frames the guest's
+                // address_filter rejects) cheaply so a busy LAN can't pin the ring
+                // full and starve the guest's own frames, then handle at most one
+                // for-guest frame this iteration (one delivery per interrupt).
+                // Bounded by RX_DRAIN_CAP so TX and interrupt servicing still run.
                 let rx_result = if let Some(ref dma) = rx_dma {
-                    Self::pump_rx(dma, &mut rx_cons, rx_cmd_snap, station_addr_snap, &in_reset_enet)
+                    let mut r = RxPumpResult::Nothing;
+                    for _ in 0..RX_DRAIN_CAP {
+                        match Self::pump_rx(dma, &mut rx_cons, rx_cmd_snap, station_addr_snap, &in_reset_enet) {
+                            RxPumpResult::Filtered => continue,   // chatter discarded; keep draining
+                            other => { r = other; break; }        // Delivered / Refused / Nothing
+                        }
+                    }
+                    r
                 } else { RxPumpResult::Nothing };
 
                 // Now take SeeqState lock once to apply all results atomically.
@@ -676,7 +696,9 @@ impl Device for Seeq8003 {
                     RxPumpResult::Refused => {
                         dlog_dev!(LogModule::Seeq, "[ts={}] SEEQ RX DMA refused, retrying next tick", st.ts);
                     }
-                    RxPumpResult::Nothing => {}
+                    // Filtered never reaches here (the drain loop consumes it), but
+                    // keep the match exhaustive over RxPumpResult.
+                    RxPumpResult::Nothing | RxPumpResult::Filtered => {}
                 }
 
                 // Only call raise_interrupt if something actually happened this iteration.
