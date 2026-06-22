@@ -2225,18 +2225,28 @@ impl App {
         }
         use iris::nfsudp::NfsVersion;
 
-        // Gateway the guest will mount from: the one IRIS has live-adopted while
-        // running, else the gateway derived from the configured NAT subnet, else
-        // the documented default. Matches network_check_window's derivation.
-        let (eb, ep) = netplan::parse_cidr(self.cfg.nat_subnet.as_deref());
-        let cfg_gw = netplan::classify(eb, ep, &[]).derived.map(|d| d.gateway.to_string());
-        let gw = self
-            .emu
-            .status
-            .net_guest_gateway
-            .map(|g| g.to_string())
-            .or(cfg_gw)
-            .unwrap_or_else(|| "192.168.0.1".into());
+        // Address the guest mounts from. PCAP (bridged) mode: the in-core NFS
+        // server is a virtual L2 host at the IP you assigned — show that, not a NAT
+        // gateway (there is none). NAT mode: the gateway IRIS live-adopted while
+        // running, else the gateway derived from the configured subnet, else the
+        // documented default. (Matches network_check_window's derivation.)
+        let pcap = self.cfg.network.mode == iris::config::NetMode::Pcap;
+        let gw = if pcap {
+            self.cfg
+                .network
+                .nfs_pcap_ip
+                .map(|ip| ip.to_string())
+                .unwrap_or_else(|| "<set the NFS server IP under Networking>".into())
+        } else {
+            let (eb, ep) = netplan::parse_cidr(self.cfg.nat_subnet.as_deref());
+            let cfg_gw = netplan::classify(eb, ep, &[]).derived.map(|d| d.gateway.to_string());
+            self.emu
+                .status
+                .net_guest_gateway
+                .map(|g| g.to_string())
+                .or(cfg_gw)
+                .unwrap_or_else(|| "192.168.0.1".into())
+        };
 
         let mut open = true;
         egui::Window::new("Mount the shared folder in IRIX")
@@ -2260,10 +2270,15 @@ impl App {
                         return;
                     };
 
-                    ui.label(
-                        "IRIS serves the folder below over NFS, in-process, from the NAT gateway. \
+                    let source = if pcap {
+                        "as a virtual host on your LAN at the address you assigned"
+                    } else {
+                        "from the NAT gateway"
+                    };
+                    ui.label(format!(
+                        "IRIS serves the folder below over NFS, in-process, {source}. \
                          Boot IRIX, make sure networking is up (the NET light / Check networking), \
-                         then log in as root and run these commands at an IRIX shell:");
+                         then log in as root and run these commands at an IRIX shell:"));
                     ui.add_space(6.0);
 
                     if nfs.shared_dir.trim().is_empty() {
