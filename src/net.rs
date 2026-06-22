@@ -489,11 +489,14 @@ fn portmap_reply(xid: u32, port: u32) -> Vec<u8> {
 /// injected straight back to the guest — still zero host sockets. Anything else is
 /// forwarded to the wire unchanged.
 ///
-/// Limitation: no inbound IP-fragment reassembly yet, so a fragmented request
-/// (e.g. a large NFS WRITE) is currently ignored; MOUNT/READ and small ops fit one
-/// datagram. Outbound replies *are* auto-fragmented (via [`ip_frames_udp`]).
+/// Inbound IP fragments (a large NFS WRITE whose wsize exceeds the link MTU) are
+/// reassembled in [`handle_udp`] before dispatch, keyed by (src, id, proto) and
+/// aged out after 5s — mirroring the NAT engine's `handle_ip`. Outbound replies are
+/// auto-fragmented (via [`ip_frames_udp`]); MOUNT/READ and small ops still fit one
+/// datagram.
 ///
 /// [`maybe_handle`]: NfsVirtualHost::maybe_handle
+/// [`handle_udp`]: NfsVirtualHost::handle_udp
 #[cfg(feature = "pcap")]
 pub(crate) struct NfsVirtualHost {
     ip: Ipv4Addr,
@@ -501,6 +504,8 @@ pub(crate) struct NfsVirtualHost {
     server: crate::nfsudp::NfsServer,
     nfs_cfg: NfsConfig,
     ip_id: u16,
+    /// Inbound IP-fragment reassembly buffer, keyed by (src IP, IP id, proto).
+    frag_reasm: HashMap<(u32, u16, u8), FragReasm>,
 }
 
 #[cfg(feature = "pcap")]
@@ -510,7 +515,7 @@ impl NfsVirtualHost {
         // keeps the virtual NFS host as its own ARP entry. (0xBF53 ≈ "BF-NFS".)
         let mac = [0x02, 0x00, 0xDE, 0xAD, 0xBF, 0x53];
         let server = crate::nfsudp::NfsServer::new(nfs_cfg.shared_dir.clone(), nfs_cfg.version);
-        Self { ip, mac, server, nfs_cfg, ip_id: 1 }
+        Self { ip, mac, server, nfs_cfg, ip_id: 1, frag_reasm: HashMap::new() }
     }
 
     /// Handle a guest-originated Ethernet `frame` if it's addressed to the virtual
@@ -573,18 +578,40 @@ impl NfsVirtualHost {
             return None;
         }
         let src_ip = Ipv4Addr::new(ip[12], ip[13], ip[14], ip[15]);
-        // No inbound reassembly yet: drop a fragment (MF set, or non-zero offset).
-        let flags_frag = r16(ip, 6);
-        if flags_frag & 0x2000 != 0 || (flags_frag & 0x1fff) != 0 {
-            return None;
-        }
         let ihl = ((ip[0] & 0x0f) as usize) * 4;
         let ip_total = r16(ip, 2) as usize;
-        let ip_end = ip_total.min(frame.len() - 14);
-        if ip_end < ihl + 8 {
+        if ip_total < ihl || frame.len() < 14 + ihl {
             return None;
         }
-        let udp = &ip[ihl..ip_end];
+        let ip_end = ip_total.min(frame.len() - 14);
+        let ip_payload = &ip[ihl..ip_end];
+
+        // Inbound IP-fragment reassembly: a large NFS WRITE arrives fragmented when
+        // its wsize exceeds the link MTU. Buffer fragments by (src, id, proto) and
+        // only dispatch once the whole UDP datagram is contiguous; mirrors the NAT
+        // engine's `handle_ip`. Without this, large guest→host writes silently fail.
+        // A buffered-but-incomplete fragment returns `Some(vec![])` so the caller
+        // treats it as consumed (not bridged onto the wire), since it's addressed to
+        // our virtual host.
+        let flags_frag = r16(ip, 6);
+        let more = flags_frag & 0x2000 != 0;
+        let frag_off = ((flags_frag & 0x1fff) as usize) * 8;
+        let reassembled: Option<Vec<u8>> = if more || frag_off != 0 {
+            let id = r16(ip, 4);
+            let key = (u32::from(src_ip), id, IP_PROTO_UDP);
+            self.frag_reasm.retain(|_, v| v.last.elapsed() < Duration::from_secs(5));
+            match self.frag_reasm.entry(key).or_insert_with(FragReasm::new).add(frag_off, ip_payload, more) {
+                Some(full) => { self.frag_reasm.remove(&key); Some(full) }
+                None => return Some(Vec::new()), // consumed; still waiting on fragments
+            }
+        } else {
+            None
+        };
+        // The complete UDP datagram: the reassembled one, or this lone unfragmented one.
+        let udp: &[u8] = reassembled.as_deref().unwrap_or(ip_payload);
+        if udp.len() < 8 {
+            return None;
+        }
         let sport = r16(udp, 0);
         let dport = r16(udp, 2);
         let payload = &udp[8..];
@@ -913,6 +940,84 @@ mod ftp_alg_tests {
         // Malformed tuple (not six bytes) is rejected.
         assert!(ftp_pasv_rewrite(b"227 (1,2,3,4,5)\r\n", Ipv4Addr::LOCALHOST, 1).is_none());
         assert!(ftp_pasv_rewrite(b"227 (1,2,3,4,5,999)\r\n", Ipv4Addr::LOCALHOST, 1).is_none());
+    }
+}
+
+#[cfg(all(test, feature = "pcap"))]
+mod nfs_pcap_tests {
+    use super::*;
+
+    /// A 56-byte portmap GETPORT call asking for the port of `req_prog` over UDP.
+    fn getport_call(xid: u32, req_prog: u32) -> Vec<u8> {
+        let mut p = vec![0u8; 56];
+        w32(&mut p,  0, xid);
+        w32(&mut p,  4, 0);                    // msg_type = CALL
+        w32(&mut p,  8, 2);                    // rpcvers
+        w32(&mut p, 12, RPC_PROG_PORTMAP);
+        w32(&mut p, 16, 2);                    // portmap vers
+        w32(&mut p, 20, RPC_PORTMAP_GETPORT);
+        // cred (flavor+len) and verf (flavor+len) all zero (AUTH_NULL).
+        w32(&mut p, 40, req_prog);             // mapping.prog
+        w32(&mut p, 44, 3);                    // mapping.vers
+        w32(&mut p, 48, 17);                   // mapping.prot = UDP
+        w32(&mut p, 52, 0);                    // mapping.port
+        p
+    }
+
+    /// A fragmented inbound portmap request (large NFS WRITEs arrive the same way)
+    /// must be reassembled, not dropped: intermediate fragments are consumed
+    /// (`Some([])`, so the caller doesn't bridge them onto the wire) and the final
+    /// fragment yields the reply built from the whole datagram.
+    #[test]
+    fn reassembles_fragmented_request() {
+        let nfs_ip = Ipv4Addr::new(192, 168, 1, 213);
+        let guest_ip = Ipv4Addr::new(192, 168, 1, 50);
+        let guest_mac = [0x08, 0x00, 0x69, 0x01, 0x02, 0x03];
+        let host_mac  = [0x02, 0x00, 0xde, 0xad, 0xbf, 0x53];
+
+        let mut host = NfsVirtualHost::new(
+            nfs_ip,
+            NfsConfig { shared_dir: "/nonexistent".into(), version: crate::nfsudp::NfsVersion::Auto },
+        );
+
+        // Full UDP datagram (header + portmap GETPORT for NFS), then split its IP
+        // payload across two fragments at an 8-byte boundary.
+        let dgram = udp_packet(guest_ip, nfs_ip, 0x9abc, UDP_PORT_PORTMAP, &getport_call(0x1234, RPC_PROG_NFS));
+        let (a, b) = dgram.split_at(8);
+        let frag1 = ip_fragment_frame(&host_mac, &guest_mac, guest_ip, nfs_ip, IP_PROTO_UDP, 0x42, 0, true,  a);
+        let frag2 = ip_fragment_frame(&host_mac, &guest_mac, guest_ip, nfs_ip, IP_PROTO_UDP, 0x42, 8, false, b);
+
+        // First fragment: consumed, no reply yet (NOT None — None would bridge it).
+        assert_eq!(host.maybe_handle(&frag1), Some(Vec::new()));
+
+        // Second fragment completes the datagram → one reply frame.
+        let frames = host.maybe_handle(&frag2).expect("reply after reassembly");
+        assert_eq!(frames.len(), 1);
+        // eth(14) + ip(20) + udp(8) = 42-byte headers, then the 28-byte portmap reply
+        // whose final word is the resolved port.
+        let reply = &frames[0];
+        let port = u32::from_be_bytes(reply[reply.len() - 4..].try_into().unwrap());
+        assert_eq!(port, NFS_VM_PORT as u32, "portmap resolved NFS to its VM port");
+    }
+
+    /// An unfragmented request still works unchanged (no reassembly path taken).
+    #[test]
+    fn handles_unfragmented_request() {
+        let nfs_ip = Ipv4Addr::new(10, 0, 0, 9);
+        let guest_ip = Ipv4Addr::new(10, 0, 0, 2);
+        let guest_mac = [0x08, 0x00, 0x69, 0x0a, 0x0b, 0x0c];
+        let host_mac  = [0x02, 0x00, 0xde, 0xad, 0xbf, 0x53];
+
+        let mut host = NfsVirtualHost::new(
+            nfs_ip,
+            NfsConfig { shared_dir: "/nonexistent".into(), version: crate::nfsudp::NfsVersion::Auto },
+        );
+        let dgram = udp_packet(guest_ip, nfs_ip, 0x9abc, UDP_PORT_PORTMAP, &getport_call(7, RPC_PROG_MOUNTD));
+        let frame = ip_frame(&host_mac, &guest_mac, guest_ip, nfs_ip, IP_PROTO_UDP, &dgram);
+        let frames = host.maybe_handle(&frame).expect("reply");
+        let reply = &frames[0];
+        let port = u32::from_be_bytes(reply[reply.len() - 4..].try_into().unwrap());
+        assert_eq!(port, MOUNTD_VM_PORT as u32);
     }
 }
 

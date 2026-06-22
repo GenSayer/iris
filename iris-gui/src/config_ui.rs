@@ -773,6 +773,13 @@ fn show_network(
         } else { None };
         out.changed = true;
     }
+    // PCAP mode: the in-core NFS server is presented as its own virtual L2 host
+    // on the bridged LAN (see `NfsVirtualHost`), so it needs its own IP on the
+    // guest's subnet. NAT mode mounts from the gateway and doesn't use this. The
+    // change takes effect on the next Start (the virtual host is built then).
+    if cfg.nfs.is_some() && cfg.network.mode == NetMode::Pcap {
+        out.changed |= pcap_nfs_ip_row(ui, cfg, host);
+    }
     if let Some(nfs) = cfg.nfs.as_mut() {
         Grid::new("nfs_grid").num_columns(2).striped(true).show(ui, |ui| {
             ui.label("Shared dir");
@@ -840,6 +847,76 @@ fn show_network(
     }
 
     out
+}
+
+/// PCAP mode: edit the virtual NFS host's IPv4 address (`cfg.network.nfs_pcap_ip`).
+/// The server answers ARP + portmap/NFS/mountd UDP for this single address on the
+/// bridged LAN, so it only needs an IP on the guest's subnet — no netmask or
+/// gateway (it never routes). Returns true if the value changed this frame.
+fn pcap_nfs_ip_row(ui: &mut Ui, cfg: &mut MachineConfig, host: &[crate::netplan::HostIface]) -> bool {
+    #[cfg(not(feature = "pcap"))]
+    let _ = host;
+
+    let buf_id  = ui.make_persistent_id("nfs_pcap_ip_buf");
+    let last_id = ui.make_persistent_id("nfs_pcap_ip_last");
+
+    let cur = cfg.network.nfs_pcap_ip.map(|i| i.to_string()).unwrap_or_default();
+    let mut text: String = ui.data_mut(|d| d.get_temp::<String>(buf_id)).unwrap_or_else(|| cur.clone());
+    // Re-sync the buffer if the stored IP changed outside this code (machine switch).
+    let last: String = ui.data_mut(|d| d.get_temp::<String>(last_id)).unwrap_or_default();
+    if cur != last {
+        text = cur.clone();
+    }
+
+    let mut changed = false;
+    ui.horizontal(|ui| {
+        ui.label("NFS server IP");
+        let resp = ui.add(TextEdit::singleline(&mut text)
+            .hint_text("e.g. 192.168.1.213").desired_width(130.0));
+        if resp.changed() {
+            cfg.network.nfs_pcap_ip = text.trim().parse::<std::net::Ipv4Addr>().ok();
+            changed = true;
+        }
+        // One-click suggestion: a free address high in the host LAN's host range.
+        #[cfg(feature = "pcap")]
+        if let Some(ip) = suggest_nfs_ip(cfg, host) {
+            if ui.button(format!("Use {ip}"))
+                .on_hover_text("A free address on your LAN's subnet")
+                .clicked()
+            {
+                text = ip.to_string();
+                cfg.network.nfs_pcap_ip = Some(ip);
+                changed = true;
+            }
+        }
+    });
+    ui.label(RichText::new(
+        "Give the NFS server a free address on the same subnet your Indy uses (your real LAN). \
+         Then on the Indy: mount it from this IP. No gateway needed — it's reachable directly.")
+        .weak());
+
+    ui.data_mut(|d| {
+        d.insert_temp(buf_id, text);
+        d.insert_temp(last_id, cfg.network.nfs_pcap_ip.map(|i| i.to_string()).unwrap_or_default());
+    });
+    changed
+}
+
+/// Suggest a free IPv4 for the PCAP NFS host: take the subnet of the selected
+/// capture interface (else the first host interface), reserve the host's own
+/// addresses, and pick the first [`nfs_ip_candidates`] entry.
+///
+/// [`nfs_ip_candidates`]: iris::net_pcap::nfs_ip_candidates
+#[cfg(feature = "pcap")]
+fn suggest_nfs_ip(cfg: &MachineConfig, host: &[crate::netplan::HostIface]) -> Option<std::net::Ipv4Addr> {
+    let want = cfg.network.pcap_interface.as_deref().filter(|s| !s.is_empty());
+    let iface = want
+        .and_then(|n| host.iter().find(|h| h.name == n))
+        .or_else(|| host.first())?;
+    let reserved: Vec<_> = host.iter().map(|h| h.addr).collect();
+    iris::net_pcap::nfs_ip_candidates(iface.network, iface.prefix, &reserved)
+        .into_iter()
+        .next()
 }
 
 /// PCAP interface picker: a dropdown of enumerated host interfaces (with an
