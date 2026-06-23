@@ -71,19 +71,23 @@ pub mod l0_regs {
 }
 
 pub mod l1_regs {
-    pub const VERTICAL_RETRACE: u8 = 1 << 7;
-    pub const VIDEO_VSYNC: u8 = 1 << 6;
-    pub const AC_FAIL: u8 = 1 << 5;
-    pub const HPC_DMA: u8 = 1 << 4;
-    pub const MAP_INT1: u8 = 1 << 3;
-    pub const GP2: u8 = 1 << 2;
-    pub const PANEL: u8 = 1 << 1;
-    pub const GP0: u8 = 1 << 0;
+    pub const VERTICAL_RETRACE: u8 = 1 << 7; // LIO_GIO_2 / vert retrace
+    pub const VIDEO_VSYNC: u8      = 1 << 6; // LIO_VIDEO
+    pub const AC_FAIL: u8          = 1 << 5; // LIO_AC
+    pub const HPC_DMA: u8          = 1 << 4; // LIO_HPC3
+    pub const MAP_INT1: u8         = 1 << 3; // Mappable Interrupt 1 summary (map_stat & map_mask1)
+    pub const GP2: u8              = 1 << 2; // General Purpose LOCAL1_N<2>, active low
+    pub const PANEL: u8            = 1 << 1; // Panel: PWR_INT_N / UP_INT_N / DOWN_INT_N
+    pub const GP0: u8              = 1 << 0; // General Purpose LOCAL1_N<0>, active low
 }
 
 pub mod map_regs {
-    pub const SERIAL: u8 = 1 << 5;
+    pub const SERIAL: u8    = 1 << 5;
     pub const KBD_MOUSE: u8 = 1 << 4;
+    // On Indy (IP24/Guinness): GIO EXP slot 0 interrupt = LIO_2 bit 6,
+    // dispatched via lcl2_intr → fires as L0/IP2 (VECTOR_GIOEXP0 = 22 = lcl_id 2, level 6).
+    pub const GIO_EXP0: u8  = 1 << 6;
+    pub const GIO_EXP1: u8  = 1 << 7;
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -102,19 +106,19 @@ pub enum IocInterrupt {
     VideoVsync,
     AcFail,
     HpcDma,
-    Gp2,
+    Gp2,   // LOCAL1_N<2>, active low general purpose
     Panel,
-    Gp0,
+    Gp0,   // LOCAL1_N<0>, active low general purpose
 
-    // Mappable Sources
+    // Mappable Sources (LIO_2 on IP24 / MAP on IP22)
     Serial,
     KbMouse,
-    Mappable0, // Timer 0
-    Mappable1, // Timer 1
+    GioExp0,    // LIO_GIO_EXP0 = bit 6 — GIO expansion slot 0 (Indy IP24)
+    GioExp1,    // LIO_GIO_EXP1 = bit 7 — GIO expansion slot 1
+    Mappable0,  // Timer 0
+    Mappable1,  // Timer 1
     Mappable2,
     Mappable3,
-    Mappable6,
-    Mappable7,
 }
 
 struct IocState {
@@ -311,19 +315,21 @@ impl Ioc {
             IocInterrupt::VideoVsync => if active { state.l1_stat |= l1_regs::VIDEO_VSYNC } else { state.l1_stat &= !l1_regs::VIDEO_VSYNC },
             IocInterrupt::AcFail => if active { state.l1_stat |= l1_regs::AC_FAIL } else { state.l1_stat &= !l1_regs::AC_FAIL },
             IocInterrupt::HpcDma => if active { state.l1_stat |= l1_regs::HPC_DMA } else { state.l1_stat &= !l1_regs::HPC_DMA },
-            IocInterrupt::Gp2 => if active { state.l1_stat |= l1_regs::GP2 } else { state.l1_stat &= !l1_regs::GP2 },
+            IocInterrupt::Gp2   => if active { state.l1_stat |= l1_regs::GP2   } else { state.l1_stat &= !l1_regs::GP2   },
             IocInterrupt::Panel => if active { state.l1_stat |= l1_regs::PANEL } else { state.l1_stat &= !l1_regs::PANEL },
-            IocInterrupt::Gp0 => if active { state.l1_stat |= l1_regs::GP0 } else { state.l1_stat &= !l1_regs::GP0 },
+            IocInterrupt::Gp0   => if active { state.l1_stat |= l1_regs::GP0   } else { state.l1_stat &= !l1_regs::GP0   },
 
-            // Mappable
-            IocInterrupt::Serial => if active { state.map_stat |= map_regs::SERIAL } else { state.map_stat &= !map_regs::SERIAL },
+            // Mappable (LIO_2 on IP24)
+            IocInterrupt::Serial  => if active { state.map_stat |= map_regs::SERIAL    } else { state.map_stat &= !map_regs::SERIAL    },
             IocInterrupt::KbMouse => if active { state.map_stat |= map_regs::KBD_MOUSE } else { state.map_stat &= !map_regs::KBD_MOUSE },
+            IocInterrupt::GioExp0 => {
+                if active { state.map_stat |= map_regs::GIO_EXP0 } else { state.map_stat &= !map_regs::GIO_EXP0 }
+            }
+            IocInterrupt::GioExp1 => if active { state.map_stat |= map_regs::GIO_EXP1 } else { state.map_stat &= !map_regs::GIO_EXP1 },
             IocInterrupt::Mappable0 => if active { state.map_stat |= 1 << 0 } else { state.map_stat &= !(1 << 0) },
             IocInterrupt::Mappable1 => if active { state.map_stat |= 1 << 1 } else { state.map_stat &= !(1 << 1) },
             IocInterrupt::Mappable2 => if active { state.map_stat |= 1 << 2 } else { state.map_stat &= !(1 << 2) },
             IocInterrupt::Mappable3 => if active { state.map_stat |= 1 << 3 } else { state.map_stat &= !(1 << 3) },
-            IocInterrupt::Mappable6 => if active { state.map_stat |= 1 << 6 } else { state.map_stat &= !(1 << 6) },
-            IocInterrupt::Mappable7 => if active { state.map_stat |= 1 << 7 } else { state.map_stat &= !(1 << 7) },
         }
         state.update_interrupts();
     }
@@ -399,7 +405,10 @@ impl Device for Ioc {
                 (l1_regs::PANEL, "PANEL"), (l1_regs::GP0, "GP0"),
             ];
             let map_names: &[(u8, &str)] = &[
-                (map_regs::SERIAL, "SERIAL"), (map_regs::KBD_MOUSE, "KBD_MOUSE"),
+                (map_regs::GIO_EXP1,  "GIO_EXP1"),
+                (map_regs::GIO_EXP0,  "GIO_EXP0"),
+                (map_regs::SERIAL,    "SERIAL"),
+                (map_regs::KBD_MOUSE, "KBD_MOUSE"),
                 (1 << 1, "TIMER1"), (1 << 0, "TIMER0"),
             ];
             let l0_eff = s.l0_stat & s.l0_mask;
@@ -491,15 +500,15 @@ impl BusDevice for Ioc {
             IOC_PL_CNTL => 0,
             IOC_PL_STAT => 0,
 
-            IOC_INT3_L0_STAT => state.l0_stat,
-            IOC_INT3_L0_MASK => state.l0_mask,
-            IOC_INT3_L1_STAT => state.l1_stat,
-            IOC_INT3_L1_MASK => state.l1_mask,
-            IOC_INT3_MAP_STAT => state.map_stat,
-            IOC_INT3_MAP_MASK0 => state.map_mask0,
-            IOC_INT3_MAP_MASK1 => state.map_mask1,
-            IOC_INT3_MAP_POL => state.map_pol,
-            IOC_INT3_ERR_STAT => state.err_stat,
+            IOC_INT3_L0_STAT  => { dlog_dev!(LogModule::Ioc, "IOC: rd L0_STAT  → {:#04x}", state.l0_stat);  state.l0_stat }
+            IOC_INT3_L0_MASK  => { dlog_dev!(LogModule::Ioc, "IOC: rd L0_MASK  → {:#04x}", state.l0_mask);  state.l0_mask }
+            IOC_INT3_L1_STAT  => { dlog_dev!(LogModule::Ioc, "IOC: rd L1_STAT  → {:#04x}", state.l1_stat);  state.l1_stat }
+            IOC_INT3_L1_MASK  => { dlog_dev!(LogModule::Ioc, "IOC: rd L1_MASK  → {:#04x}", state.l1_mask);  state.l1_mask }
+            IOC_INT3_MAP_STAT => { dlog_dev!(LogModule::Ioc, "IOC: rd MAP_STAT → {:#04x}", state.map_stat); state.map_stat }
+            IOC_INT3_MAP_MASK0 => { dlog_dev!(LogModule::Ioc, "IOC: rd MAP_MASK0 → {:#04x}", state.map_mask0); state.map_mask0 }
+            IOC_INT3_MAP_MASK1 => { dlog_dev!(LogModule::Ioc, "IOC: rd MAP_MASK1 → {:#04x}", state.map_mask1); state.map_mask1 }
+            IOC_INT3_MAP_POL  => { dlog_dev!(LogModule::Ioc, "IOC: rd MAP_POL  → {:#04x}", state.map_pol);  state.map_pol }
+            IOC_INT3_ERR_STAT => { dlog_dev!(LogModule::Ioc, "IOC: rd ERR_STAT → {:#04x}", state.err_stat); state.err_stat }
 
             IOC_GC_SELECT => state.gc_select,
             IOC_GEN_CNTL => state.gen_cntl,
@@ -549,11 +558,11 @@ impl BusDevice for Ioc {
             IOC_PL_DATA => { dlog_dev!(LogModule::Ioc, "IOC: Write PL_DATA val {:02x}", val); },
             IOC_PL_CNTL => { dlog_dev!(LogModule::Ioc, "IOC: Write PL_CNTL val {:02x}", val); },
 
-            IOC_INT3_L0_MASK => state.l0_mask = val,
-            IOC_INT3_L1_MASK => state.l1_mask = val,
-            IOC_INT3_MAP_MASK0 => state.map_mask0 = val,
-            IOC_INT3_MAP_MASK1 => state.map_mask1 = val,
-            IOC_INT3_MAP_POL => state.map_pol = val,
+            IOC_INT3_L0_MASK  => { dlog_dev!(LogModule::Ioc, "IOC: L0_MASK  = {:#04x}", val); state.l0_mask  = val; }
+            IOC_INT3_L1_MASK  => { dlog_dev!(LogModule::Ioc, "IOC: L1_MASK  = {:#04x}", val); state.l1_mask  = val; }
+            IOC_INT3_MAP_MASK0 => { dlog_dev!(LogModule::Ioc, "IOC: MAP_MASK0 = {:#04x}", val); state.map_mask0 = val; }
+            IOC_INT3_MAP_MASK1 => { dlog_dev!(LogModule::Ioc, "IOC: MAP_MASK1 = {:#04x}", val); state.map_mask1 = val; }
+            IOC_INT3_MAP_POL  => { dlog_dev!(LogModule::Ioc, "IOC: MAP_POL   = {:#04x}", val); state.map_pol  = val; }
             IOC_INT3_TMR_CLR => {
                 dlog_dev!(LogModule::Ioc, "IOC: Timer Clear val {:02x}", val);
                 state.map_stat &= !(val & 0x3);
@@ -656,7 +665,6 @@ impl IocState {
         
         // Local 1 -> IP3 (MIPS Int 1)
         let ip3 = (self.l1_stat & self.l1_mask) != 0;
-
         // Level 2: Timer 0 -> IP4
         // Timer 0 is bit 0 of map_stat (latched)
         let ip4 = (self.map_stat & 0x01) != 0;

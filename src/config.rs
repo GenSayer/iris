@@ -197,6 +197,14 @@ impl Default for VinoStandard {
     fn default() -> Self { VinoStandard::Ntsc }
 }
 
+/// N64 development board (Ultra64) configuration.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct Ultra64Config {
+    /// Enable the N64 development board GIO device and POSIX shm IPC bridge.
+    #[serde(default)]
+    pub enabled: bool,
+}
+
 /// VINO video-in configuration.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct VinoConfig {
@@ -356,6 +364,11 @@ pub struct MachineConfig {
     /// Required for OpenBSD/NetBSD; disable if observing spurious SCSI timeouts.
     #[serde(default = "default_scsi_deferred_int")]
     pub scsi_deferred_int: bool,
+
+    /// N64 development board (Ultra64) — GIO slot 0 + shm IPC.
+    #[cfg(feature = "ultra64")]
+    #[serde(default)]
+    pub ultra64: Ultra64Config,
 }
 
 fn default_scsi_deferred_int() -> bool { true }
@@ -422,6 +435,8 @@ impl Default for MachineConfig {
             mouse_scroll_pixels_per_line: default_scroll_pixels_per_line(),
             lock_aspect_ratio: default_lock_aspect_ratio(),
             scsi_deferred_int: default_scsi_deferred_int(),
+            #[cfg(feature = "ultra64")]
+            ultra64: Ultra64Config::default(),
         }
     }
 }

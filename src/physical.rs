@@ -12,6 +12,8 @@ use crate::mc::MemoryController;
 use crate::hpc3::Hpc3;
 use crate::rex3::Rex3;
 use crate::vino::Vino;
+#[cfg(feature = "ultra64")]
+use crate::ultra64::Ultra64;
 
 // Error device for unmapped addresses
 struct ErrorBus {
@@ -192,6 +194,8 @@ pub struct Physical {
     banks: [Memory; 4],
 
     pub rex3: Option<Arc<Rex3>>,
+    #[cfg(feature = "ultra64")]
+    pub ultra64: Option<Arc<Ultra64>>,
     pub vino: Vino,
     mc: MemoryController,
     hpc3: Hpc3,
@@ -255,6 +259,8 @@ impl Physical {
     pub fn new(
         banks: [Memory; 4],
         rex3: Option<Arc<Rex3>>,
+        #[cfg(feature = "ultra64")]
+        ultra64: Option<Arc<Ultra64>>,
         vino: Vino,
         mc: MemoryController,
         hpc3: Hpc3,
@@ -288,6 +294,8 @@ impl Physical {
         Self {
             banks,
             rex3,
+            #[cfg(feature = "ultra64")]
+            ultra64,
             vino,
             mc,
             hpc3,
@@ -316,6 +324,8 @@ impl Physical {
         let cpu_err_ptr: *const dyn BusDevice = &self.cpu_bus_error;
         let gio_err_ptr: *const dyn BusDevice = &self.gio_bus_error;
         let rex3_ptr: Option<*const dyn BusDevice> = self.rex3.as_deref().map(|r| r as *const dyn BusDevice);
+        #[cfg(feature = "ultra64")]
+        let ultra64_ptr: Option<*const dyn BusDevice> = self.ultra64.as_deref().map(|u| u as *const dyn BusDevice);
         let vino_ptr: *const dyn BusDevice = &self.vino;
         let hpc3_ptr: *const dyn BusDevice = &self.hpc3;
         let mc_ptr: *const dyn BusDevice = &self.mc;
@@ -375,8 +385,20 @@ impl Physical {
         }
         // else: GIO timeout from layer 2 already covers the Newport slot
 
-        // GIO expansion slots 0 and 1 — no device attached, GIO timeout already set
-        // (left as gio_err_ptr from layer 2)
+        // GIO expansion slot 0 (0x1F400000–0x1F5FFFFF): N64 dev board if enabled
+        #[cfg(feature = "ultra64")]
+        if let Some(u64_ptr) = ultra64_ptr {
+            use crate::ultra64::{GIO_SLOT0_BASE, RAMROM_BASE, RAMROM_SIZE};
+            // Control registers: 0x1F400000–0x1F4FFFFF (16 × 64KB slots)
+            for i in (GIO_SLOT0_BASE >> 16)..((RAMROM_BASE - 1) >> 16) + 1 {
+                self.device_map[i as usize] = u64_ptr;
+            }
+            // RAMROM window: 0x1F500000–0x1F5FFFFF (16 × 64KB slots)
+            for i in (RAMROM_BASE >> 16)..((RAMROM_BASE + RAMROM_SIZE - 1) >> 16) + 1 {
+                self.device_map[i as usize] = u64_ptr;
+            }
+        }
+        // GIO expansion slot 1 (0x1F600000–0x1F9FFFFF) — no device, GIO timeout remains
 
         // Map MC registers (128KB at 0x1FA00000)
         for i in (MC_BASE >> 16)..((MC_END - 1) >> 16) + 1 {

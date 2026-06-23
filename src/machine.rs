@@ -337,6 +337,20 @@ impl Machine {
             Some(r)
         };
 
+        // N64 development board (Ultra64) — GIO slot 0 at 0x1F400000
+        #[cfg(feature = "ultra64")]
+        let ultra64: Option<Arc<crate::ultra64::Ultra64>> = if cfg.ultra64.enabled {
+            match crate::ultra64::Ultra64::new(ioc.clone()) {
+                Ok(dev) => Some(Arc::new(dev)),
+                Err(e)  => {
+                    eprintln!("ultra64: failed to initialize ({e}); running without N64 dev board");
+                    None
+                }
+            }
+        } else {
+            None
+        };
+
         // VINO (Video-In, No Out) — GIO64 at 0x1F080000
         let vino = crate::vino::Vino::new();
         {
@@ -353,6 +367,8 @@ impl Machine {
         let phys_raw = Physical::new(
             banks,
             rex3,
+            #[cfg(feature = "ultra64")]
+            ultra64,
             vino,
             mc.clone(),
             hpc3.clone(),
@@ -482,6 +498,8 @@ impl Machine {
         monitor.register_device(Arc::new(hpc3.clone()));
         monitor.register_device(phys.clone());
         if let Some(rex3) = &phys.rex3 { monitor.register_device(rex3.clone()); }
+        #[cfg(feature = "ultra64")]
+        if let Some(u64) = &phys.ultra64 { monitor.register_device(u64.clone()); }
         monitor.register_device(Arc::new(phys.vino.clone()));
         let monitor = Arc::new(monitor);
 
@@ -554,6 +572,8 @@ impl Machine {
         self.mc.start();
         self.hpc3.start();
         if let Some(rex3) = &self._phys.rex3 { rex3.start(); }
+        #[cfg(feature = "ultra64")]
+        if let Some(u64) = &self._phys.ultra64 { u64.start(); }
 
         // Monitor server on localhost:8888 — always start, even in CI mode,
         // so debug helpers (status/regs/bt/dis) stay reachable while iris-ci
@@ -628,6 +648,8 @@ impl Machine {
         if let Some(rex3) = &self._phys.rex3 { rex3.stop(); }
         self.hpc3.stop();
         self.mc.stop();
+        #[cfg(feature = "ultra64")]
+        if let Some(u64) = &self._phys.ultra64 { u64.stop(); }
     }
 
     pub fn run_console_client() {

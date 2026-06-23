@@ -620,6 +620,12 @@ pub struct MipsExecutor<T: Tlb, C: MipsCache> {
     /// When true, the next call to step() skips all breakpoint checks.
     /// Cleared automatically after one step. Used to resume past a breakpoint.
     pub skip_breakpoints: bool,
+    /// When true, the next call to step() skips the pending-interrupt check.
+    /// Cleared automatically after one step. Used by the debugger `s` command
+    /// so single-stepping works inside an interrupt handler whose source is
+    /// still asserted (without this, the CPU re-takes the exception every step).
+    #[cfg(feature = "developer")]
+    pub skip_interrupts: bool,
     /// Current decoded instruction — written by fetch_instr, read by exec_decoded.
     pub ins: DecodedInstr,
     /// Count of instructions that were already decoded (cache hit).
@@ -801,6 +807,8 @@ impl<T: Tlb, C: MipsCache> MipsExecutor<T, C> {
             pc_bp_count: 0,
             mem_bp_count: 0,
             skip_breakpoints: false,
+            #[cfg(feature = "developer")]
+            skip_interrupts: false,
             ins: DecodedInstr::default(), // scratch slot for uncached fetches
             decoded_count: Arc::new(AtomicU64::new(0)),
             uncached_fetch_count: Arc::new(AtomicU64::new(0)),
@@ -1014,10 +1022,14 @@ impl<T: Tlb, C: MipsCache> MipsExecutor<T, C> {
             // Merge external IP bits into Cause
             self.core.cp0_cause = (self.core.cp0_cause & !EXT_INT_MASK) | (pending as u32 & EXT_INT_MASK);
 
-            if self.core.interrupts_enabled() {
+            #[cfg(feature = "developer")]
+            let skip_int = self.skip_interrupts;
+            #[cfg(not(feature = "developer"))]
+            let skip_int = false;
+
+            if self.core.interrupts_enabled() && !skip_int {
                 let ip = self.core.cp0_cause & crate::mips_core::CAUSE_IP_MASK;
                 let im = self.core.cp0_status & crate::mips_core::STATUS_IM_MASK;
-
                 if (ip & im) != 0 {
                     let s = exec_exception(EXC_INT);
                     return self.handle_exception(s);
@@ -4961,6 +4973,8 @@ impl<T: Tlb + Send + 'static, C: MipsCache + Send + 'static> MipsCpu<T, C> {
                 }
             }
             exec.flush_cycles();
+            #[cfg(feature = "developer")]
+            { exec.skip_interrupts = false; }
             if let Some(ref mut f) = *trace_file.lock() { let _ = f.flush(); }
 
             // Print next instruction
@@ -5392,6 +5406,8 @@ impl<T: Tlb + Send + 'static, C: MipsCache + Send + 'static> Device for MipsCpu<
             ("finish".to_string(), "Run until function return (jr ra)".to_string()),
             ("fin".to_string(), "Alias for finish".to_string()),
             ("s".to_string(), "Alias for step".to_string()),
+            #[cfg(feature = "developer")]
+            ("si".to_string(), "Step suppressing interrupt delivery (alias for step, no interrupts taken) [DEV]".to_string()),
             ("n".to_string(), "Alias for next".to_string()),
             ("regs".to_string(), "Dump registers".to_string()),
             ("r".to_string(), "Alias for regs".to_string()),
@@ -5789,7 +5805,7 @@ impl<T: Tlb + Send + 'static, C: MipsCache + Send + 'static> Device for MipsCpu<
                     Err("Could not determine return address".to_string())
                 }
             }
-            "step" | "s" => {
+            "step" | "s" | "si" => {
                 let actual_args = if actual_args.first() == Some(&"block") { &actual_args[1..] } else { actual_args };
                 let mut count = Some(1);
                 let mut until_pc = None;
@@ -5818,6 +5834,8 @@ impl<T: Tlb + Send + 'static, C: MipsCache + Send + 'static> Device for MipsCpu<
                 if let Some(pc) = until_pc {
                     self.executor.lock().set_temp_breakpoint(pc);
                 }
+                #[cfg(feature = "developer")]
+                if cmd == "si" { self.executor.lock().skip_interrupts = true; }
                 self.run_debug_loop(count, true, writer);
                 Ok(())
             }

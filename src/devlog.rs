@@ -35,6 +35,7 @@ pub enum LogModule {
     L1i    = 20,  // L1 instruction cache: fetch hit/miss, fill, cache ops
     L1d    = 21,  // L1 data cache: read/write hit/miss, fill, cache ops
     L2c    = 22,  // L2 unified cache: fill, writeback, invalidate, cache ops
+    Ultra  = 23,  // N64 dev board: shm reads/writes, interrupts, register traffic
 }
 
 // Mask bits shared by L1i / L1d / L2c
@@ -43,7 +44,7 @@ pub const CACHE_LOG_MISS: u32 = 0x2;  // log misses and fills
 pub const CACHE_LOG_OP:   u32 = 0x4;  // log CACHE instruction ops
 
 impl LogModule {
-    pub const COUNT: usize = 23;
+    pub const COUNT: usize = 24;
 
     pub fn from_str(s: &str) -> Option<Self> {
         match s {
@@ -70,6 +71,7 @@ impl LogModule {
             "l1i"    => Some(Self::L1i),
             "l1d"    => Some(Self::L1d),
             "l2c"    => Some(Self::L2c),
+            "ultra"  => Some(Self::Ultra),
             _        => None,
         }
     }
@@ -99,6 +101,7 @@ impl LogModule {
             Self::L1i    => "l1i",
             Self::L1d    => "l1d",
             Self::L2c    => "l2c",
+            Self::Ultra  => "ultra",
         }
     }
 
@@ -108,7 +111,7 @@ impl LogModule {
             Self::Rex3, Self::Mips, Self::Ioc, Self::Scsi, Self::Pdma,
             Self::Vino, Self::Dcb, Self::Vc2, Self::Cmap, Self::Xmap,
             Self::Bt445, Self::Scc, Self::Ps2, Self::Rtc, Self::Eeprom,
-            Self::L1i, Self::L1d, Self::L2c,
+            Self::L1i, Self::L1d, Self::L2c, Self::Ultra,
         ]
     }
 
@@ -240,6 +243,7 @@ impl DevLog {
                 ModuleLog::new(), ModuleLog::new(), // Bt445, Scc
                 ModuleLog::new(), ModuleLog::new(), ModuleLog::new(), // Ps2, Rtc, Eeprom
                 ModuleLog::new(), ModuleLog::new(), ModuleLog::new(), // L1i, L1d, L2c
+                ModuleLog::new(), // Ultra
             ],
         }
     }

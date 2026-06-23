@@ -96,6 +96,8 @@ pub mod camera;
 pub mod saa7191;
 pub mod video_source;
 pub mod vino;
+pub mod ultra_proto;
+pub mod ultra64;
 #[cfg(feature = "jit")]
 pub mod jit;
 #[cfg(feature = "rex-jit")]

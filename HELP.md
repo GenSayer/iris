@@ -328,6 +328,12 @@ cdrom = true
 source       = "test_pattern"
 standard     = "ntsc"
 camera_index = 0
+
+# N64 development board emulation.
+# Requires the ultra64-enabled gopher64 fork running alongside IRIS.
+# See the "N64 Development Board" section below for setup instructions.
+[ultra64]
+enabled = false
 ```
 
 Looks like we have some problems automounting hybrid ISO9660 CDs like Hot Mix 19 while efs formatted ones and pure iso9660 seem to work fine.
@@ -602,6 +608,68 @@ Modules: `net hpc3 seeq hal2 mc rex3 mips ioc scsi pdma vino dcb vc2 cmap xmap b
 
 PDMA mask categories: `hal enet scsi on/all off/none <hex>`
 MIPS mask categories: `insn tlb mem on/all off/none <hex>`
+
+---
+
+---
+
+## N64 Development Board (ultra64)
+
+IRIS emulates the SGI Indy N64 development board — the hardware Nintendo used
+to develop and test N64 games.  When enabled, IRIS presents a 16 MB RAMROM
+shared-memory region that the N64 emulator (gopher64) maps as its cartridge ROM.
+You can load and run N64 ROMs from IRIX using the `gload` utility, and switch
+games at any time.
+
+The N64 emulator is a fork of the open-source
+[gopher64](https://github.com/gopher64/gopher64) project, extended with the
+development board IPC bridge.  The IRIS-compatible fork lives at:
+**<https://github.com/techomancer/gopher64>** (branch `ultra64`).
+
+### Setup
+
+1. Enable the dev board in `iris.toml` and start IRIS:
+
+   ```toml
+   [ultra64]
+   enabled = true
+   ```
+
+   ```bash
+   cargo run --release --features lightning,rex-jit
+   ```
+
+2. Build and run the N64 emulator (it can be started at any time — it will
+   wait for IRIS to create the shared memory region):
+
+   ```bash
+   git clone -b ultra64 https://github.com/techomancer/gopher64
+   cd gopher64
+   cargo run --features ultra64 --no-default-features
+   ```
+
+3. From IRIX, load a ROM with `gload`:
+
+   ```sh
+   gload /path/to/game.n64
+   ```
+
+   The N64 window will appear, boot the ROM, and display the game.
+   Run `gload` again with a different ROM to switch games — the N64 resets
+   and reinitializes cleanly.
+
+### Monitor commands
+
+| Command | Description |
+|---------|-------------|
+| `ultra status` | Show dev board state (reset, page, interrupt, RDB) |
+| `ultra send <hex>` | Send a CART_INT payload to the N64 |
+| `ultra reset` | Assert N64 reset |
+| `ultra load <path> [offset]` | Load a binary directly into RAMROM (for testing) |
+| `ultra r <offset>` | Read a word from RAMROM |
+| `ultra w <offset> <val>` | Write a word to RAMROM |
+| `ultra dump <offset> <size>` | Hex dump of RAMROM |
+| `ultra disasm <offset> <count>` | Disassemble RAMROM (MIPS) |
 
 ---
 

@@ -21,7 +21,7 @@ and 5.3 to a usable system (shell, networking, X11). It is **not** cycle-accurat
 
 ```
 cargo run --release                                       # interpreter
-cargo run --release --features lightning,rex-jit,tlbvmap  # recommended for speed
+cargo run --release --features lightning,rex-jit          # recommended for speed
 IRIS_JIT=1 cargo run --release --features jit             # enable MIPS JIT
 ```
 
