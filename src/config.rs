@@ -815,7 +815,7 @@ mod export_tests {
         let mut cfg = MachineConfig::default();
         cfg.scsi.insert(4, ScsiDeviceConfig {
             path: "/abs/cd.chd".into(), discs: vec![], cdrom: true,
-            overlay: false, scratch: false, size_mb: None,
+            overlay: false, scratch: false, size_mb: None, hotswappable: false,
         });
         let s = toml::to_string_pretty(&cfg).expect("serialize");
         let back: MachineConfig = toml::from_str(&s).expect("deserialize");
