@@ -478,6 +478,28 @@ impl Wd33c93a {
         }
     }
 
+    /// Enable or disable hotswappable mode for a CD-ROM device.
+    /// In hotswappable mode, load_disc replaces the current disc instead of
+    /// accumulating a changer queue, and eject clears the tray.
+    pub fn set_hotswappable(&self, id: usize, hotswappable: bool) -> Result<(), String> {
+        let mut state = self.state.lock();
+        match state.devices.get_mut(id).and_then(|d| d.as_mut()) {
+            None => Err(format!("No device at SCSI ID {}", id)),
+            Some(dev) => {
+                dev.set_hotswappable(hotswappable);
+                Ok(())
+            }
+        }
+    }
+
+    /// Check if a CD-ROM device is in hotswappable mode.
+    pub fn is_hotswappable(&self, id: usize) -> bool {
+        let state = self.state.lock();
+        state.devices.get(id)
+            .and_then(|d| d.as_ref())
+            .map_or(false, |dev| dev.is_hotswappable())
+    }
+
     /// Remove a disc by ordinal from a CD-ROM device's queue.
     pub fn remove_disc(&self, id: usize, ordinal: usize) -> Result<String, String> {
         let mut state = self.state.lock();

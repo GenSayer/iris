@@ -265,13 +265,21 @@ impl Machine {
                 }
             }
             let (path, discs) = if dev.cdrom {
-                let mut list = dev.discs.clone();
-                if list.is_empty() {
+                // Build the changer list, skipping empty paths (an empty path
+                // means "drive present, tray empty" — valid for hotswappable
+                // CD-ROMs where media is loaded later at runtime).
+                let mut list: Vec<String> = Vec::new();
+                if !dev.path.is_empty() {
                     list.push(dev.path.clone());
-                } else if list[0] != dev.path {
-                    list.insert(0, dev.path.clone());
                 }
-                (list[0].clone(), list)
+                for d in &dev.discs {
+                    if !d.is_empty() && !list.contains(d) {
+                        list.push(d.clone());
+                    }
+                }
+                // Active disc is the first entry, or empty (no media) if none.
+                let active = list.first().cloned().unwrap_or_default();
+                (active, list)
             } else {
                 (dev.path.clone(), vec![])
             };
@@ -303,6 +311,10 @@ impl Machine {
                 }
                 eprintln!("iris: fatal: {msg}");
                 std::process::exit(1);
+            }
+            // Apply hotswappable mode for CD-ROMs
+            if dev.cdrom && dev.hotswappable {
+                let _ = hpc3.scsi().set_hotswappable(id as usize, true);
             }
         }
 

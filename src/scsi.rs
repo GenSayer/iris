@@ -154,6 +154,10 @@ pub struct ScsiDevice {
     /// Logical block size: LBA→byte offset = lba * logical_block_size.
     /// Defaults to 512. IRIX switches via MODE SELECT (512↔2048). Persists across disc changes.
     logical_block_size: u64,
+    /// Hotswappable mode (CD-ROM only): `load_disc` replaces the active disc
+    /// rather than growing a changer queue, and eject empties the tray instead
+    /// of cycling to the next disc. Set from `ScsiDeviceConfig.hotswappable`.
+    hotswappable: bool,
 }
 
 const SCSI_BUFFER_SIZE: usize = 0x4000; // 16KB (16384 bytes)
@@ -173,6 +177,7 @@ impl ScsiDevice {
             // CD-ROM drives default to 2048-byte logical blocks (Sony CDU-76S behaviour).
             // HDD defaults to 512. dksc switches CD-ROM to 512 for EFS, back to 2048 for ISO.
             logical_block_size: if is_cdrom { 2048 } else { 512 },
+            hotswappable: false,
         }
     }
 
@@ -191,12 +196,23 @@ impl ScsiDevice {
             unit_attention: false,
             phys_block_size: 2048,
             logical_block_size: 2048,
+            hotswappable: false,
         }
     }
 
     /// Whether physical media is loaded. For HDDs always true; for CD-ROMs
     /// false when the tray is empty.
     pub fn has_media(&self) -> bool { self.backend.is_some() }
+
+    /// Set hotswappable mode for CD-ROMs. In hotswappable mode, `load_disc`
+    /// replaces the current disc instead of accumulating a changer queue.
+    pub fn set_hotswappable(&mut self, hotswappable: bool) {
+        if self.is_cdrom {
+            self.hotswappable = hotswappable;
+        }
+    }
+
+    pub fn is_hotswappable(&self) -> bool { self.hotswappable }
 
     /// Mount media on a previously-empty CD-ROM, or swap the disc on a
     /// loaded one. Sets `unit_attention` so the guest re-reads capacity.
@@ -342,8 +358,22 @@ impl ScsiDevice {
     /// Advance to the next disc in the list (wraps around).
     /// Returns the new active disc path, or None if this is not a CD-ROM
     /// or there is only one disc.
+    /// In hotswappable mode, ejects simply clear the tray instead of cycling.
     pub fn eject_next(&mut self) -> Option<String> {
-        if !self.is_cdrom || self.discs.len() <= 1 {
+        if !self.is_cdrom {
+            return None;
+        }
+        if self.hotswappable {
+            // Hotswappable: eject empties the tray; no cycling
+            let prev_disc = self.filename.clone();
+            self.unload_media();
+            self.discs.clear(); // Clear the disc list so no phantom entries remain
+            if !prev_disc.is_empty() {
+                eprintln!("CD-ROM hotswap: ejected '{}', tray empty", prev_disc);
+            }
+            return None;
+        }
+        if self.discs.len() <= 1 {
             return None;
         }
         // Rotate: move front to back, new front becomes active.
@@ -361,6 +391,7 @@ impl ScsiDevice {
                 // that persists across disc changes, just like on real hardware.
                 self.filename = next_path.clone();
                 self.unit_attention = true; // signal medium change on next command
+                eprintln!("CD-ROM changer: switched to '{}'", next_path);
                 Some(next_path)
             }
             Err(e) => {
@@ -389,6 +420,10 @@ impl ScsiDevice {
     /// command. The image is opened as a raw ISO (`Direct` backend), matching
     /// the changer's eject path. Err if this is not a CD-ROM or the file can't
     /// be opened.
+    ///
+    /// In hotswappable mode, the disc list is replaced with only the new disc
+    /// (no accumulation). In legacy changer mode, the new disc is inserted at
+    /// index 0 and the list grows.
     pub fn load_disc(&mut self, path: String) -> Result<String, String> {
         if !self.is_cdrom {
             return Err("Not a CD-ROM device".to_string());
@@ -402,7 +437,14 @@ impl ScsiDevice {
         // settings), exactly as in eject_next.
         self.filename = path.clone();
         self.unit_attention = true; // signal medium change on next command
-        self.discs.insert(0, path.clone());
+
+        if self.hotswappable {
+            // Hotswappable: replace the entire disc list with just this one disc
+            self.discs = vec![path.clone()];
+        } else {
+            // Legacy changer: insert at front, accumulating the list
+            self.discs.insert(0, path.clone());
+        }
         Ok(path)
     }
 
@@ -702,8 +744,9 @@ impl ScsiDevice {
         let loej  = (cdb[4] & 0x02) != 0;
         let start = (cdb[4] & 0x01) != 0;
         if loej && !start && self.is_cdrom {
-            // Eject requested — advance to next disc in changer list.
-            if self.discs.len() > 1 {
+            // Eject requested — advance to next disc in changer list (legacy),
+            // or clear the tray (hotswappable).
+            if self.hotswappable || self.discs.len() > 1 {
                 self.eject_next();
             }
         }
@@ -1097,9 +1140,13 @@ impl ScsiDevice {
         if !self.is_cdrom {
             return Ok(self.check_condition(0x05, 0x20, 0x00)); // Invalid command for HDD
         }
-        if self.discs.len() > 1 {
+        if self.hotswappable || self.discs.len() > 1 {
             self.eject_next();
-            eprintln!("SCSI SGI_EJECT: switched to disc {}", self.filename);
+            if self.filename.is_empty() {
+                eprintln!("SCSI SGI_EJECT: tray emptied");
+            } else {
+                eprintln!("SCSI SGI_EJECT: switched to disc {}", self.filename);
+            }
         } else {
             eprintln!("SCSI SGI_EJECT: no additional discs in changer list");
         }

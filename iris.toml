@@ -125,6 +125,18 @@ bind       = "localhost"
 #cdrom  = true
 #discs = ["second.iso", "cdrom4.iso", "patches.iso"]
 
+# Hotswappable CD-ROM (recommended for interactive disc switching).
+# With hotswappable = true you can load any ISO/CHD at runtime by pressing
+# Ctrl+F12 (RCtrl+F12 in the standalone window, Ctrl/Cmd+F12 in the GUI) and
+# picking a file — no need to pre-list discs here. Loading a disc replaces the
+# current one (no changer queue accumulates), and eject simply empties the tray.
+# `path` is optional in this mode: omit it (or comment it out) to boot with an
+# empty drive and insert media later.
+#[scsi.4]
+#cdrom        = true
+#hotswappable = true
+#path         = "cdrom4.iso"   # optional — omit to start with an empty tray
+
 #[vino]
 #source = "camera"
 

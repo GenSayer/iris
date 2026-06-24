@@ -9,6 +9,8 @@ pub const VALID_BANK_SIZES: &[u32] = &[0, 8, 16, 32, 64, 128];
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ScsiDeviceConfig {
     /// Path to the disk image or ISO file (primary/current disc).
+    /// For hotswappable CD-ROMs, this can be omitted (defaults to empty string).
+    #[serde(default)]
     pub path: String,
     /// Additional ISO images for CD-ROM changers (ignored for HDD).
     #[serde(default)]
@@ -32,6 +34,12 @@ pub struct ScsiDeviceConfig {
     /// already exists or `scratch=false`.
     #[serde(default)]
     pub size_mb: Option<u32>,
+    /// Hotswappable mode (CD-ROM only): load_disc replaces the current disc
+    /// instead of accumulating a changer queue, and eject clears the tray
+    /// instead of cycling to the next disc. Designed for on-the-fly disc
+    /// switching via keyboard shortcuts. Ignored for HDDs.
+    #[serde(default)]
+    pub hotswappable: bool,
 }
 
 /// Protocol for port forwarding.
@@ -384,6 +392,7 @@ fn default_scsi() -> std::collections::HashMap<u8, ScsiDeviceConfig> {
         overlay: false,
         scratch: false,
         size_mb: None,
+        hotswappable: false,
     });
     map.insert(4, ScsiDeviceConfig {
         path: "cdrom4.iso".to_string(),
@@ -392,6 +401,7 @@ fn default_scsi() -> std::collections::HashMap<u8, ScsiDeviceConfig> {
         overlay: false,
         scratch: false,
         size_mb: None,
+        hotswappable: false,
     });
     map
 }
@@ -479,10 +489,24 @@ impl MachineConfig {
             if *id == 0 || *id > 7 {
                 return Err(format!("SCSI ID {} is out of range (1–7)", id));
             }
-            // CD-ROM with empty path + no changer entries = drive present, no
-            // media loaded. This is a valid runtime state (see
-            // Wd33c93a::add_device empty-CD-ROM path / insert_disc).
-            let _ = dev; // explicitly keep the binding for future checks
+            if dev.cdrom {
+                // hotswappable + discs list is contradictory: discs is for the
+                // legacy changer queue; hotswappable replaces it with runtime loading.
+                if dev.hotswappable && !dev.discs.is_empty() {
+                    return Err(format!(
+                        "SCSI ID {id}: hotswappable=true and a discs list are mutually exclusive; \
+                         remove the discs list or set hotswappable=false"
+                    ));
+                }
+                // Non-hotswappable CD-ROM with no media = mis-configuration.
+                // Empty + no discs is valid only in hotswappable mode.
+                if !dev.hotswappable && dev.path.is_empty() && dev.discs.is_empty() {
+                    return Err(format!(
+                        "SCSI ID {id}: CD-ROM has no disc configured (path and discs are both empty); \
+                         set a path/discs, or enable hotswappable=true to start with an empty tray"
+                    ));
+                }
+            }
         }
         Ok(())
     }
@@ -672,6 +696,7 @@ impl Cli {
                 overlay: false,
                 scratch: false,
                 size_mb: None,
+                hotswappable: false,
             });
             entry.path = path;
             entry.cdrom = cdrom;
