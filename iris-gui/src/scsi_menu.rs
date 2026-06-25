@@ -153,14 +153,14 @@ pub fn apply(cfg: &mut MachineConfig, action: ScsiAction) -> Option<String> {
         ScsiAction::None => None,
         ScsiAction::AttachHdd { id, path } => {
             cfg.scsi.insert(id, ScsiDeviceConfig {
-                path, discs: vec![], cdrom: false, overlay: false, scratch: false, size_mb: None, hotswappable: false,
+                path, discs: vec![], cdrom: false, overlay: false, scratch: false, size_mb: None,
             });
             Some(format!("scsi{id}: HDD attached"))
         }
         ScsiAction::AttachEmptyCdrom { id } => {
             cfg.scsi.insert(id, ScsiDeviceConfig {
                 path: String::new(), discs: vec![], cdrom: true,
-                overlay: false, scratch: false, size_mb: None, hotswappable: false,
+                overlay: false, scratch: false, size_mb: None,
             });
             Some(format!("scsi{id}: empty CD-ROM drive attached"))
         }

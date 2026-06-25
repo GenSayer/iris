@@ -169,8 +169,8 @@ pub enum ConfigAction {
     /// the app should run the platform's privilege flow (Linux setcap/pkexec,
     /// macOS ChmodBPF install, Windows driver check) via `capture_access`.
     EnablePacketCapture,
-    /// User picked a disc image for a hotswappable CD-ROM while the machine is
-    /// running — send Cmd::LoadDisc immediately without waiting for restart.
+    /// User picked a disc image for a CD-ROM while the machine is running —
+    /// send Cmd::LoadDisc immediately without waiting for restart.
     LoadDisc { id: u8, path: String },
 }
 
@@ -335,7 +335,6 @@ fn show_disks(ui: &mut Ui, cfg: &mut MachineConfig) -> (PathEdit, ConfigAction) 
                     overlay: false,
                     scratch: false,
                     size_mb: None,
-                    hotswappable: false,
                 });
             }
         });
@@ -347,9 +346,11 @@ fn show_disks(ui: &mut Ui, cfg: &mut MachineConfig) -> (PathEdit, ConfigAction) 
                     DISK_FILTERS);
                 edit.changed |= e.changed;
                 edit.picked |= e.picked;
-                // For hotswappable CD-ROMs, picking a path immediately loads the
-                // disc into the running machine (equivalent to Ctrl+F12).
-                if dev.cdrom && dev.hotswappable && e.picked && !dev.path.is_empty() {
+                // For CD-ROMs, picking a path immediately loads the disc into
+                // the running machine (equivalent to Ctrl+F12). The core's
+                // count-driven queue decides whether this replaces the current
+                // disc or joins the changer cycle.
+                if dev.cdrom && e.picked && !dev.path.is_empty() {
                     action = ConfigAction::LoadDisc { id, path: dev.path.clone() };
                 }
                 ui.end_row();
@@ -421,17 +422,6 @@ fn show_disks(ui: &mut Ui, cfg: &mut MachineConfig) -> (PathEdit, ConfigAction) 
                 ui.checkbox(&mut dev.scratch, "");
                 ui.end_row();
 
-                if dev.cdrom {
-                    ui.label("Hotswappable")
-                        .on_hover_text(
-                            "Enable on-the-fly disc switching via Ctrl+F12. \
-                             Eject clears the tray instead of cycling to the next disc. \
-                             The drive starts with an empty tray even if no path is configured.");
-                    ui.checkbox(&mut dev.hotswappable, "")
-                        .on_hover_text("Use Ctrl+F12 to load any disc at runtime");
-                    ui.end_row();
-                }
-
                 if dev.scratch {
                     ui.label("Scratch size (MB)");
                     let mut sz = dev.size_mb.unwrap_or(64);
@@ -442,7 +432,7 @@ fn show_disks(ui: &mut Ui, cfg: &mut MachineConfig) -> (PathEdit, ConfigAction) 
                 }
             });
 
-            if dev.cdrom && !dev.hotswappable {
+            if dev.cdrom {
                 ui.label("Extra changer discs:");
                 let mut drop_idx: Option<usize> = None;
                 for (i, disc) in dev.discs.iter_mut().enumerate() {

@@ -2617,19 +2617,15 @@ impl eframe::App for App {
         // without needing to configure it in iris.toml or use the SCSI menu.
         if ctx.input(|i| i.modifiers.command && i.key_pressed(egui::Key::F12)) {
             if self.emu.is_running() {
-                // Find the first hotswappable CD-ROM device
+                // Find the first CD-ROM device
                 let cdrom_id = self.cfg.scsi.iter()
-                    .find(|(_, dev)| dev.cdrom && dev.hotswappable)
+                    .find(|(_, dev)| dev.cdrom)
                     .map(|(id, _)| *id);
-                // Check if there's a non-hotswappable CD-ROM instead
-                let non_hs = self.cfg.scsi.iter().any(|(_, dev)| dev.cdrom && !dev.hotswappable);
 
                 if let Some(id) = cdrom_id {
                     if let Some(path) = scsi_menu::pick_iso("Load CD-ROM disc") {
                         self.emu.send(Cmd::LoadDisc { id, path });
                     }
-                } else if non_hs {
-                    self.toast("CD-ROM not hotswappable (enable hotswappable=true in config)");
                 } else {
                     self.toast("No CD-ROM drive attached");
                 }
@@ -2756,7 +2752,7 @@ impl eframe::App for App {
             let path_str = result.path.to_string_lossy().into_owned();
             self.cfg.scsi.insert(result.scsi_id, iris::config::ScsiDeviceConfig {
                 path: path_str.clone(), discs: vec![], cdrom: false,
-                overlay: false, scratch: false, size_mb: None, hotswappable: false,
+                overlay: false, scratch: false, size_mb: None,
             });
             self.mark_dirty();
             self.toast(format!("created {path_str} and attached at scsi{}", result.scsi_id));

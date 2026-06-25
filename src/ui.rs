@@ -810,11 +810,6 @@ impl Ui {
                 let cdrom_id = scsi.disc_status().first().map(|(id, ..)| *id);
 
                 if let Some(id) = cdrom_id {
-                    // Check if the drive is in hotswappable mode
-                    if !scsi.is_hotswappable(id) {
-                        eprintln!("SCSI #{}: hotswap disabled (set hotswappable=true in iris.toml)", id);
-                        return;
-                    }
                     // Open file picker (blocks the event loop but winit tolerates it on most platforms)
                     if let Some(path) = rfd::FileDialog::new()
                         .set_title("Load CD-ROM disc")

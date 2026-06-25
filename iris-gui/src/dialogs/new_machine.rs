@@ -218,7 +218,6 @@ impl NewMachineDialog {
                                 overlay: false,
                                 scratch: false,
                                 size_mb: None,
-                                hotswappable: false,
                             });
                         }
                         if self.attach_cdrom && !self.cdrom4_path.is_empty() {
@@ -229,7 +228,6 @@ impl NewMachineDialog {
                                 overlay: false,
                                 scratch: false,
                                 size_mb: None,
-                                hotswappable: false,
                             });
                         }
                         let name = if self.name.trim().is_empty() { "indy".to_string() } else { self.name.trim().to_string() };

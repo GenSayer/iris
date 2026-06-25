@@ -266,8 +266,8 @@ impl Machine {
             }
             let (path, discs) = if dev.cdrom {
                 // Build the changer list, skipping empty paths (an empty path
-                // means "drive present, tray empty" — valid for hotswappable
-                // CD-ROMs where media is loaded later at runtime).
+                // means "drive present, tray empty" — a valid CD-ROM state
+                // where media is loaded later at runtime).
                 let mut list: Vec<String> = Vec::new();
                 if !dev.path.is_empty() {
                     list.push(dev.path.clone());
@@ -311,10 +311,6 @@ impl Machine {
                 }
                 eprintln!("iris: fatal: {msg}");
                 std::process::exit(1);
-            }
-            // Apply hotswappable mode for CD-ROMs
-            if dev.cdrom && dev.hotswappable {
-                let _ = hpc3.scsi().set_hotswappable(id as usize, true);
             }
         }
 
