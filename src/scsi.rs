@@ -339,11 +339,23 @@ impl ScsiDevice {
         pending
     }
 
-    /// Advance to the next disc in the list (wraps around).
-    /// Returns the new active disc path, or None if this is not a CD-ROM
-    /// or there is only one disc.
+    /// Eject the current disc. Behaviour depends on how many discs are queued:
+    ///   - 0 or 1 disc: the tray empties (drive present, no media).
+    ///   - 2+ discs: cycle to the next disc in the changer list (wraps around).
+    /// Returns the newly-active disc path, or None when the tray is emptied or
+    /// this is not a CD-ROM.
     pub fn eject_next(&mut self) -> Option<String> {
-        if !self.is_cdrom || self.discs.len() <= 1 {
+        if !self.is_cdrom {
+            return None;
+        }
+        // 0 or 1 disc: eject empties the tray entirely.
+        if self.discs.len() <= 1 {
+            let prev_disc = self.filename.clone();
+            self.unload_media();
+            self.discs.clear(); // no phantom entries remain
+            if !prev_disc.is_empty() {
+                eprintln!("CD-ROM: ejected '{}', tray empty", prev_disc);
+            }
             return None;
         }
         // Rotate: move front to back, new front becomes active.
@@ -361,6 +373,7 @@ impl ScsiDevice {
                 // that persists across disc changes, just like on real hardware.
                 self.filename = next_path.clone();
                 self.unit_attention = true; // signal medium change on next command
+                eprintln!("CD-ROM changer: switched to '{}'", next_path);
                 Some(next_path)
             }
             Err(e) => {
@@ -389,6 +402,14 @@ impl ScsiDevice {
     /// command. The image is opened as a raw ISO (`Direct` backend), matching
     /// the changer's eject path. Err if this is not a CD-ROM or the file can't
     /// be opened.
+    ///
+    /// Queue management by disc count:
+    ///   - 0 discs (empty tray): the new disc becomes the sole entry.
+    ///   - 1 disc: the existing disc is kept in the queue (pushed to index 1)
+    ///     and the new disc becomes active at index 0, growing the queue to 2
+    ///     so that eject cycles rather than emptying the tray.
+    ///   - 2+ discs: the new disc is placed at index 0 (active); if it was
+    ///     already queued it is moved to the front rather than duplicated.
     pub fn load_disc(&mut self, path: String) -> Result<String, String> {
         if !self.is_cdrom {
             return Err("Not a CD-ROM device".to_string());
@@ -398,11 +419,29 @@ impl ScsiDevice {
         let size = f.metadata().map(|m| m.len()).unwrap_or(0);
         self.backend = Some(DiskBackend::Direct(f));
         self.size = size;
-        // phys/logical block sizes persist across disc changes (controller
-        // settings), exactly as in eject_next.
         self.filename = path.clone();
-        self.unit_attention = true; // signal medium change on next command
-        self.discs.insert(0, path.clone());
+        self.unit_attention = true;
+
+        match self.discs.len() {
+            // Empty tray: new disc is the only entry.
+            0 => self.discs.push(path.clone()),
+            // One disc already loaded: keep it queued at index 1 so eject
+            // cycles between the two instead of emptying the tray.
+            1 => {
+                if self.discs[0] != path {
+                    // Push the current disc to the back, new disc goes to front.
+                    self.discs.insert(0, path.clone());
+                }
+                // If same path, nothing to change — already loaded.
+            }
+            // 2+ discs: make new disc active at front, dedup if already queued.
+            _ => {
+                if let Some(pos) = self.discs.iter().position(|d| d == &path) {
+                    self.discs.remove(pos);
+                }
+                self.discs.insert(0, path.clone());
+            }
+        }
         Ok(path)
     }
 
@@ -702,10 +741,9 @@ impl ScsiDevice {
         let loej  = (cdb[4] & 0x02) != 0;
         let start = (cdb[4] & 0x01) != 0;
         if loej && !start && self.is_cdrom {
-            // Eject requested — advance to next disc in changer list.
-            if self.discs.len() > 1 {
-                self.eject_next();
-            }
+            // Eject requested. eject_next() handles the count-driven cases:
+            // 0/1 disc empties the tray; 2+ discs cycle to the next.
+            self.eject_next();
         }
         Ok(ScsiResponse { status: 0x00, data: vec![] })
     }
@@ -1091,18 +1129,14 @@ impl ScsiDevice {
     }
 
     /// SGI vendor command 0xC4 — eject / next disc.
-    /// On real hardware this spins the tray out. We advance to the next disc in
-    /// the changer list and raise Unit Attention so IRIX re-reads the TOC.
+    /// On real hardware this spins the tray out. eject_next() handles the
+    /// count-driven cases: 0/1 disc empties the tray; 2+ discs cycle to the
+    /// next and raise Unit Attention so IRIX re-reads the TOC.
     fn exec_sgi_eject(&mut self, _cdb: &[u8]) -> Result<ScsiResponse, std::io::Error> {
         if !self.is_cdrom {
             return Ok(self.check_condition(0x05, 0x20, 0x00)); // Invalid command for HDD
         }
-        if self.discs.len() > 1 {
-            self.eject_next();
-            eprintln!("SCSI SGI_EJECT: switched to disc {}", self.filename);
-        } else {
-            eprintln!("SCSI SGI_EJECT: no additional discs in changer list");
-        }
+        self.eject_next();
         Ok(ScsiResponse { status: 0x00, data: vec![] })
     }
 

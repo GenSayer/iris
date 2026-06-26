@@ -138,7 +138,7 @@ fn pick_disk(title: &str) -> Option<String> {
         .map(|p| p.to_string_lossy().into_owned())
 }
 
-fn pick_iso(title: &str) -> Option<String> {
+pub fn pick_iso(title: &str) -> Option<String> {
     rfd::FileDialog::new()
         .set_title(title)
         .add_filter("ISO images", &["iso", "chd"])

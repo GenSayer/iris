@@ -40,6 +40,9 @@ pub enum Cmd {
     /// Discard a single disk's COW overlay ("roll back") — delete the
     /// `.diff.chd` / `.overlay`. File-level; only valid while stopped.
     CowReset { base: String, chd: bool },
+    /// Load a disc image into a CD-ROM device (live hot-swap).
+    /// Valid only while running. The path is loaded as the active disc.
+    LoadDisc { id: u8, path: String },
     Quit,
 }
 
@@ -566,6 +569,25 @@ fn worker_loop(
                 match write_png(&path, frame.width as u32, frame.height as u32, &frame.rgba) {
                     Ok(()) => { let _ = evt_tx.send(Evt::Screenshot(path)); }
                     Err(e) => { let _ = evt_tx.send(Evt::Error(format!("screenshot failed: {e}"))); }
+                }
+            }
+            Ok(Cmd::LoadDisc { id, path }) => {
+                match machine.as_ref() {
+                    Some(m) => {
+                        match m.hpc3().scsi().load_disc(id as usize, path.clone()) {
+                            Ok(loaded_path) => {
+                                let filename = std::path::Path::new(&loaded_path)
+                                    .file_name()
+                                    .map(|n| n.to_string_lossy().into_owned())
+                                    .unwrap_or_else(|| loaded_path.clone());
+                                let _ = evt_tx.send(Evt::Error(format!("SCSI #{id}: loaded {filename}")));
+                            }
+                            Err(e) => {
+                                let _ = evt_tx.send(Evt::Error(format!("SCSI #{id}: {e}")));
+                            }
+                        }
+                    }
+                    None => { let _ = evt_tx.send(Evt::Error("load disc: not running".into())); }
                 }
             }
             Ok(Cmd::Quit) | Err(_) => {

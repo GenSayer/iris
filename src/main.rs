@@ -119,7 +119,8 @@ fn main() {
         use winit::event_loop::EventLoop;
         let event_loop = EventLoop::new().unwrap();
         let rex3 = machine.get_rex3().expect("rex3 must be present in non-headless mode");
-        let ui = Ui::new(machine.get_ps2(), rex3, machine.get_timer_manager(), &event_loop, scale, scroll_pixels_per_line, lock_aspect_ratio);
+        let scsi = machine.hpc3().scsi().clone();
+        let ui = Ui::new(machine.get_ps2(), rex3, scsi, machine.get_timer_manager(), &event_loop, scale, scroll_pixels_per_line, lock_aspect_ratio);
         ui.run(event_loop);
     }
 

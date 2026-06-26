@@ -1859,6 +1859,16 @@ impl App {
             ConfigAction::TestCamera => self.open_camera_test(),
             ConfigAction::RefreshPcapIfaces => self.refresh_pcap_ifaces(),
             ConfigAction::EnablePacketCapture => self.run_enable_packet_capture(),
+            ConfigAction::LoadDisc { id, path } => {
+                if self.emu.is_running() {
+                    self.emu.send(Cmd::LoadDisc { id, path: path.clone() });
+                    let filename = std::path::Path::new(&path)
+                        .file_name()
+                        .map(|n| n.to_string_lossy().into_owned())
+                        .unwrap_or_else(|| path.clone());
+                    self.toast(format!("SCSI #{}: loaded {}", id, filename));
+                }
+            }
             ConfigAction::None => {}
         }
         if out.disks_changed { self.mark_dirty(); }
@@ -2601,6 +2611,27 @@ impl eframe::App for App {
         if ctx.input(|i| i.key_pressed(egui::Key::F11) && !(i.modifiers.ctrl && i.modifiers.alt)) {
             self.fullscreen = !self.fullscreen;
             ctx.send_viewport_cmd(ViewportCommand::Fullscreen(self.fullscreen));
+        }
+
+        // Ctrl+F12 opens a file picker to load a CD-ROM disc on the fly (hot-swap)
+        // without needing to configure it in iris.toml or use the SCSI menu.
+        if ctx.input(|i| i.modifiers.command && i.key_pressed(egui::Key::F12)) {
+            if self.emu.is_running() {
+                // Find the first CD-ROM device
+                let cdrom_id = self.cfg.scsi.iter()
+                    .find(|(_, dev)| dev.cdrom)
+                    .map(|(id, _)| *id);
+
+                if let Some(id) = cdrom_id {
+                    if let Some(path) = scsi_menu::pick_iso("Load CD-ROM disc") {
+                        self.emu.send(Cmd::LoadDisc { id, path });
+                    }
+                } else {
+                    self.toast("No CD-ROM drive attached");
+                }
+            } else {
+                self.toast("Load disc: machine not running");
+            }
         }
 
         // Ctrl + / Ctrl - / Ctrl 0 zoom controls (helps on Linux where egui's

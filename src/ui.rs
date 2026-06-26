@@ -15,6 +15,7 @@ use crate::compositor::{Compositor, SwCompositor};
 use crate::gl_compositor::GlCompositor;
 use crate::debug_overlay::DebugOverlay;
 use crate::hptimer::{TimerManager, TimerReturn};
+use crate::wd33c93a::Wd33c93a;
 use glutin::config::ConfigTemplateBuilder;
 use glutin::context::{ContextAttributesBuilder, PossiblyCurrentContext};
 use glutin::display::GetGlDisplay;
@@ -541,6 +542,7 @@ struct MouseDelta {
 pub struct Ui {
     ps2: Arc<Ps2Controller>,
     rex3: Arc<Rex3>,
+    scsi: Arc<Wd33c93a>,
     window: Arc<Window>,
     window_size: Arc<Mutex<Option<(u32, u32)>>>,
     scale_snap:  Arc<Mutex<Option<ScaleSnap>>>,
@@ -552,7 +554,7 @@ pub struct Ui {
 }
 
 impl Ui {
-    pub fn new(ps2: Arc<Ps2Controller>, rex3: Arc<Rex3>, timer_manager: Arc<TimerManager>, event_loop: &EventLoop<()>, scale: u32, scroll_pixels_per_line: f64, lock_aspect_ratio: bool) -> Self {
+    pub fn new(ps2: Arc<Ps2Controller>, rex3: Arc<Rex3>, scsi: Arc<Wd33c93a>, timer_manager: Arc<TimerManager>, event_loop: &EventLoop<()>, scale: u32, scroll_pixels_per_line: f64, lock_aspect_ratio: bool) -> Self {
         // The Indy's default video mode is 1280×1024; open the window at that
         // size (plus the status bar). The renderer snaps to the real resolution
         // via resize() once the PROM/IRIX programs its actual mode.
@@ -603,12 +605,12 @@ impl Ui {
 
         *rex3.renderer.lock() = Some(Box::new(renderer));
 
-        Self { ps2, rex3, window, window_size, scale_snap, display_res, timer_manager, initial_scale: scale, scroll_pixels_per_line, lock_aspect_ratio }
+        Self { ps2, rex3, scsi, window, window_size, scale_snap, display_res, timer_manager, initial_scale: scale, scroll_pixels_per_line, lock_aspect_ratio }
     }
 
     /// Run the UI event loop (blocks the current thread)
     pub fn run(self, event_loop: EventLoop<()>) {
-        let Ui { ps2, rex3, window, window_size, scale_snap, display_res, timer_manager, initial_scale, scroll_pixels_per_line, lock_aspect_ratio } = self;
+        let Ui { ps2, rex3, scsi, window, window_size, scale_snap, display_res, timer_manager, initial_scale, scroll_pixels_per_line, lock_aspect_ratio } = self;
         let scale = initial_scale;
 
         let mut mouse_grabbed = false;
@@ -670,7 +672,7 @@ impl Ui {
                         }
                     }
                     WindowEvent::KeyboardInput { event, .. } => {
-                        Self::handle_keyboard(&ps2, &rex3, &scale_snap, event, &mut mouse_grabbed, &mut rctrl_held, &window);
+                        Self::handle_keyboard(&ps2, &rex3, &scsi, &scale_snap, event, &mut mouse_grabbed, &mut rctrl_held, &window);
                     }
                     WindowEvent::MouseInput { state, button, .. } => {
                         if mouse_grabbed {
@@ -770,7 +772,7 @@ impl Ui {
         }
     }
 
-    fn handle_keyboard(ps2: &Ps2Controller, rex3: &Rex3, scale_snap: &Mutex<Option<ScaleSnap>>,
+    fn handle_keyboard(ps2: &Ps2Controller, rex3: &Rex3, scsi: &Wd33c93a, scale_snap: &Mutex<Option<ScaleSnap>>,
         input: KeyEvent, grabbed: &mut bool, rctrl_held: &mut bool, window: &Window)
     {
         use std::sync::atomic::Ordering;
@@ -799,6 +801,38 @@ impl Ui {
                     Some(winit::window::Fullscreen::Borderless(None))
                 };
                 window.set_fullscreen(new_mode);
+                return;
+            }
+
+            // RCtrl+F12: hot-swap CD-ROM disc (open file picker and load into first CD-ROM device)
+            if keycode == KeyCode::F12 && pressed && !input.repeat && *rctrl_held {
+                // Find the first CD-ROM device (disc_status only lists CD-ROMs)
+                let cdrom_id = scsi.disc_status().first().map(|(id, ..)| *id);
+
+                if let Some(id) = cdrom_id {
+                    // Open file picker (blocks the event loop but winit tolerates it on most platforms)
+                    if let Some(path) = rfd::FileDialog::new()
+                        .set_title("Load CD-ROM disc")
+                        .add_filter("ISO images", &["iso", "chd"])
+                        .add_filter("All", &["*"])
+                        .pick_file()
+                    {
+                        let path_str = path.to_string_lossy().into_owned();
+                        match scsi.load_disc(id, path_str.clone()) {
+                            Ok(_) => {
+                                let filename = path.file_name()
+                                    .map(|n| n.to_string_lossy().into_owned())
+                                    .unwrap_or_else(|| path_str.clone());
+                                eprintln!("SCSI #{}: loaded {}", id, filename);
+                            }
+                            Err(e) => {
+                                eprintln!("SCSI #{}: {}", id, e);
+                            }
+                        }
+                    }
+                } else {
+                    eprintln!("No CD-ROM drive attached");
+                }
                 return;
             }
 

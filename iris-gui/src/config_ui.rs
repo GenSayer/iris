@@ -150,7 +150,7 @@ impl JitEnv {
 
 /// Action a config tab asks the app to perform that needs app-level state
 /// (e.g. a confirmation modal) the immediate-mode tab UI doesn't own.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub enum ConfigAction {
     #[default]
     None,
@@ -169,6 +169,9 @@ pub enum ConfigAction {
     /// the app should run the platform's privilege flow (Linux setcap/pkexec,
     /// macOS ChmodBPF install, Windows driver check) via `capture_access`.
     EnablePacketCapture,
+    /// User picked a disc image for a CD-ROM while the machine is running —
+    /// send Cmd::LoadDisc immediately without waiting for restart.
+    LoadDisc { id: u8, path: String },
 }
 
 /// Everything a config tab hands back to the app for one frame.
@@ -194,10 +197,10 @@ pub fn show_tab(
 ) -> TabOutcome {
     ScrollArea::vertical().show(ui, |ui| match tab {
         Tab::General => TabOutcome { action: show_general(ui, cfg), ..Default::default() },
-        Tab::Disks   => { let e = show_disks(ui, cfg); TabOutcome { disks_changed: e.changed, disk_picked: e.picked, ..Default::default() } }
+        Tab::Disks   => { let (e, a) = show_disks(ui, cfg); TabOutcome { action: a, disks_changed: e.changed, disk_picked: e.picked, ..Default::default() } }
         Tab::Network => {
             let net = show_network(ui, cfg, host, disk_folders, pcap_ifaces);
-            TabOutcome { action: net.action, net, ..Default::default() }
+            TabOutcome { action: net.action.clone(), net, ..Default::default() }
         }
         Tab::Memory  => { show_memory(ui, cfg); TabOutcome::default() }
         Tab::Display => { show_display(ui, cfg); TabOutcome::default() }
@@ -301,8 +304,9 @@ fn show_display(ui: &mut Ui, cfg: &mut MachineConfig) {
     });
 }
 
-fn show_disks(ui: &mut Ui, cfg: &mut MachineConfig) -> PathEdit {
+fn show_disks(ui: &mut Ui, cfg: &mut MachineConfig) -> (PathEdit, ConfigAction) {
     let mut edit = PathEdit::default();
+    let mut action = ConfigAction::None;
     ui.heading("SCSI devices");
     ui.horizontal(|ui| {
         ui.label("IDs 1–7. CD-ROMs typically use 4–6.");
@@ -342,6 +346,13 @@ fn show_disks(ui: &mut Ui, cfg: &mut MachineConfig) -> PathEdit {
                     DISK_FILTERS);
                 edit.changed |= e.changed;
                 edit.picked |= e.picked;
+                // For CD-ROMs, picking a path immediately loads the disc into
+                // the running machine (equivalent to Ctrl+F12). The core's
+                // count-driven queue decides whether this replaces the current
+                // disc or joins the changer cycle.
+                if dev.cdrom && e.picked && !dev.path.is_empty() {
+                    action = ConfigAction::LoadDisc { id, path: dev.path.clone() };
+                }
                 ui.end_row();
                 if dev.path.ends_with(".chd") && !build_features::CHD {
                     ui.label("");
@@ -440,7 +451,7 @@ fn show_disks(ui: &mut Ui, cfg: &mut MachineConfig) -> PathEdit {
         }
     }
     if let Some(id) = to_delete { cfg.scsi.remove(&id); }
-    edit
+    (edit, action)
 }
 
 /// A soft-invalid subnet the user just entered, surfaced to the app so it can

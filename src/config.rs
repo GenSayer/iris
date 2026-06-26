@@ -9,6 +9,9 @@ pub const VALID_BANK_SIZES: &[u32] = &[0, 8, 16, 32, 64, 128];
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ScsiDeviceConfig {
     /// Path to the disk image or ISO file (primary/current disc).
+    /// For CD-ROMs this may be omitted (defaults to empty string) to start the
+    /// drive with an empty tray; media can be loaded at runtime.
+    #[serde(default)]
     pub path: String,
     /// Additional ISO images for CD-ROM changers (ignored for HDD).
     #[serde(default)]
@@ -479,10 +482,10 @@ impl MachineConfig {
             if *id == 0 || *id > 7 {
                 return Err(format!("SCSI ID {} is out of range (1–7)", id));
             }
-            // CD-ROM with empty path + no changer entries = drive present, no
-            // media loaded. This is a valid runtime state (see
-            // Wd33c93a::add_device empty-CD-ROM path / insert_disc).
-            let _ = dev; // explicitly keep the binding for future checks
+            // A CD-ROM may legitimately start with an empty tray (no path, no
+            // discs) and have media loaded at runtime; any discs list is valid
+            // as a changer queue. So there is nothing CD-ROM-specific to check.
+            let _ = dev;
         }
         Ok(())
     }
